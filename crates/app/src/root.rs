@@ -3,8 +3,6 @@
 use gchat_core::{Connection, Core};
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
-use std::cell::Cell;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui_kit::component::{h_flex, v_flex};
@@ -44,7 +42,9 @@ actions!(
     RewriteDraft,
     FindInChat,
     FindNext,
-    FindPrevious
+    FindPrevious,
+    GoBack,
+    GoForward
   ]
 );
 
@@ -91,6 +91,9 @@ pub fn menus() -> Vec<Menu> {
       name: "Go".into(),
       disabled: false,
       items: vec![
+        MenuItem::action("Back", GoBack),
+        MenuItem::action("Forward", GoForward),
+        MenuItem::separator(),
         MenuItem::action("Home", GoHome),
         MenuItem::action("New Chat…", OpenNewChat),
         MenuItem::action("Quick Switcher…", OpenSwitcher),
@@ -104,18 +107,6 @@ pub fn menus() -> Vec<Menu> {
   ]
 }
 
-/// Sideways travel, in points, that counts as a "back" swipe.
-const SWIPE_DISTANCE: f32 = 50.0;
-
-/// One scroll gesture (finger down to finger up), watched for a sideways swipe.
-#[derive(Clone, Copy, Default)]
-struct Swipe {
-  x: f32,
-  y: f32,
-  /// Nothing more to do until the next gesture starts: it already went back, or the finger lifted.
-  done: bool,
-}
-
 pub struct RootView {
   store: Entity<Store>,
   sidebar: Entity<Sidebar>,
@@ -125,7 +116,6 @@ pub struct RootView {
   focus: FocusHandle,
   /// The top-bar mark, for the dark look and for the light one.
   logo: [Arc<Image>; 2],
-  swipe: Rc<Cell<Swipe>>,
   viewer: Entity<Viewer>,
   menu: Entity<ContextMenu>,
   emoji: Entity<EmojiPicker>,
@@ -222,7 +212,6 @@ impl RootView {
       mark(include_bytes!("../assets/logo.png")),
       mark(include_bytes!("../assets/logo-light.png")),
     ];
-    let swipe = Rc::new(Cell::new(Swipe::default()));
     Self {
       store,
       sidebar,
@@ -231,7 +220,6 @@ impl RootView {
       focus,
       shortcuts,
       logo,
-      swipe,
       viewer,
       menu,
       emoji,
@@ -403,54 +391,26 @@ impl RootView {
     self.settings.is_some() || self.switcher.is_some() || self.theme_picker.is_some() || self.new_chat.is_some()
   }
 
-  /// The mouse or trackpad "back" gesture: closes the viewer, then the thread panel, then the conversation.
-  fn on_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+  /// Back and Forward through the views (Ctrl+Cmd+Left and Right, and the Go menu). A modal over the window keeps
+  /// them out; the media viewer closes first, since it covers the view.
+  fn step(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
+    if self.modal_open() {
+      return;
+    }
     if self.viewer.read(cx).is_open() {
       self.viewer.update(cx, |viewer, cx| viewer.close(window, cx));
-    } else if self.store.read(cx).view != View::Home {
-      let conv = self.store.read(cx).conv.clone();
-      let closed = conv.is_some_and(|conv| conv.update(cx, |conv, cx| conv.close_thread(window, cx)));
-      if !closed {
-        self.go_home(window, cx);
-      }
+      return;
     }
-  }
-
-  /// Watches scrolling, before any list sees it, for a mostly horizontal swipe to the right. macOS delivers the
-  /// Magic Mouse and two-finger "swipe between pages" gesture as plain scroll events.
-  fn swipe_watcher(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-    let swipe = self.swipe.clone();
-    let this = cx.weak_entity();
-    canvas(
-      |_, _, _| (),
-      move |_, (), window, _| {
-        window.on_mouse_event(move |event: &ScrollEvent, phase, window, cx| {
-          if phase != DispatchPhase::Capture {
-            return;
-          }
-          if event.touch_phase == TouchPhase::Started {
-            swipe.set(Swipe::default());
-            return;
-          }
-          let mut state = swipe.get();
-          if state.done {
-            return;
-          }
-          if let ScrollDelta::Pixels(delta) = event.delta {
-            state.x += f32::from(delta.x);
-            state.y += f32::from(delta.y);
-          }
-          let back = state.x > SWIPE_DISTANCE && state.x > state.y.abs() * 3.0;
-          state.done = back || event.touch_phase == TouchPhase::Ended;
-          swipe.set(state);
-          if back {
-            let _ = this.update(cx, |this, cx| this.on_back(window, cx));
-          }
-        });
-      },
-    )
-    .absolute()
-    .size_0()
+    self.store.update(cx, |store, cx| {
+      if back {
+        store.go_back(window, cx);
+      } else {
+        store.go_forward(window, cx);
+      }
+    });
+    if self.store.read(cx).view == View::Home || matches!(self.store.read(cx).view, View::Shortcut(_)) {
+      window.focus(&self.focus, cx);
+    }
   }
 
   fn indicator(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -598,6 +558,8 @@ impl Render for RootView {
       .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
       .on_action(cx.listener(|this, _: &OpenNotificationSettings, window, cx| this.open_settings_at(true, window, cx)))
       .on_action(cx.listener(|this, _: &GoHome, window, cx| this.go_home(window, cx)))
+      .on_action(cx.listener(|this, _: &GoBack, window, cx| this.step(true, window, cx)))
+      .on_action(cx.listener(|this, _: &GoForward, window, cx| this.step(false, window, cx)))
       .on_action(cx.listener(|this, _: &OpenNewChat, window, cx| this.open_new_chat(window, cx)))
       .on_action(cx.listener(|this, _: &RewriteDraft, window, cx| {
         if this.modal_open() {
@@ -630,11 +592,6 @@ impl Render for RootView {
         };
         conv.update(cx, |conv, cx| conv.find_prev(window, cx));
       }))
-      .on_mouse_down(
-        MouseButton::Navigate(NavigationDirection::Back),
-        cx.listener(|this, _, window, cx| this.on_back(window, cx)),
-      )
-      .child(self.swipe_watcher(cx))
       .child(bar)
       .child(
         h_flex().flex_1().min_h_0().child(self.sidebar.clone()).child(

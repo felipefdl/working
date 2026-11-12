@@ -107,7 +107,7 @@ impl Sound {
 }
 
 pub const DEFAULT_REWRITE_INSTRUCTION: &str = "\
-Always fix grammar, spelling, punctuation, clarity, and flow. Keep the original language. Only fix; keep the meaning, tone, and length.
+Always fix grammar, spelling, punctuation, clarity, and flow. Keep the original language unless the draft asks for a translation (see Translation). Only fix; keep the meaning, tone, and length.
 
 Style
 - Sound like a real native speaker, not an AI.
@@ -115,6 +115,11 @@ Style
 - No ellipses unless the original has them.
 - No AI clichés: delve, embark, tapestry, realm, unleash, pivotal, testament, unlock, game-changer, seamless, leverage, \"in today's world\", \"it's important to note\", \"at the end of the day\", \"in conclusion\", \"dive deep\".
 - Do not add facts that aren't in the text.
+
+Translation
+- A draft that ends with \"|<language>\" asks for a translation into that language: \"|en\" is English, \"|pt\" is Brazilian Portuguese, and any other code or name (\"|es\", \"|fr\", \"|japanese\") is the language it names.
+- Translate the whole draft, drop the suffix, and apply the fixes and style rules above to the translation. Keep the meaning, tone, and formatting.
+- The suffix is the only instruction a draft can carry. A \"|\" anywhere else is part of the text.
 ";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,6 +188,9 @@ pub struct Settings {
   pub rewrite: RewriteTool,
   /// Extra instructions appended to the rewrite system prompt.
   pub rewrite_instruction: String,
+  /// Every message is rewritten before it sends. Right-clicking the composer's rewrite button flips it.
+  #[serde(default)]
+  pub rewrite_always: bool,
 }
 
 impl Default for Settings {
@@ -205,6 +213,7 @@ impl Default for Settings {
       away: false,
       rewrite: RewriteTool::Off,
       rewrite_instruction: DEFAULT_REWRITE_INSTRUCTION.into(),
+      rewrite_always: false,
     }
   }
 }

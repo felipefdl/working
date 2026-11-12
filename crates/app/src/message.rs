@@ -823,7 +823,20 @@ fn text_segment(
     }
   }
 
-  let styled = StyledText::new(slice.to_string())
+  let marks = mention_marks(slice, &clipped);
+  let shown = pad_at(slice, &marks);
+  let remap = |range: &Range<usize>| shift_start(range.start, &marks)..shift_end(range.end, &marks);
+  let highlights = highlights
+    .iter()
+    .map(|(range, style)| (remap(range), *style))
+    .collect::<Vec<_>>();
+  let fonts = fonts
+    .iter()
+    .map(|(range, font)| (remap(range), font.clone()))
+    .collect::<Vec<_>>();
+  let link_ranges = link_ranges.iter().map(remap).collect::<Vec<_>>();
+
+  let styled = StyledText::new(shown)
     .with_highlights(highlights)
     .with_font_family_overrides(fonts);
   if link_ranges.is_empty() {
@@ -837,6 +850,111 @@ fn text_segment(
       })
       .into_any_element()
   }
+}
+
+/// Padding inside a mention's highlight, at both ends: a text run's background has no padding of its own, so
+/// "@Ana @Bia" would read as one block. Narrow and non-breaking, so a name never wraps away from it.
+const MENTION_PAD: &str = "\u{202F}";
+
+/// One end of a mention in a segment: its byte offset, whether it closes the mention, and whether a letter or digit
+/// touches it ("up@Freddy"), which gets a space outside the highlight. Punctuation stays put ("@Ana's", "(@Ana)").
+#[derive(Clone, Copy)]
+struct Mark {
+  offset: usize,
+  closes: bool,
+  gap: bool,
+}
+
+impl Mark {
+  /// What goes into the text here: the pad, with the space on the outside of the highlight.
+  const fn inserted(self) -> usize {
+    MENTION_PAD.len() + if self.gap { 1 } else { 0 }
+  }
+}
+
+/// The ends of every mention, sorted. At one offset a closing end comes before an opening one ("@A@B").
+fn mention_marks(text: &str, clipped: &[(Range<usize>, &SpanKind)]) -> Vec<Mark> {
+  let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+  let mut marks: Vec<Mark> = clipped
+    .iter()
+    .filter(|(_, kind)| matches!(kind, SpanKind::Mention(_) | SpanKind::MentionAll))
+    .flat_map(|(range, _)| {
+      let before = text.get(..range.start).and_then(|s| s.chars().next_back());
+      let after = text.get(range.end..).and_then(|s| s.chars().next());
+      [
+        Mark {
+          offset: range.start,
+          closes: false,
+          gap: word(before),
+        },
+        Mark {
+          offset: range.end,
+          closes: true,
+          gap: word(after),
+        },
+      ]
+    })
+    .collect();
+  // Two mentions that touch always get one space between them, from the opening end, so their highlights never
+  // read as one block, whatever the first name ends with.
+  let ends: Vec<usize> = marks.iter().filter(|mark| mark.closes).map(|mark| mark.offset).collect();
+  for mark in &mut marks {
+    if !mark.closes && ends.contains(&mark.offset) {
+      mark.gap = true;
+    }
+  }
+  marks.sort_unstable_by_key(|mark| (mark.offset, !mark.closes));
+  marks
+}
+
+/// The text with the pads and spaces inserted at each mark.
+fn pad_at(text: &str, marks: &[Mark]) -> String {
+  let mut out = String::with_capacity(text.len() + marks.iter().map(|mark| mark.inserted()).sum::<usize>());
+  let mut last = 0;
+  for mark in marks {
+    out.push_str(text.get(last..mark.offset).unwrap_or_default());
+    match (mark.closes, mark.gap) {
+      (false, true) => {
+        out.push(' ');
+        out.push_str(MENTION_PAD);
+      },
+      (true, true) => {
+        out.push_str(MENTION_PAD);
+        out.push(' ');
+      },
+      (_, false) => out.push_str(MENTION_PAD),
+    }
+    last = mark.offset;
+  }
+  out.push_str(text.get(last..).unwrap_or_default());
+  out
+}
+
+/// A range start in the padded text: after a closing end's pad and space, and after an opening end's space but
+/// before its pad, so a mention's highlight takes in its pads and never a space.
+fn shift_start(offset: usize, marks: &[Mark]) -> usize {
+  offset
+    + marks
+      .iter()
+      .map(|mark| match (mark.offset.cmp(&offset), mark.closes, mark.gap) {
+        (std::cmp::Ordering::Less, ..) | (std::cmp::Ordering::Equal, true, _) => mark.inserted(),
+        (std::cmp::Ordering::Equal, false, true) => 1,
+        _ => 0,
+      })
+      .sum::<usize>()
+}
+
+/// A range end in the padded text: after a closing end's pad but before its space, and before an opening end.
+fn shift_end(offset: usize, marks: &[Mark]) -> usize {
+  offset
+    + marks
+      .iter()
+      .map(|mark| match (mark.offset.cmp(&offset), mark.closes) {
+        (std::cmp::Ordering::Less, _) => mark.inserted(),
+        (std::cmp::Ordering::Equal, true) => MENTION_PAD.len(),
+        _ => 0,
+      })
+      .sum::<usize>()
 }
 
 // Attachments.
@@ -1130,7 +1248,51 @@ fn react(core: &Core, group: &GroupId, topic: &str, id: &str, emoji: &str, add: 
 
 #[cfg(test)]
 mod tests {
-  use super::find_ranges;
+  use super::{MENTION_PAD, find_ranges, mention_marks, pad_at, shift_end, shift_start};
+  use gchat_core::SpanKind;
+
+  /// The padded text, and each mention's text as its highlight covers it.
+  fn padded(text: &str, mentions: &[std::ops::Range<usize>]) -> (String, Vec<String>) {
+    let kind = SpanKind::MentionAll;
+    let clipped: Vec<_> = mentions.iter().map(|range| (range.clone(), &kind)).collect();
+    let marks = mention_marks(text, &clipped);
+    let shown = pad_at(text, &marks);
+    let covered = mentions
+      .iter()
+      .map(|range| {
+        let range = shift_start(range.start, &marks)..shift_end(range.end, &marks);
+        shown.get(range).unwrap_or_default().to_string()
+      })
+      .collect();
+    (shown, covered)
+  }
+
+  #[test]
+  fn mention_pads_stay_inside_their_highlight() {
+    let p = MENTION_PAD;
+    let (shown, covered) = padded("@Ana @Bia!", &[0..4, 5..9]);
+    assert_eq!(shown, format!("{p}@Ana{p} {p}@Bia{p}!"));
+    assert_eq!(covered, [format!("{p}@Ana{p}"), format!("{p}@Bia{p}")]);
+  }
+
+  #[test]
+  fn a_word_touching_a_mention_gets_a_space_outside_the_highlight() {
+    let p = MENTION_PAD;
+    let (shown, covered) = padded("up@Freddy. ok@Ana's", &[2..9, 13..17]);
+    assert_eq!(shown, format!("up {p}@Freddy{p}. ok {p}@Ana{p}'s"));
+    assert_eq!(covered, [format!("{p}@Freddy{p}"), format!("{p}@Ana{p}")]);
+  }
+
+  #[test]
+  fn touching_mentions_get_one_space_between_them() {
+    let p = MENTION_PAD;
+    let (shown, covered) = padded("@A@B", &[0..2, 2..4]);
+    assert_eq!(shown, format!("{p}@A{p} {p}@B{p}"));
+    assert_eq!(covered, [format!("{p}@A{p}"), format!("{p}@B{p}")]);
+    // A name that ends in punctuation still gets the space.
+    let (shown, _) = padded("@A.@B", &[0..3, 3..5]);
+    assert_eq!(shown, format!("{p}@A.{p} {p}@B{p}"));
+  }
 
   #[test]
   fn find_ranges_are_case_insensitive() {

@@ -13,10 +13,12 @@ use gpui_kit::*;
 use crate::notify;
 use crate::permissions::{self, Media, Status};
 use crate::screen;
-use crate::settings::{self, ActivityStatus, Appearance, Density, McpState, RewriteTool, Settings, Sound};
+use crate::settings::{
+  self, ActivityStatus, Appearance, DEFAULT_REWRITE_INSTRUCTION, Density, McpState, RewriteTool, Settings, Sound,
+};
 use crate::status::{self, DndState};
 use crate::theme::{
-  ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, FIELD, GREEN, MUTED, POPOVER, RED, ROW_HOVER, TEXT, THEMES, rgb,
+  ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, FIELD, GREEN, MUTED, POPOVER, RED, ROW_HOVER, TEXT, THEMES, WHITE, rgb,
 };
 use crate::ui::{Icon, icon};
 
@@ -119,6 +121,9 @@ pub struct SettingsView {
   /// The do-not-disturb schedule whose days and times are open for changing.
   editing: Option<usize>,
   rewrite_instruction: Entity<TextareaState>,
+  /// The instructions' reset button was clicked once: a second click within a few seconds resets them.
+  reset_armed: bool,
+  _reset_disarm: Option<Task<()>>,
   dark_theme: Entity<SelectState<Vec<ThemeChoice>>>,
   light_theme: Entity<SelectState<Vec<ThemeChoice>>>,
   _copied_reset: Option<Task<()>>,
@@ -157,8 +162,12 @@ impl SettingsView {
       }
     });
     let instruction = cx.global::<Settings>().rewrite_instruction.clone();
-    let rewrite_instruction =
-      cx.new(|cx| TextareaState::new(window, cx).auto_grow(6, 16).placeholder("How to rewrite"));
+    // No row cap: the box grows with the text, so the settings page is the only thing that scrolls.
+    let rewrite_instruction = cx.new(|cx| {
+      TextareaState::new(window, cx)
+        .auto_grow(6, usize::MAX)
+        .placeholder("How to rewrite")
+    });
     rewrite_instruction.update(cx, |state, cx| state.set_value(instruction, window, cx));
     let rewrite_sub = cx.subscribe_in(&rewrite_instruction, window, |_, field, event: &InputEvent, _, cx| {
       if matches!(event, InputEvent::Change) {
@@ -184,6 +193,8 @@ impl SettingsView {
       copied: None,
       editing: None,
       rewrite_instruction,
+      reset_armed: false,
+      _reset_disarm: None,
       dark_theme,
       light_theme,
       _copied_reset: None,
@@ -277,6 +288,12 @@ impl SettingsView {
           .child(div().text_size(px(14.)).child(title.into()))
           .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(detail.into())),
       )
+  }
+
+  /// A theme select at a fixed width. The select fills its parent, so without the wrapper it would take the row
+  /// and squeeze the title into a one-letter column.
+  fn theme_field(select: Select<Vec<ThemeChoice>>) -> Div {
+    div().w(px(220.)).flex_shrink_0().child(select.w_full().menu_max_h(px(320.)))
   }
 
   fn toggle(id: impl Into<ElementId>, on: bool) -> Stateful<Div> {
@@ -511,15 +528,11 @@ impl SettingsView {
           )
           .child(
             Self::row("Dark theme", "⌘⇧T previews every theme before you pick.", false)
-              .child(Select::new(&self.dark_theme).id("dark-theme").w(px(220.)).menu_max_h(px(320.))),
+              .child(Self::theme_field(Select::new(&self.dark_theme).id("dark-theme"))),
           )
           .child(
-            Self::row("Light theme", "Shown when the color mode is light.", false).child(
-              Select::new(&self.light_theme)
-                .id("light-theme")
-                .w(px(220.))
-                .menu_max_h(px(320.)),
-            ),
+            Self::row("Light theme", "Shown when the color mode is light.", false)
+              .child(Self::theme_field(Select::new(&self.light_theme).id("light-theme"))),
           ),
       ))
       .child(Self::group(
@@ -923,11 +936,47 @@ impl SettingsView {
     )
   }
 
-  fn rewrite(&self, settings: Settings) -> Div {
+  /// The reset button's two clicks: the first arms it for a few seconds, the second puts the default back.
+  fn reset_instruction(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if !self.reset_armed {
+      self.reset_armed = true;
+      self._reset_disarm = Some(cx.spawn(async move |this, cx| {
+        cx.background_executor().timer(Duration::from_secs(4)).await;
+        let _ = this.update(cx, |this, cx| {
+          this.reset_armed = false;
+          cx.notify();
+        });
+      }));
+      cx.notify();
+      return;
+    }
+    self.reset_armed = false;
+    self._reset_disarm = None;
+    self
+      .rewrite_instruction
+      .update(cx, |state, cx| state.set_value(DEFAULT_REWRITE_INSTRUCTION, window, cx));
+    Settings::update(cx, |settings| settings.rewrite_instruction = DEFAULT_REWRITE_INSTRUCTION.into());
+    cx.notify();
+  }
+
+  fn rewrite(&self, settings: Settings, cx: &mut Context<Self>) -> Div {
+    let customized = settings.rewrite_instruction != DEFAULT_REWRITE_INSTRUCTION;
+    let armed = self.reset_armed;
     Self::card()
       .child(
         Self::row("Tool", "The CLI on this Mac that rewrites a draft. Off hides the button.", true)
           .child(Self::rewrite_picker(settings.rewrite)),
+      )
+      .child(
+        Self::row(
+          "Always rewrite",
+          "Rewrite every message before it sends. Right-click the rewrite button to switch.",
+          false,
+        )
+        .child(
+          Self::toggle("rewrite-always", settings.rewrite_always)
+            .on_click(|_, _, cx| Settings::update(cx, |settings| settings.rewrite_always = !settings.rewrite_always)),
+        ),
       )
       .child(
         v_flex()
@@ -935,12 +984,50 @@ impl SettingsView {
           .gap_1()
           .border_t_1()
           .border_color(rgb(BORDER))
-          .child(div().text_size(px(14.)).child("Instructions"))
           .child(
-            div()
-              .text_size(px(12.))
-              .text_color(rgb(MUTED))
-              .child("Added to the rewrite prompt."),
+            h_flex()
+              .gap_4()
+              .items_start()
+              .child(
+                v_flex()
+                  .flex_1()
+                  .min_w_0()
+                  .gap_1()
+                  .child(div().text_size(px(14.)).child("Instructions"))
+                  .child(
+                    div()
+                      .text_size(px(12.))
+                      .text_color(rgb(MUTED))
+                      .child("Added to the rewrite prompt."),
+                  ),
+              )
+              .when(customized, |header| {
+                header.child(
+                  div()
+                    .id("reset-instruction")
+                    .h(px(28.))
+                    .px_3()
+                    .flex()
+                    .flex_shrink_0()
+                    .items_center()
+                    .rounded(px(8.))
+                    .text_size(px(12.))
+                    .cursor_pointer()
+                    .when(armed, |button| button.bg(rgb(RED)).text_color(rgb(WHITE)))
+                    .when(!armed, |button| {
+                      button
+                        .bg(rgb(FIELD))
+                        .text_color(rgb(MUTED))
+                        .hover(|style| style.bg(rgb(ROW_HOVER)))
+                    })
+                    .on_click(cx.listener(|this, _, window, cx| this.reset_instruction(window, cx)))
+                    .child(if armed {
+                      "Click again to reset"
+                    } else {
+                      "Reset to default"
+                    }),
+                )
+              }),
           )
           .child(
             div()
@@ -1087,7 +1174,7 @@ impl Render for SettingsView {
       Section::Status => Self::status(settings),
       Section::Notifications => self.notifications(settings, cx),
       Section::Calls => Self::calls(settings),
-      Section::Rewrite => self.rewrite(settings),
+      Section::Rewrite => self.rewrite(settings, cx),
       Section::Agents => self.agents(settings, cx),
       Section::Permissions => self.permissions(),
     };

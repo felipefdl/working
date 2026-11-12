@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use gchat_core::{Command, Core, Group, GroupKind, Message, User};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Paste, Textarea, TextareaState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -168,7 +169,7 @@ impl ConversationView {
     let subs = vec![
       cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| match event {
         InputEvent::Change => this.on_typed(cx),
-        InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
+        InputEvent::PressEnter { shift: false, .. } => this.submit(false, window, cx),
         _ => {},
       }),
     ];
@@ -778,8 +779,9 @@ impl ConversationView {
     )
   }
 
-  fn go_back(&mut self, cx: &mut Context<Self>) {
-    self.store.update(cx, super::store::Store::go_home).ok();
+  /// The header's arrow: the same step back as Ctrl+Cmd+Left.
+  fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    self.store.update(cx, |store, cx| store.go_back(window, cx)).ok();
   }
 
   // Thread panel.
@@ -803,7 +805,7 @@ impl ConversationView {
     });
     let sub = cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| {
       if let InputEvent::PressEnter { shift: false, .. } = event {
-        this.send_thread(window, cx);
+        this.submit(true, window, cx);
       }
     });
     composer.update(cx, |state, cx| state.focus(window, cx));
@@ -1005,10 +1007,30 @@ impl ConversationView {
   }
 
   pub fn rewrite_hotkey(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    self.rewrite(self.thread.is_some(), window, cx);
+    self.rewrite(self.thread.is_some(), false, window, cx);
   }
 
-  fn rewrite(&mut self, in_thread: bool, window: &mut Window, cx: &mut Context<Self>) {
+  /// Enter in a composer: sends, or with "Always rewrite" on, rewrites first and sends the result.
+  fn submit(&mut self, in_thread: bool, window: &mut Window, cx: &mut Context<Self>) {
+    let settings = cx.global::<Settings>();
+    if settings.rewrite_always && settings.rewrite != RewriteTool::Off {
+      self.rewrite(in_thread, true, window, cx);
+    } else {
+      self.send_from(in_thread, window, cx);
+    }
+  }
+
+  fn send_from(&mut self, in_thread: bool, window: &mut Window, cx: &mut Context<Self>) {
+    if in_thread {
+      self.send_thread(window, cx);
+    } else {
+      self.send(window, cx);
+    }
+  }
+
+  /// Rewrites the draft in place. With `then_send`, a successful rewrite goes out right away; a failed one stays
+  /// in the composer, unsent, with the error under it.
+  fn rewrite(&mut self, in_thread: bool, then_send: bool, window: &mut Window, cx: &mut Context<Self>) {
     if self.rewrite_task.is_some() {
       return;
     }
@@ -1024,6 +1046,10 @@ impl ConversationView {
     };
     let draft = composer.read(cx).value().to_string();
     if draft.trim().is_empty() {
+      // Files alone have nothing to rewrite.
+      if then_send {
+        self.send_from(in_thread, window, cx);
+      }
       return;
     }
     self.rewrite_error = None;
@@ -1043,7 +1069,15 @@ impl ConversationView {
             }
             state.focus(window, cx);
           });
+          if then_send && result.is_ok() {
+            this.send_from(in_thread, window, cx);
+          }
           if let Err(error) = result {
+            let error = if then_send {
+              format!("{error} Not sent.")
+            } else {
+              error
+            };
             this.rewrite_error = Some(error);
             this._rewrite_error_clear = Some(cx.spawn(async move |this, cx| {
               cx.background_executor().timer(Duration::from_secs(4)).await;
@@ -1063,9 +1097,11 @@ impl ConversationView {
 
   /// A composer's field: the button that attaches files, then the text, then rewrite when it is on.
   fn composer_field(&self, composer: &Entity<TextareaState>, in_thread: bool, cx: &mut Context<Self>) -> Div {
-    let rewrite = cx.global::<Settings>().rewrite != RewriteTool::Off;
+    let settings = cx.global::<Settings>();
+    let rewrite = settings.rewrite != RewriteTool::Off;
+    let always = settings.rewrite_always;
     let busy = self.rewriting == Some(in_thread);
-    let sparkle = icon(Icon::Sparkles, 18., if busy { ACCENT } else { MUTED });
+    let sparkle = icon(Icon::Sparkles, 18., if busy || always { ACCENT } else { MUTED });
     let sparkle = if busy {
       sparkle
         .with_animation(
@@ -1121,7 +1157,20 @@ impl ConversationView {
             .rounded_full()
             .cursor_pointer()
             .hover(|s| s.bg(rgb(BORDER)))
-            .on_click(cx.listener(move |this, _, window, cx| this.rewrite(in_thread, window, cx)))
+            .when(always, |button| button.bg(rgb(ACCENT_BG)))
+            .tooltip(move |window, cx| {
+              Tooltip::new(if always {
+                "Rewrite. Always rewrite is on: right-click to turn it off"
+              } else {
+                "Rewrite. Right-click to always rewrite before sending"
+              })
+              .build(window, cx)
+            })
+            .on_click(cx.listener(move |this, _, window, cx| this.rewrite(in_thread, false, window, cx)))
+            .on_mouse_down(MouseButton::Right, |_, _, cx| {
+              cx.stop_propagation();
+              Settings::update(cx, |settings| settings.rewrite_always = !settings.rewrite_always);
+            })
             .child(sparkle),
         )
       })
@@ -1334,7 +1383,7 @@ impl Render for ConversationView {
           .rounded_full()
           .cursor_pointer()
           .hover(|s| s.bg(rgb(ROW_HOVER)))
-          .on_click(cx.listener(|this, _, _, cx| this.go_back(cx)))
+          .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx)))
           .child(icon(Icon::ArrowLeft, 18., TEXT)),
       )
       .child(group_avatar(&self.images, cx, &self.group, 32.))

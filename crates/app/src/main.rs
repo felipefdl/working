@@ -64,8 +64,8 @@ use gpui_kit::*;
 
 use crate::images::Images;
 use crate::root::{
-  FindInChat, FindNext, FindPrevious, GoHome, Hide, HideOthers, Minimize, OpenSettings, OpenSwitcher, OpenThemePicker,
-  Quit, RewriteDraft, RootView, ShowAll, TOP_BAR_HEIGHT, Zoom, menus,
+  FindInChat, FindNext, FindPrevious, GoBack, GoForward, GoHome, Hide, HideOthers, Minimize, OpenSettings,
+  OpenSwitcher, OpenThemePicker, Quit, RewriteDraft, RootView, ShowAll, TOP_BAR_HEIGHT, Zoom, menus,
 };
 use crate::settings::Settings;
 use crate::store::Store;
@@ -122,6 +122,9 @@ fn main() {
       KeyBinding::new("cmd-shift-t", OpenThemePicker, None),
       KeyBinding::new("cmd-n", crate::new_chat::OpenNewChat, None),
       KeyBinding::new("cmd-1", GoHome, None),
+      // Xcode's pair: Cmd+[ and Cmd+] belong to the text field (outdent, indent).
+      KeyBinding::new("ctrl-cmd-left", GoBack, None),
+      KeyBinding::new("ctrl-cmd-right", GoForward, None),
       KeyBinding::new("cmd-,", OpenSettings, None),
       KeyBinding::new("cmd-shift-r", RewriteDraft, None),
       KeyBinding::new("cmd-f", FindInChat, None),

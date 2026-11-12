@@ -72,6 +72,9 @@ pub enum SidebarItem {
   Toggle(Section),
 }
 
+/// Steps Back can go, at most.
+const HISTORY_LIMIT: usize = 50;
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum View {
   Home,
@@ -118,6 +121,12 @@ pub struct Store {
   pub home: Vec<Arc<Conv>>,
   pub sidebar: Vec<SidebarItem>,
   pub view: View,
+  /// Views left by navigating, newest last: what Back returns to.
+  back: Vec<View>,
+  /// Views left by Back, newest last: what Forward reopens. Navigating anywhere else clears it.
+  forward: Vec<View>,
+  /// Back or Forward is moving: the view change it makes is not a new step in the history.
+  moving: bool,
   pub conv: Option<Entity<ConversationView>>,
   pub query: String,
   /// The message search started by Enter in the search field, shown under the conversation matches.
@@ -156,6 +165,9 @@ impl Store {
         SidebarItem::Shortcut(Shortcut::Starred),
       ],
       view: View::Home,
+      back: Vec::new(),
+      forward: Vec::new(),
+      moving: false,
       conv: None,
       query: String::new(),
       search: None,
@@ -631,7 +643,7 @@ impl Store {
     let store = cx.weak_entity();
     let (core, images, me) = (self.core.clone(), self.images.clone(), self.me.clone());
     self.conv = Some(cx.new(|cx| ConversationView::new(store, core, images, group, me, history, window, cx)));
-    self.view = View::Conversation(id.clone());
+    self.set_view(View::Conversation(id.clone()));
     self.shortcut = None;
     self.core.send(Command::Open(id.clone()));
     self.clear_notifications(&id);
@@ -639,11 +651,73 @@ impl Store {
     cx.notify();
   }
 
+  /// Switches the view, recording the one it leaves as a step Back can return to.
+  fn set_view(&mut self, view: View) {
+    if view != self.view && !self.moving {
+      self.back.push(std::mem::replace(&mut self.view, View::Home));
+      if self.back.len() > HISTORY_LIMIT {
+        self.back.remove(0);
+      }
+      self.forward.clear();
+    }
+    self.view = view;
+  }
+
+  /// Returns to the view before this one. With nothing recorded, a conversation or a shortcut goes home.
+  pub fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let target = match self.next_step(true) {
+      Some(view) => view,
+      None if self.view != View::Home => View::Home,
+      None => return,
+    };
+    self.forward.push(self.view.clone());
+    self.show(target, window, cx);
+  }
+
+  /// Reopens the view the last Back left.
+  pub fn go_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let Some(target) = self.next_step(false) else {
+      return;
+    };
+    self.back.push(self.view.clone());
+    self.show(target, window, cx);
+  }
+
+  /// The newest view on one stack that can still be shown and is not the one on screen. Conversations that are
+  /// gone (left, or deleted) are skipped.
+  fn next_step(&mut self, back: bool) -> Option<View> {
+    let stack = if back {
+      &mut self.back
+    } else {
+      &mut self.forward
+    };
+    while let Some(view) = stack.pop() {
+      let shown = match &view {
+        View::Conversation(id) => self.groups.contains_key(id),
+        View::Home | View::Shortcut(_) => true,
+      };
+      if shown && view != self.view {
+        return Some(view);
+      }
+    }
+    None
+  }
+
+  fn show(&mut self, view: View, window: &mut Window, cx: &mut Context<Self>) {
+    self.moving = true;
+    match view {
+      View::Home => self.go_home(cx),
+      View::Shortcut(shortcut) => self.open_shortcut(shortcut, cx),
+      View::Conversation(id) => self.open(id, window, cx),
+    }
+    self.moving = false;
+  }
+
   pub fn go_home(&mut self, cx: &mut Context<Self>) {
     if self.view != View::Home {
       self.core.send(Command::Close);
     }
-    self.view = View::Home;
+    self.set_view(View::Home);
     // Dropping the view tells the core we stopped typing.
     self.conv = None;
     self.shortcut = None;
@@ -655,7 +729,7 @@ impl Store {
     if matches!(self.view, View::Conversation(_)) {
       self.core.send(Command::Close);
     }
-    self.view = View::Shortcut(shortcut);
+    self.set_view(View::Shortcut(shortcut));
     self.conv = None;
     self.shortcut = Some(ShortcutList {
       shortcut,
@@ -708,7 +782,7 @@ impl Store {
       let store = cx.weak_entity();
       let (core, images, me) = (self.core.clone(), self.images.clone(), self.me.clone());
       self.conv = Some(cx.new(|cx| ConversationView::new(store, core, images, group, me, None, window, cx)));
-      self.view = View::Conversation(hit.group.clone());
+      self.set_view(View::Conversation(hit.group.clone()));
       self.shortcut = None;
     }
     self.core.send(Command::Jump {
