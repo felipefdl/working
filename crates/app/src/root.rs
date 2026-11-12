@@ -391,7 +391,7 @@ impl RootView {
     self.settings.is_some() || self.switcher.is_some() || self.theme_picker.is_some() || self.new_chat.is_some()
   }
 
-  /// Back and Forward through the views (Ctrl+Cmd+Left and Right, and the Go menu). A modal over the window keeps
+  /// Back and Forward through the views (Cmd+[ and Cmd+], and the Go menu). A modal over the window keeps
   /// them out; the media viewer closes first, since it covers the view.
   fn step(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
     if self.modal_open() {

@@ -122,9 +122,12 @@ fn main() {
       KeyBinding::new("cmd-shift-t", OpenThemePicker, None),
       KeyBinding::new("cmd-n", crate::new_chat::OpenNewChat, None),
       KeyBinding::new("cmd-1", GoHome, None),
-      // Xcode's pair: Cmd+[ and Cmd+] belong to the text field (outdent, indent).
-      KeyBinding::new("ctrl-cmd-left", GoBack, None),
-      KeyBinding::new("ctrl-cmd-right", GoForward, None),
+      // Safari's pair. The kit's text field binds the same keys to outdent and indent, which a chat composer has
+      // no use for: binding them again in its "Input" context, after `init`, takes them back.
+      KeyBinding::new("cmd-[", GoBack, None),
+      KeyBinding::new("cmd-]", GoForward, None),
+      KeyBinding::new("cmd-[", GoBack, Some("Input")),
+      KeyBinding::new("cmd-]", GoForward, Some("Input")),
       KeyBinding::new("cmd-,", OpenSettings, None),
       KeyBinding::new("cmd-shift-r", RewriteDraft, None),
       KeyBinding::new("cmd-f", FindInChat, None),

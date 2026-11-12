@@ -779,7 +779,7 @@ impl ConversationView {
     )
   }
 
-  /// The header's arrow: the same step back as Ctrl+Cmd+Left.
+  /// The header's arrow: the same step back as Cmd+[.
   fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     self.store.update(cx, |store, cx| store.go_back(window, cx)).ok();
   }
