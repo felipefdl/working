@@ -8,27 +8,64 @@ on:
 permissions:
   contents: write
 
+# One release at a time, whatever the tag: a newer tag cancels the run still building an older one.
 concurrency:
-  group: publish-${{ github.ref }}
-  cancel-in-progress: false
+  group: publish
+  cancel-in-progress: true
 
 jobs:
-  release:
-    # Xcode 26+ compiles the Icon Composer document (logo/Working.icon).
+  # Each architecture builds on its own runner at the same time; the release job joins them.
+  build:
+    strategy:
+      fail-fast: true
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
     runs-on: macos-26
-    timeout-minutes: 120
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.target }}
 
       - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          # A failed or cancelled release still keeps the compiled dependencies for the next one.
+          cache-on-failure: true
 
       # crates/core/build.rs compiles proto/googlechat.proto with prost-build, which needs protoc.
       - name: Install protoc
         run: brew install protobuf
+
+      # WORKING_UPDATES turns the self-updater on; only release builds have it.
+      - name: Build
+        env:
+          WORKING_UPDATES: "1"
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+        run: cargo build --release --locked -p working --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: working-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/working
+          if-no-files-found: error
+          retention-days: 1
+
+  release:
+    needs: build
+    # Xcode 26+ compiles the Icon Composer document (logo/Working.icon).
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: target/bin
+
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Cache cargo-packager
         id: cache-packager
@@ -96,8 +133,10 @@ jobs:
           printf '%s\n' "$APPLE_API_KEY_CONTENT" > "$key_path"
           echo "APPLE_API_KEY_PATH=${key_path}" >> "$GITHUB_ENV"
 
-      - name: Build, sign, and notarize
+      - name: Join, sign, and notarize
         env:
+          WORKING_ARM64_BINARY: target/bin/working-aarch64-apple-darwin/working
+          WORKING_X86_64_BINARY: target/bin/working-x86_64-apple-darwin/working
           WORKING_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}

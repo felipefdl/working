@@ -5,6 +5,9 @@
 # APPLE_API_ISSUER, APPLE_API_KEY_PATH (App Store Connect key for notarytool), and
 # CARGO_PACKAGER_SIGN_PRIVATE_KEY / CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD (minisign key for the updater).
 #
+# WORKING_ARM64_BINARY and WORKING_X86_64_BINARY name prebuilt binaries (the workflow builds each architecture on
+# its own runner). Without them, both are built here.
+#
 # Output, for version X:
 #   Working_X_universal.dmg              signed, notarized, stapled; what people and Homebrew install
 #   Working_X_universal.app.tar.gz(.sig) the bundle the in-app updater downloads, with its minisign signature
@@ -19,30 +22,21 @@ dist="target/dist"
 rm -rf "$dist"
 mkdir -p "$dist"
 
-notarize() {
-  xcrun notarytool submit "$1" --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" \
-    --issuer "$APPLE_API_ISSUER" --wait --timeout 30m
-}
-
 # WORKING_UPDATES turns the self-updater on; only these builds have it.
-for target in aarch64-apple-darwin x86_64-apple-darwin; do
-  WORKING_UPDATES=1 MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --release --locked -p working --target "$target"
-done
-lipo -create -output target/release/working-universal \
-  target/aarch64-apple-darwin/release/working target/x86_64-apple-darwin/release/working
+build() {
+  WORKING_UPDATES=1 MACOSX_DEPLOYMENT_TARGET=13.0 cargo build --release --locked -p working --target "$1"
+  echo "target/$1/release/working"
+}
+arm64="${WORKING_ARM64_BINARY:-$(build aarch64-apple-darwin | tail -1)}"
+x86_64="${WORKING_X86_64_BINARY:-$(build x86_64-apple-darwin | tail -1)}"
+lipo -create -output target/release/working-universal "$arm64" "$x86_64"
+chmod +x target/release/working-universal
 
 WORKING_BINARY=target/release/working-universal ./scripts/bundle.sh
 app="target/release/Working.app"
 
-ditto -c -k --keepParent "$app" "$dist/notarize.zip"
-notarize "$dist/notarize.zip"
-rm "$dist/notarize.zip"
-xcrun stapler staple "$app"
-
-tarball="$dist/Working_${version}_universal.app.tar.gz"
-tar -C target/release -czf "$tarball" Working.app
-cargo packager signer sign "$tarball"
-
+# One notarization: Apple's ticket for the dmg also covers the signed app inside it, so the app staples from the
+# same submission.
 dmg="$dist/Working_${version}_universal.dmg"
 stage="$(mktemp -d)"
 cp -R "$app" "$stage/"
@@ -50,7 +44,13 @@ ln -s /Applications "$stage/Applications"
 hdiutil create -volname Working -srcfolder "$stage" -fs HFS+ -format UDZO -ov "$dmg"
 rm -rf "$stage"
 codesign --force --timestamp --sign "$WORKING_SIGNING_IDENTITY" "$dmg"
-notarize "$dmg"
+xcrun notarytool submit "$dmg" --key "$APPLE_API_KEY_PATH" --key-id "$APPLE_API_KEY" \
+  --issuer "$APPLE_API_ISSUER" --wait --timeout 30m
 xcrun stapler staple "$dmg"
+xcrun stapler staple "$app"
+
+tarball="$dist/Working_${version}_universal.app.tar.gz"
+tar -C target/release -czf "$tarball" Working.app
+cargo packager signer sign "$tarball"
 
 ls -l "$dist"
