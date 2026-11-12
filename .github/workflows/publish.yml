@@ -26,6 +26,10 @@ jobs:
 
       - uses: swatinem/rust-cache@v2
 
+      # crates/core/build.rs compiles proto/googlechat.proto with prost-build, which needs protoc.
+      - name: Install protoc
+        run: brew install protobuf
+
       - name: Cache cargo-packager
         id: cache-packager
         uses: actions/cache@v6
