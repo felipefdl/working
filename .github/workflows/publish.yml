@@ -184,13 +184,20 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # The draft release is made on Linux, as in the other felipefdl apps, apart from the signing keychain.
+  # Notes, the release, and its files are made on Linux, apart from the signing keychain. A stable tag is published
+  # as the latest release; a tag with a "-" (v0.0.7-rc1) stays a draft prerelease to test by hand.
   publish:
     needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      stable: ${{ steps.version.outputs.stable }}
     steps:
+      # Full history and tags: the notes span the commits since the previous release.
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: actions/download-artifact@v8
         with:
@@ -198,6 +205,7 @@ jobs:
           path: dist
 
       - name: Resolve version
+        id: version
         shell: bash
         run: |
           set -euo pipefail
@@ -207,12 +215,31 @@ jobs:
           else
             TAG="v${VERSION}"
           fi
+          STABLE=true
+          [[ "$TAG" == *-* ]] && STABLE=false
           {
             echo "VERSION=${VERSION}"
             echo "TAG=${TAG}"
+            echo "STABLE=${STABLE}"
           } >> "$GITHUB_ENV"
+          {
+            echo "tag=${TAG}"
+            echo "stable=${STABLE}"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Upload draft release
+      - name: Write release notes
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # The latest published release, so tags that never shipped are covered by this one.
+          previous="$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)"
+          [[ "$previous" == "$TAG" ]] && previous=""
+          python3 scripts/release_notes.py "$TAG" "$previous" > notes.md
+          cat notes.md
+
+      - name: Create and publish the release
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -223,13 +250,35 @@ jobs:
               echo "release ${TAG} is published; refusing to replace assets in place" >&2
               exit 1
             fi
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes-file notes.md
+            gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
           else
-            gh release create "$TAG" \
+            prerelease=()
+            [[ "$STABLE" == "true" ]] || prerelease=(--prerelease)
+            # A draft first, so the release is never public without its files.
+            gh release create "$TAG" dist/* \
               --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
               --draft \
-              --title "Working v${VERSION}" \
-              --notes "" \
-              --target "${GITHUB_SHA}"
+              "${prerelease[@]}" \
+              --title "Working ${TAG}" \
+              --notes-file notes.md
           fi
-          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
-          echo "draft release ${TAG}"
+          if [[ "$STABLE" == "true" ]]; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+            echo "published ${TAG}"
+          else
+            echo "draft prerelease ${TAG}"
+          fi
+
+  # The Homebrew cask, for stable releases. A release published by this workflow's token does not trigger
+  # homebrew.yml's own events, so the same run calls it.
+  homebrew:
+    needs: publish
+    if: needs.publish.outputs.stable == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/homebrew.yml
+    with:
+      tag: ${{ needs.publish.outputs.tag }}
+    secrets: inherit

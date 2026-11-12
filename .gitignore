@@ -14,3 +14,4 @@ browser-profile
 # Local env
 .env
 .env.*
+__pycache__/

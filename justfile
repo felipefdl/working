@@ -80,14 +80,30 @@ logo:
 probe seconds="20":
   WORKING_READONLY=1 WORKING_TRACE=1 cargo run -p gchat-core --example probe -- {{seconds}}
 
-# Bump the version, commit, and tag. Pushing the tag runs .github/workflows/publish.yml.
+# Bump the version, commit, tag, and push. The tag runs .github/workflows/publish.yml: build, sign, notarize, write
+# the notes from the commits, publish the release, and update the Homebrew cask. A version with a "-" (0.0.7-rc1)
+# becomes a draft prerelease instead, with no cask update.
 release version:
+  #!/usr/bin/env bash
+  set -euo pipefail
+  if [[ ! "{{version}}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+    echo "version must be X.Y.Z or X.Y.Z-pre" >&2
+    exit 1
+  fi
+  if [[ "$(git branch --show-current)" != main ]]; then
+    echo "release from main" >&2
+    exit 1
+  fi
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "commit or stash changes first" >&2
+    exit 1
+  fi
   sed -i '' 's/^version = "[^"]*"/version = "{{version}}"/' Cargo.toml
   cargo update -w
   git add Cargo.toml Cargo.lock
   git commit -m "chore(release): v{{version}}"
   git tag "v{{version}}"
-  @echo "Push with: git push origin HEAD --tags"
+  git push origin HEAD "v{{version}}"
 
 # Ordered cheapest first: a formatting failure reports in seconds instead of
 # after the compile steps.

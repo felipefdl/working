@@ -1,11 +1,17 @@
 name: Update Homebrew Cask
 
-# Publishing a release writes Casks/working.rb in the shared felipefdl/homebrew-tap.
+# A stable release writes Casks/working.rb in the shared felipefdl/homebrew-tap.
 # The tap holds every felipefdl app, so this job touches only this app's cask.
 
 on:
-  release:
-    types: [published]
+  # Called by publish.yml after it publishes a stable release.
+  workflow_call:
+    inputs:
+      tag:
+        description: Published release tag (vX.Y.Z)
+        required: true
+        type: string
+  # Manual fallback for a release that is already published.
   workflow_dispatch:
     inputs:
       tag:
@@ -27,7 +33,7 @@ jobs:
       - name: Resolve release
         shell: bash
         env:
-          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          TAG: ${{ inputs.tag }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
