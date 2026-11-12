@@ -177,6 +177,41 @@ jobs:
           (dist / "latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
           PY
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: target/dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # The draft release is made on Linux, as in the other felipefdl apps, apart from the signing keychain.
+  publish:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="v${VERSION}"
+          fi
+          {
+            echo "VERSION=${VERSION}"
+            echo "TAG=${TAG}"
+          } >> "$GITHUB_ENV"
+
       - name: Upload draft release
         shell: bash
         env:
@@ -196,5 +231,5 @@ jobs:
               --notes "" \
               --target "${GITHUB_SHA}"
           fi
-          gh release upload "$TAG" target/dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          gh release upload "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
           echo "draft release ${TAG}"
