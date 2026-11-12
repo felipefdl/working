@@ -83,7 +83,6 @@ probe seconds="20":
 # Bump the version, commit, and tag. Pushing the tag runs .github/workflows/publish.yml.
 release version:
   sed -i '' 's/^version = "[^"]*"/version = "{{version}}"/' Cargo.toml
-  sed -i '' 's/gchat-core = { path = "crates\/core", version = "[^"]*"/gchat-core = { path = "crates\/core", version = "{{version}}"/' Cargo.toml
   cargo update -w
   git add Cargo.toml Cargo.lock
   git commit -m "chore(release): v{{version}}"

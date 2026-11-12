@@ -4,14 +4,19 @@
 resolver = "3"
 members = ["crates/core", "crates/app"]
 
+# Version and metadata live here only. The app (`working`) inherits them: the updater compares against its
+# CARGO_PKG_VERSION. Library crates in the workspace carry neither.
 [workspace.package]
 edition = "2024"
 rust-version = "1.99.1"
 version = "0.0.1"
+description = "Native macOS Google Chat client"
+license = "MIT"
+repository = "https://github.com/felipefdl/working"
 publish = false
 
 [workspace.dependencies]
-gchat-core = { path = "crates/core", version = "0.0.1" }
+gchat-core = { path = "crates/core" }
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 base64 = "0.22"
