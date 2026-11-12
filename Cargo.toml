@@ -7,11 +7,11 @@ members = ["crates/core", "crates/app"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.99.1"
-version = "0.1.0"
+version = "0.0.1"
 publish = false
 
 [workspace.dependencies]
-gchat-core = { path = "crates/core", version = "0.1.0" }
+gchat-core = { path = "crates/core", version = "0.0.1" }
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
 base64 = "0.22"
