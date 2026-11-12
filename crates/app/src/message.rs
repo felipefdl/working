@@ -681,12 +681,13 @@ fn marked_plain(text: &str, find: Option<&str>, current: Option<&Range<usize>>) 
 }
 
 fn rich_text(id: &str, text: &str, spans: &[Span], find: Option<&str>, current: Option<&Range<usize>>) -> AnyElement {
-  let mut blocks: Vec<Range<usize>> = spans
+  // Code blocks and list items each take their own row; the text between them flows as plain segments.
+  let mut blocks: Vec<(Range<usize>, bool)> = spans
     .iter()
-    .filter(|s| matches!(s.kind, SpanKind::CodeBlock) && valid(text, &s.range))
-    .map(|s| s.range.clone())
+    .filter(|s| matches!(s.kind, SpanKind::CodeBlock | SpanKind::ListItem) && valid(text, &s.range))
+    .map(|s| (s.range.clone(), s.kind == SpanKind::ListItem))
     .collect();
-  blocks.sort_by_key(|r| r.start);
+  blocks.sort_by_key(|(range, _)| range.start);
 
   let mut column = v_flex().gap_1().items_start().min_w_0();
   let mut pos = 0;
@@ -708,25 +709,51 @@ fn rich_text(id: &str, text: &str, spans: &[Span], find: Option<&str>, current: 
       current,
     ))
   };
-  for block in blocks {
+  for (block, item) in blocks {
     if block.start < pos {
       continue;
     }
     if block.start > pos {
       column = push_text(column, pos..block.start, &mut n);
     }
-    let code = text[block.clone()].trim_matches('\n').to_string();
-    column = column.child(
-      div()
-        .px_3()
-        .py_2()
-        .rounded(px(8.))
-        .bg(rgb(CODE_BG))
-        .font_family(MONO)
-        .text_size(px(12.5))
-        .child(code),
-    );
+    column = if item {
+      let line = text[block.clone()].trim_end_matches(['\n', ' ']);
+      n += 1;
+      column.child(
+        h_flex()
+          .w_full()
+          .min_w_0()
+          .pl_2()
+          .gap_2()
+          .items_start()
+          .child(div().flex_shrink_0().child("•"))
+          .child(div().flex_1().min_w_0().child(text_segment(
+            SharedString::from(format!("{id}-t{n}")),
+            text,
+            block.start..block.start + line.len(),
+            spans,
+            find,
+            current,
+          ))),
+      )
+    } else {
+      let code = text[block.clone()].trim_matches('\n').to_string();
+      column.child(
+        div()
+          .px_3()
+          .py_2()
+          .rounded(px(8.))
+          .bg(rgb(CODE_BG))
+          .font_family(MONO)
+          .text_size(px(12.5))
+          .child(code),
+      )
+    };
     pos = block.end;
+    // The line break that ends a block is the row itself, not a blank line before the next text.
+    if text[pos..].starts_with('\n') {
+      pos += 1;
+    }
   }
   if pos < text.len() {
     column = push_text(column, pos..text.len(), &mut n);
@@ -802,7 +829,7 @@ fn text_segment(
           style.color = Some(rgb(ACCENT).into());
           style.background_color = Some(rgb(ACCENT_BG).into());
         },
-        SpanKind::CodeBlock => {},
+        SpanKind::CodeBlock | SpanKind::ListItem => {},
       }
     }
     if touched {
@@ -1161,45 +1188,79 @@ fn chip(att: &Attachment, id: SharedString, viewer_first: bool) -> AnyElement {
     .into_any_element()
 }
 
+/// An app card as Google Chat draws it: a bordered box, the header first, then each section with a divider above it.
 fn card_view(card: &Card, msg_id: &str, ix: usize) -> AnyElement {
+  let block = |first: bool| {
+    v_flex()
+      .gap_1()
+      .px_4()
+      .py_3()
+      .when(!first, |block| block.border_t_1().border_color(rgb(BORDER)))
+  };
   let mut body = v_flex()
-    .max_w(px(480.))
-    .gap_1()
-    .p_3()
+    .max_w(px(560.))
     .rounded(px(12.))
     .border_1()
     .border_color(rgb(BORDER))
+    .overflow_hidden()
     .text_size(px(13.))
     .text_color(rgb(TEXT));
-  if !card.title.is_empty() {
-    body = body.child(div().font_weight(FontWeight::SEMIBOLD).child(card.title.clone()));
+  let mut first = true;
+  if !card.title.is_empty() || !card.subtitle.is_empty() {
+    let mut header = block(first);
+    if !card.title.is_empty() {
+      header = header.child(div().text_size(px(15.)).child(card.title.clone()));
+    }
+    if !card.subtitle.is_empty() {
+      header = header.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(card.subtitle.clone()));
+    }
+    body = body.child(header);
+    first = false;
   }
-  if !card.subtitle.is_empty() {
-    body = body.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(card.subtitle.clone()));
-  }
-  for line in &card.lines {
-    body = body.child(div().child(line.clone()));
-  }
-  if !card.links.is_empty() {
-    let mut buttons = h_flex().flex_wrap().gap_2().pt_1();
-    for (i, (label, url)) in card.links.iter().enumerate() {
-      let url = url.clone();
-      buttons = buttons.child(
+  for (s, section) in card.sections.iter().enumerate() {
+    let mut out = block(first);
+    first = false;
+    if !section.header.is_empty() {
+      out = out.child(
         div()
-          .id(SharedString::from(format!("{msg_id}-c{ix}-{i}")))
+          .text_size(px(12.))
+          .font_weight(FontWeight::SEMIBOLD)
+          .text_color(rgb(MUTED))
+          .child(section.header.clone()),
+      );
+    }
+    for line in &section.lines {
+      out = out.child(div().child(line.clone()));
+    }
+    if !section.buttons.is_empty() {
+      let mut row = h_flex().flex_wrap().gap_2().pt_2();
+      for (b, button) in section.buttons.iter().enumerate() {
+        let pill = div()
+          .id(SharedString::from(format!("{msg_id}-c{ix}-{s}-{b}")))
           .px_3()
           .py_1()
           .rounded_full()
           .border_1()
           .border_color(rgb(BORDER))
-          .text_color(rgb(ACCENT))
-          .cursor_pointer()
-          .hover(|s| s.bg(rgb(ROW_HOVER)))
-          .on_click(move |_, _, cx| cx.open_url(&url))
-          .child(label.clone()),
-      );
+          .child(button.label.clone());
+        row = row.child(match &button.url {
+          Some(url) => {
+            let url = url.clone();
+            pill
+              .text_color(rgb(ACCENT))
+              .cursor_pointer()
+              .hover(|style| style.bg(rgb(ROW_HOVER)))
+              .on_click(move |_, _, cx| cx.open_url(&url))
+          },
+          // An action calls the app back through Google Chat, which this client cannot send yet.
+          None => pill
+            .text_color(rgb(MUTED))
+            .tooltip(hint("Use this button in Google Chat on the web")),
+        });
+      }
+      out = out.child(row);
     }
-    body = body.child(buttons);
+    body = body.child(out);
   }
   body.into_any_element()
 }

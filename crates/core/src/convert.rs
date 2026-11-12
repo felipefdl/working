@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 
 use crate::model::{
-  Attachment, AttachmentKind, Card, Group, GroupId, GroupKind, Message, Notify, Placement, Quote, Reaction, Snippet,
-  Span, SpanKind, User,
+  Attachment, AttachmentKind, Card, CardButton, CardSection, Group, GroupId, GroupKind, Message, Notify, Placement,
+  Quote, Reaction, Snippet, Span, SpanKind, User,
 };
 use crate::proto;
 
@@ -342,6 +342,8 @@ fn annotations(text: &str, annotations: &[proto::Annotation]) -> (Vec<Span>, Vec
           Some(Format::Underline) => span(SpanKind::Underline),
           Some(Format::Monospace | Format::SourceCode) => span(SpanKind::Code),
           Some(Format::MonospaceBlock) => span(SpanKind::CodeBlock),
+          // The list itself (BULLETED_LIST) only wraps its items.
+          Some(Format::BulletedListItem) => span(SpanKind::ListItem),
           _ => {},
         }
       },
@@ -507,14 +509,17 @@ fn card(item: &proto::JAddOnsCardItem) -> Card {
     card.title = formatted(header.title.as_ref());
     card.subtitle = formatted(header.subtitle.as_ref());
   }
-  let mut line = |text: String| {
-    if !text.is_empty() {
-      card.lines.push(text);
-    }
-  };
-  let mut links = Vec::new();
   for section in &item.sections {
-    line(formatted(section.header.as_ref()));
+    let mut out = CardSection {
+      header: formatted(section.header.as_ref()),
+      ..CardSection::default()
+    };
+    let mut line = |text: String| {
+      if !text.is_empty() {
+        out.lines.push(text);
+      }
+    };
+    let mut buttons = Vec::new();
     for widget in &section.widgets {
       if let Some(paragraph) = &widget.text_paragraph {
         line(formatted(paragraph.text.as_ref()));
@@ -541,27 +546,35 @@ fn card(item: &proto::JAddOnsCardItem) -> Card {
         });
         line(formatted(pair.bottom_label.as_ref()));
         if let Some(url) = click_url(pair.on_click.as_ref()) {
-          links.push((
-            if content.is_empty() {
+          buttons.push(CardButton {
+            label: if content.is_empty() {
               "Open".to_string()
             } else {
               content
             },
-            url,
-          ));
+            url: Some(url),
+          });
         }
       }
       for button in &widget.buttons {
         let Some(button) = &button.text_button else {
           continue;
         };
-        if let Some(url) = click_url(button.on_click.as_deref()) {
-          links.push((formatted(button.text.as_ref()), url));
+        let label = formatted(button.text.as_ref());
+        if label.is_empty() || button.disabled.unwrap_or(false) {
+          continue;
         }
+        buttons.push(CardButton {
+          label,
+          url: click_url(button.on_click.as_deref()),
+        });
       }
     }
+    out.buttons = buttons;
+    if !out.header.is_empty() || !out.lines.is_empty() || !out.buttons.is_empty() {
+      card.sections.push(out);
+    }
   }
-  card.links = links;
   card
 }
 
@@ -588,7 +601,7 @@ pub fn message(message: &proto::Message, users: &Users) -> Option<Message> {
     .iter()
     .filter_map(|attachment| attachment.card_add_on_data.as_ref())
     .map(card)
-    .filter(|card| !card.title.is_empty() || !card.lines.is_empty() || !card.links.is_empty())
+    .filter(|card| !card.is_empty())
     .collect();
   let quote = message.quoted_message_metadata.as_ref().map(|quoted| Quote {
     sender_name: quoted
@@ -728,6 +741,37 @@ mod tests {
     assert_eq!(spans.len(), 1);
     assert_eq!(spans[0].kind, SpanKind::Bold);
     assert_eq!(&"café"[spans[0].range.clone()], "café");
+  }
+
+  #[test]
+  fn bulleted_list_items_become_list_spans() {
+    use proto::format_metadata::FormatType as Format;
+    let format = |format_type: proto::format_metadata::FormatType, start: i32, length: i32| proto::Annotation {
+      r#type: Some(proto::AnnotationType::FormatData as i32),
+      start_index: Some(start),
+      length: Some(length),
+      format_metadata: Some(proto::FormatMetadata {
+        format_type: Some(format_type as i32),
+        ..Default::default()
+      }),
+      ..Default::default()
+    };
+    let text = "New\none\ntwo";
+    let (spans, _) = annotations(
+      text,
+      &[
+        format(Format::BulletedList, 4, 7),
+        format(Format::BulletedListItem, 4, 3),
+        format(Format::BulletedListItem, 8, 3),
+      ],
+    );
+    let items: Vec<&str> = spans
+      .iter()
+      .filter(|span| span.kind == SpanKind::ListItem)
+      .map(|span| &text[span.range.clone()])
+      .collect();
+    assert_eq!(items, ["one", "two"]);
+    assert_eq!(spans.len(), 2);
   }
 
   #[test]

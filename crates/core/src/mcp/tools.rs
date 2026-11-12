@@ -473,8 +473,14 @@ fn line(message: &Message, me: &str) -> String {
   }
   for card in &message.cards {
     let mut parts: Vec<String> = vec![card.title.clone(), card.subtitle.clone()];
-    parts.extend(card.lines.iter().cloned());
-    parts.extend(card.links.iter().map(|(label, url)| format!("{label}: {url}")));
+    for section in &card.sections {
+      parts.push(section.header.clone());
+      parts.extend(section.lines.iter().cloned());
+      parts.extend(section.buttons.iter().map(|button| match &button.url {
+        Some(url) => format!("{}: {url}", button.label),
+        None => format!("[{}]", button.label),
+      }));
+    }
     parts.retain(|part| !part.trim().is_empty());
     let _ = write!(out, " [card: {}]", clip(&parts.join(" | "), 400));
   }

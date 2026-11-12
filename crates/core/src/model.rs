@@ -164,6 +164,8 @@ pub enum SpanKind {
   Mention(String),
   /// @all mention.
   MentionAll,
+  /// One item of a bulleted list: its line, without a bullet character (the UI draws the bullet).
+  ListItem,
 }
 
 /// Formatting over a byte range of `Message::text`, always on char boundaries.
@@ -231,17 +233,47 @@ pub struct Quote {
   pub text: String,
 }
 
-/// App card flattened to text: enough to read activity feeds.
+/// App card, its widgets reduced to text lines and buttons per section.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Card {
   /// Card title.
   pub title: String,
   /// Card subtitle.
   pub subtitle: String,
-  /// Body lines.
+  /// Sections in order; Google Chat draws a divider between them.
+  pub sections: Vec<CardSection>,
+}
+
+/// One section of a card.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardSection {
+  /// Section header, when it has one.
+  pub header: String,
+  /// Text lines.
   pub lines: Vec<String>,
-  /// Button labels with the link each opens.
-  pub links: Vec<(String, String)>,
+  /// Buttons, in order.
+  pub buttons: Vec<CardButton>,
+}
+
+/// A card button.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardButton {
+  /// Label.
+  pub label: String,
+  /// The link it opens. None for a button that calls the app back (an action), which this client cannot send.
+  pub url: Option<String>,
+}
+
+impl Card {
+  /// Whether the card has nothing to show.
+  pub fn is_empty(&self) -> bool {
+    self.title.is_empty()
+      && self.subtitle.is_empty()
+      && self
+        .sections
+        .iter()
+        .all(|section| section.header.is_empty() && section.lines.is_empty() && section.buttons.is_empty())
+  }
 }
 
 /// One Chat message, already resolved for the UI.
