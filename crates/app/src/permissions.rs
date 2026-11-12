@@ -6,8 +6,6 @@ use objc2::msg_send;
 use objc2::runtime::{AnyClass, Bool};
 use objc2_foundation::NSString;
 
-use crate::screen;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
   Allowed,
@@ -59,14 +57,5 @@ pub fn request_media(media: Media) {
   // SAFETY: a class method taking one NSString and a block of the declared shape.
   unsafe {
     let _: () = msg_send![class, requestAccessForMediaType: &*kind, completionHandler: &*ignore];
-  }
-}
-
-/// Screen recording. macOS does not tell "denied" from "not asked yet" here.
-pub fn screen() -> Status {
-  if screen::permitted() {
-    Status::Allowed
-  } else {
-    Status::Denied
   }
 }

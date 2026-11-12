@@ -63,7 +63,7 @@ just run
 | `just probe` | Read-only protocol smoke test that prints counts and event types, never message text |
 | `just logo` | Rebuild the logo and icon images |
 
-With an Apple Development certificate in your keychain, local builds keep camera, microphone, and screen-recording permissions across rebuilds. Without one, macOS asks again after every build.
+With an Apple Development certificate in your keychain, local builds keep camera and microphone permissions across rebuilds. Without one, macOS asks again after every build.
 
 The app is `crates/app` (GPUI). The Google Chat protocol, realtime stream, cache, and MCP server are in `crates/core`, and the app talks to them only through commands and events.
 

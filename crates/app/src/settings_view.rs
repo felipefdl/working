@@ -12,7 +12,6 @@ use gpui_kit::*;
 
 use crate::notify;
 use crate::permissions::{self, Media, Status};
-use crate::screen;
 use crate::settings::{
   self, ActivityStatus, Appearance, DEFAULT_REWRITE_INSTRUCTION, Density, McpState, RewriteTool, Settings, Sound,
 };
@@ -24,7 +23,6 @@ use crate::ui::{Icon, icon, switch};
 
 const CAMERA_PANE: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera";
 const MICROPHONE_PANE: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
-const SCREEN_PANE: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
 const NOTIFICATIONS_PANE: &str = "x-apple.systempreferences:com.apple.Notifications-Settings.extension";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -104,7 +102,6 @@ impl Access {
 struct Allowed {
   camera: Status,
   microphone: Status,
-  screen: Status,
   notifications: Option<Status>,
 }
 
@@ -258,7 +255,6 @@ impl SettingsView {
     Allowed {
       camera: permissions::media(Media::Camera),
       microphone: permissions::media(Media::Microphone),
-      screen: permissions::screen(),
       notifications: None,
     }
   }
@@ -894,12 +890,7 @@ impl SettingsView {
   }
 
   fn permissions(&self) -> Div {
-    let Allowed {
-      camera,
-      microphone,
-      screen,
-      notifications,
-    } = self.allowed;
+    let Allowed { camera, microphone, notifications } = self.allowed;
     let media = |media: Media, status: Status, pane: &'static str| {
       move |cx: &mut App| match status {
         Status::NotAsked => permissions::request_media(media),
@@ -924,19 +915,6 @@ impl SettingsView {
           Some(microphone),
           false,
           media(Media::Microphone, microphone, MICROPHONE_PANE),
-        ))
-        .child(Self::permission(
-          "screen",
-          "Screen & System Audio Recording",
-          "Sharing your screen at its full sharpness.",
-          Some(screen),
-          false,
-          move |cx| {
-            if screen != Status::Allowed {
-              screen::request_permission();
-            }
-            cx.open_url(SCREEN_PANE);
-          },
         ))
         .child(Self::permission(
           "notifications",

@@ -2,7 +2,7 @@
 //
 // It strips the page down to the video tiles, joins by itself, keeps the camera away from Meet until the app's
 // camera switch is on, clicks Meet's own buttons on behalf of the app's control bar, reports the call state
-// back through `window.ipc`, and sends a shared screen sharper than WebKit's defaults give.
+// back through `window.ipc`, and gives Meet the screen the app captures when the user shares one.
 //
 // Meet's class names are generated and change; everything here hooks on what stays put: the `main` element that
 // holds the tiles, `jsname` attributes, and (English, forced with `hl=en`) accessibility labels.
@@ -216,17 +216,54 @@
     leave: () => click(leave()),
   };
 
-  // ---- Media quality -------------------------------------------------------------------------------------
-  // Measured in a call: Meet asks WebKit for a screen of at most 1920x1200 at 5 fps, and WebKit answers that
-  // with a 640-wide capture. Asking for the full size instead gets the display's size in points, which is the
-  // most WebKit offers (it does not capture Retina pixels). The steps below ask for that, mark the stream as
-  // text-like, and lift the bitrate cap.
+  // ---- Screen sharing ------------------------------------------------------------------------------------
+  // Where the app can (`__workingShare`), it shares the screen itself: Meet's request for a screen opens the
+  // macOS picker from the app, which captures what was picked at its real pixels and sends the pictures here.
+  // They are drawn on a canvas, and the canvas's stream is what Meet gets as the shared screen. WebKit's own
+  // capture is not used: it stops at the display's size in points, which reads blurry on a Retina screen, and
+  // its picker stops answering once the app captures the screen too.
+  //
+  // On a macOS without that picker the request goes to WebKit, lifted as far as it goes. Measured in a call:
+  // Meet asks for a screen of at most 1920x1200 at 5 fps, and WebKit answers that with a 640-wide capture;
+  // asking for the full size gets the display's size in points.
+  //
+  // Either way the stream is marked as text-like and its bitrate cap is lifted.
 
   const SCREEN_BITRATE = 4000000;
+  // The tracks that carry the shared screen, by id: the one Meet was given and every copy it makes.
   const screenTracks = new Set();
   const connections = [];
   const boosted = new WeakSet();
   const Devices = window.MediaDevices && MediaDevices.prototype;
+
+  // The app's share: the canvas its pictures are drawn on and the tracks of that canvas's stream.
+  let feed = null;
+  // Meet's request for a screen, while the picker is open.
+  let picking = null;
+  // Counts Meet's requests: what the app sends back names the request it answers, so a late picture or end of
+  // an earlier share is told apart.
+  let request = 0;
+  let pictures = 0;
+
+  function adoptScreenTrack(track) {
+    if (screenTracks.has(track.id)) return;
+    screenTracks.add(track.id);
+    // Text and UI: keep detail, drop frames instead.
+    track.contentHint = 'detail';
+    if (feed) feed.tracks.add(track);
+    else track.addEventListener('ended', () => screenTracks.delete(track.id));
+  }
+
+  function pickScreen() {
+    if (picking) return Promise.reject(new DOMException('A screen is already being picked.', 'InvalidStateError'));
+    // A share Meet has let go of, not yet seen as over.
+    if (feed) stopFeed();
+    return new Promise((resolve, reject) => {
+      picking = { resolve, reject };
+      request += 1;
+      window.ipc.postMessage(`capture|pick|${request}`);
+    });
+  }
 
   const sharpSize = () => {
     const scale = window.devicePixelRatio || 2;
@@ -237,48 +274,43 @@
     };
   };
 
-  function adoptScreenTrack(track) {
-    if (screenTracks.has(track.id)) return;
-    screenTracks.add(track.id);
-    // Text and UI: keep detail, drop frames instead.
-    track.contentHint = 'detail';
-    track.addEventListener('ended', (event) => {
-      // Starting the native capture can end WebKit's own. While native pictures stand in for it, Meet must
-      // not hear about that, or it would stop presenting. This listener is added before any of Meet's.
-      if (feed) {
-        if (window.__workingTrace) window.ipc.postMessage('stats|{"webkitCaptureEnded":"hidden from Meet"}');
-        event.stopImmediatePropagation();
-        return;
-      }
-      screenTracks.delete(track.id);
-    });
-  }
-
   // Patched on the prototype: Meet does not call the method through `navigator.mediaDevices`.
   if (Devices && Devices.getDisplayMedia) {
     const capture = Devices.getDisplayMedia;
-    Devices.getDisplayMedia = async function (constraints = {}) {
-      const video = typeof constraints.video === 'object' ? constraints.video : {};
-      if (window.__workingTrace) window.ipc.postMessage('stats|' + JSON.stringify({ asked: constraints }));
-      let stream;
-      try {
-        stream = await capture.call(this, { ...constraints, video: { ...video, ...sharpSize() } });
-      } catch (error) {
-        // The user cancelling the picker is final; anything else gets Meet's own request.
-        if (error && error.name === 'NotAllowedError') throw error;
-        stream = await capture.call(this, constraints);
-      }
-      stream.getVideoTracks().forEach(adoptScreenTrack);
-      return stream;
-    };
+    Devices.getDisplayMedia = window.__workingShare
+      ? pickScreen
+      : async function (constraints = {}) {
+          const video = typeof constraints.video === 'object' ? constraints.video : {};
+          if (window.__workingTrace) window.ipc.postMessage('stats|' + JSON.stringify({ asked: constraints }));
+          let stream;
+          try {
+            stream = await capture.call(this, { ...constraints, video: { ...video, ...sharpSize() } });
+          } catch (error) {
+            // The user cancelling the picker is final; anything else gets Meet's own request.
+            if (error && error.name === 'NotAllowedError') throw error;
+            stream = await capture.call(this, constraints);
+          }
+          stream.getVideoTracks().forEach(adoptScreenTrack);
+          return stream;
+        };
   }
 
-  // Meet may send a copy of the captured track; the copy is the screen too.
+  // Meet works with copies of the track it was given; a copy is the screen too.
   if (window.MediaStreamTrack) {
     const clone = MediaStreamTrack.prototype.clone;
     MediaStreamTrack.prototype.clone = function () {
       const copy = clone.call(this);
       if (screenTracks.has(this.id)) adoptScreenTrack(copy);
+      return copy;
+    };
+  }
+  if (window.MediaStream) {
+    const clone = MediaStream.prototype.clone;
+    MediaStream.prototype.clone = function () {
+      const copy = clone.call(this);
+      if (this.getVideoTracks().some((track) => screenTracks.has(track.id))) {
+        copy.getVideoTracks().forEach(adoptScreenTrack);
+      }
       return copy;
     };
   }
@@ -381,35 +413,17 @@
     };
   }
 
-  // A screen capture is labeled by what it shows ("Screen 1", a window title); a camera has a device name and
+  // WebKit's capture is labeled by what it shows ("Screen 1", a window title); a camera has a device name and
   // no display surface.
   const looksLikeScreen = (track) =>
     track.kind === 'video' && (!!track.getSettings().displaySurface || /^(screen|window)\b/i.test(track.label));
 
-  // ---- Native screen feed ----------------------------------------------------------------------------------
-  // WebKit's capture of a display stops at its size in points. When a whole display is shared, the app
-  // captures its real pixels and sends the pictures here; they are drawn on a canvas whose stream takes the
-  // place of WebKit's track on the wire. Meet keeps holding its own track, so its controls work as before.
-
-  let feed = null;
-  // The share the app could not capture natively (no permission): it stays on WebKit's capture.
-  let refusedFor = null;
-  const swapping = new WeakSet();
-
-  const isDisplay = (track) => {
-    const surface = track.getSettings().displaySurface;
-    return surface ? surface === 'monitor' : /^screen\b/i.test(track.label);
-  };
-
-  function startFeed(track) {
-    const size = track.getSettings();
-    feed = { original: track, canvas: null, context: null, track: null, picture: null, idle: 0 };
-    const kind = isDisplay(track) ? 'display' : 'window';
-    window.ipc.postMessage(`capture|start|${kind}|${size.width}x${size.height}|${track.label}`);
-  }
-
+  // Meet is done with the share: the app stops capturing.
   function stopFeed() {
-    if (feed.track) feed.track.stop();
+    for (const track of feed.tracks) {
+      track.stop();
+      screenTracks.delete(track.id);
+    }
     if (feed.picture) feed.picture.close();
     feed = null;
     window.ipc.postMessage('capture|stop');
@@ -420,71 +434,86 @@
     if (feed && feed.picture) feed.context.drawImage(feed.picture, 0, 0);
   }
 
-  // Called by the app with each new picture of the shared display or window, a base64 JPEG.
-  async function frame(base64) {
-    if (!feed) return;
+  // Called by the app with each new picture of what is shared, a base64 JPEG. The first one answers Meet's
+  // request, so the stream has the picture's size from its start.
+  async function frame(id, base64) {
+    if (id !== request || (!feed && !picking)) return;
+    const turn = ++pictures;
     const binary = atob(base64);
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     const picture = await createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
-    if (!feed) {
+    // The share ended meanwhile, or a later picture got here first.
+    if (id !== request || (!feed && !picking) || (feed && turn < feed.turn)) {
       picture.close();
       return;
     }
-    if (!feed.canvas) {
-      feed.canvas = document.createElement('canvas');
-      feed.context = feed.canvas.getContext('2d');
-      feed.track = feed.canvas.captureStream(10).getVideoTracks()[0];
-      adoptScreenTrack(feed.track);
+    if (!feed) {
+      const canvas = document.createElement('canvas');
+      feed = { canvas, context: canvas.getContext('2d'), tracks: new Set(), picture: null, turn: 0, sent: false, idle: 0 };
     }
     // A shared window can be resized while it is shared.
     if (feed.canvas.width !== picture.width || feed.canvas.height !== picture.height) {
       feed.canvas.width = picture.width;
       feed.canvas.height = picture.height;
     }
+    const stream = picking && feed.canvas.captureStream(10);
     if (feed.picture) feed.picture.close();
     feed.picture = picture;
+    feed.turn = turn;
     paintFeed();
+    if (picking) {
+      stream.getVideoTracks().forEach(adoptScreenTrack);
+      picking.resolve(stream);
+      picking = null;
+    }
   }
   window.__working.frame = frame;
-  window.__working.captureRefused = () => {
-    if (!feed) return;
-    refusedFor = feed.original.id;
+  // The picker was closed without a choice: to Meet, the user said no.
+  window.__working.shareCancelled = (id) => {
+    if (id !== request || !picking) return;
+    picking.reject(new DOMException('The user did not pick a screen to share.', 'NotAllowedError'));
+    picking = null;
+  };
+  // macOS stopped the capture ("Stop Sharing" in the menu bar, or the shared window closed): Meet hears that
+  // its screen ended, as it would from a capture of WebKit's.
+  window.__working.shareStopped = (id) => {
+    window.__working.shareCancelled(id);
+    if (id !== request || !feed) return;
+    const tracks = [...feed.tracks].filter((track) => track.readyState === 'live');
+    for (const track of feed.tracks) screenTracks.delete(track.id);
+    if (feed.picture) feed.picture.close();
     feed = null;
+    for (const track of tracks) {
+      track.stop();
+      track.dispatchEvent(new Event('ended'));
+    }
   };
 
   function boostScreenSenders() {
-    // The share is over once nothing sends the display any more, in either form.
+    const senders = connections
+      .filter((connection) => connection.connectionState !== 'closed')
+      .flatMap((connection) => connection.getSenders());
+    // The share is over once Meet has stopped every track of it, or sends none of them any more.
     if (feed) {
-      const carried = connections.some(
-        (connection) =>
-          connection.connectionState !== 'closed' &&
-          connection.getSenders().some((s) => s.track && (s.track === feed.track || s.track.id === feed.original.id)),
-      );
+      const carried = senders.some((sender) => feed.tracks.has(sender.track));
+      feed.sent = feed.sent || carried;
       feed.idle = carried ? 0 : feed.idle + 1;
-      if (feed.idle >= 3) stopFeed();
+      const live = [...feed.tracks].some((track) => track.readyState === 'live');
+      if (!live || (feed.sent && feed.idle >= 3)) stopFeed();
     }
-    for (const connection of connections) {
-      if (connection.connectionState === 'closed') continue;
-      for (const sender of connection.getSenders()) {
-        const track = sender.track;
-        if (!track) continue;
-        // A capture that did not come through the wrapper above: take it over here and ask for full size.
-        if (!screenTracks.has(track.id) && looksLikeScreen(track)) {
-          adoptScreenTrack(track);
-          track.applyConstraints(sharpSize()).catch(() => {});
-        }
-        if (!screenTracks.has(track.id)) continue;
-        if (!feed && track.readyState === 'live' && track.id !== refusedFor) startFeed(track);
-        // Once the first native picture is in, it goes out instead of WebKit's capture.
-        if (feed && feed.track && track.id === feed.original.id && !swapping.has(sender)) {
-          swapping.add(sender);
-          sender.replaceTrack(feed.track).finally(() => swapping.delete(sender));
-        }
-        if (boosted.has(sender)) continue;
-        boosted.add(sender);
-        sender.setParameters(sender.getParameters()).catch(() => boosted.delete(sender));
+    for (const sender of senders) {
+      const track = sender.track;
+      if (!track) continue;
+      // A capture of WebKit's that did not come through the wrapper above: take it over here and ask for
+      // full size.
+      if (!window.__workingShare && !screenTracks.has(track.id) && looksLikeScreen(track)) {
+        adoptScreenTrack(track);
+        track.applyConstraints(sharpSize()).catch(() => {});
       }
+      if (!screenTracks.has(track.id) || boosted.has(sender)) continue;
+      boosted.add(sender);
+      sender.setParameters(sender.getParameters()).catch(() => boosted.delete(sender));
     }
   }
 

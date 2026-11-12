@@ -13,10 +13,10 @@ use gpui_kit::*;
 use gpui_webview::WebView;
 use wry::WebViewBuilder;
 
-use crate::screen::{self, ScreenCapture, Shared};
+use crate::screen::{self, End, Frame, Share};
 use crate::session;
 use crate::settings::Settings;
-use crate::theme::{ACCENT, ACCENT_BG, AMBER, BG, FIELD, GREEN, HANGUP, MUTED, OFF_BG, TEXT, Tone, WHITE, rgb};
+use crate::theme::{ACCENT, ACCENT_BG, BG, FIELD, GREEN, HANGUP, MUTED, OFF_BG, TEXT, Tone, WHITE, rgb};
 
 use crate::ui::{Icon, icon};
 
@@ -25,8 +25,6 @@ const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleW
 
 const TOP_BAR_HEIGHT: f32 = 44.0;
 const CONTROLS_HEIGHT: f32 = 68.0;
-/// The System Settings pane where screen recording is allowed per app.
-const SCREEN_RECORDING_SETTINGS: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -94,14 +92,9 @@ struct CallView {
   copied: bool,
   _copied_reset: Option<Task<()>>,
   state: CallState,
-  /// Native capture of the display being shared, when macOS allows it; its frames go to the page.
-  capture: Option<(ScreenCapture, Task<()>)>,
-  /// The Screen Recording prompt was raised in this call; macOS shows it once.
-  asked_permission: bool,
-  /// Waiting for that prompt's answer, to start the native capture on Allow.
-  permission_wait: Option<Task<()>>,
-  /// A share is running on `WebKit`'s softer capture because macOS has not allowed screen recording.
-  capture_blocked: bool,
+  /// The screen share, from the macOS picker to its end, with the tasks that pass its frames and its end to
+  /// the page.
+  share: Option<(Share, Task<()>, Task<()>)>,
   _reports: Task<()>,
   _session_sync: Task<()>,
   /// Turns the camera off when "Camera always off" is switched on during a call.
@@ -119,6 +112,12 @@ impl CallView {
       .with_background_color((0x13, 0x13, 0x14, 255))
       .with_initialization_script(if trace {
         "window.__workingTrace = true;"
+      } else {
+        ""
+      })
+      // The page asks the app for a shared screen where the app can pick and capture one.
+      .with_initialization_script(if screen::available() {
+        "window.__workingShare = true;"
       } else {
         ""
       })
@@ -206,10 +205,7 @@ impl CallView {
       copied: false,
       _copied_reset: None,
       state,
-      capture: None,
-      asked_permission: false,
-      permission_wait: None,
-      capture_blocked: false,
+      share: None,
       _reports: reports,
       _session_sync: session_sync,
       _settings: cx.observe_global::<Settings>(|this, cx| {
@@ -221,76 +217,41 @@ impl CallView {
     }
   }
 
-  /// The page shares a display or a window (`start|<display or window>|<width>x<height>|<name>`, the size in
-  /// points) or stopped (`stop`).
+  /// The page wants a screen to share (`pick|<request number>`), or its share is over (`stop`). What goes
+  /// back to the page carries that number.
   fn on_capture(&mut self, request: &str, cx: &mut Context<Self>) {
-    self.capture = None;
-    self.permission_wait = None;
-    self.capture_blocked = false;
-    cx.notify();
-    let Some(share) = request.strip_prefix("start|") else {
+    self.share = None;
+    let Some(id) = request.strip_prefix("pick|").and_then(|id| id.parse::<u32>().ok()) else {
       return;
     };
-    let mut parts = share.splitn(3, '|');
-    let (Some(kind), Some(size), label) = (parts.next(), parts.next(), parts.next().unwrap_or_default()) else {
-      return;
-    };
-    let Some(points) = size.split_once('x').and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?))) else {
-      return;
-    };
-    let shared = match kind {
-      "display" => Shared::Display { points },
-      _ => Shared::Window { points, label: label.to_string() },
-    };
-    if screen::permitted() {
-      return self.start_capture(shared, cx);
-    }
-    // Until macOS allows it, the call keeps WebKit's softer capture, and the top bar offers the setting. The
-    // first time, macOS also asks; the native capture takes over as soon as it is allowed.
-    self.capture_blocked = true;
-    if !self.asked_permission {
-      self.asked_permission = true;
-      screen::request_permission();
-    }
-    self.permission_wait = Some(cx.spawn(async move |this, cx| {
-      for _ in 0..120 {
-        cx.background_executor().timer(std::time::Duration::from_secs(1)).await;
-        if screen::permitted() {
-          this
-            .update(cx, |this, cx| {
-              this.capture_blocked = false;
-              this.start_capture(shared, cx);
-              cx.notify();
-            })
-            .ok();
-          return;
-        }
-      }
-      this.update(cx, |this, cx| this.run("captureRefused()", cx)).ok();
-    }));
-  }
-
-  fn start_capture(&mut self, shared: Shared, cx: &mut Context<Self>) {
     // One frame of slack: the capture waits for the page instead of piling pictures up.
-    let (frame_tx, frame_rx) = flume::bounded::<screen::Frame>(1);
-    let capture = ScreenCapture::start(shared, frame_tx);
+    let (frame_tx, frame_rx) = flume::bounded::<Frame>(1);
+    let (end_tx, end_rx) = flume::unbounded();
+    let share = Share::pick(frame_tx, end_tx);
     let frames = cx.spawn(async move |this, cx| {
-      let mut sent_any = false;
       while let Ok(frame) = frame_rx.recv_async().await {
-        sent_any = true;
-        if this
-          .update(cx, |this, cx| this.run(&format!("frame('{}')", frame.jpeg_base64), cx))
-          .is_err()
-        {
+        let sent = this.update(cx, |this, cx| this.run(&format!("frame({id},'{}')", frame.jpeg_base64), cx));
+        if sent.is_err() {
           return;
         }
-      }
-      // The display or window was not found: the share stays on WebKit's capture.
-      if !sent_any {
-        this.update(cx, |this, cx| this.run("captureRefused()", cx)).ok();
       }
     });
-    self.capture = Some((capture, frames));
+    let ended = cx.spawn(async move |this, cx| {
+      let Ok(end) = end_rx.recv_async().await else {
+        return;
+      };
+      let call = match end {
+        End::Cancelled => format!("shareCancelled({id})"),
+        End::Stopped => format!("shareStopped({id})"),
+      };
+      this
+        .update(cx, |this, cx| {
+          this.run(&call, cx);
+          this.share = None;
+        })
+        .ok();
+    });
+    self.share = Some((share, frames, ended));
   }
 
   fn copy_link(&mut self, cx: &mut Context<Self>) {
@@ -430,22 +391,6 @@ impl Render for CallView {
           .child("WebUI"),
       )
       .child(div().flex_1())
-      .children(self.capture_blocked.then(|| {
-        div()
-          .id("allow-capture")
-          .px_3()
-          .py_1()
-          .rounded_full()
-          .bg(rgb(AMBER))
-          .text_size(px(12.))
-          .font_weight(FontWeight::MEDIUM)
-          .text_color(rgb(BG))
-          .cursor_pointer()
-          .hover(|s| s.opacity(0.85))
-          .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-          .on_click(|_, _, cx| cx.open_url(SCREEN_RECORDING_SETTINGS))
-          .child("Allow sharp sharing")
-      }))
       .child(
         h_flex()
           .id("copy-link")

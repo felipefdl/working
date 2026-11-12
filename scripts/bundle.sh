@@ -39,7 +39,7 @@ if [ -n "${WORKING_SIGNING_IDENTITY:-}" ]; then
   codesign --verify --strict --verbose=2 "$app"
 else
   # Signed with the Apple Development certificate when the keychain has one: macOS ties permissions the user
-  # grants (screen recording, camera, microphone) to the signature, and an ad-hoc one changes with every build,
+  # grants (camera, microphone) to the signature, and an ad-hoc one changes with every build,
   # so each rebuild would lose them. Without a certificate, ad-hoc is enough to launch.
   identity="$(security find-identity -v -p codesigning 2>/dev/null | sed -n 's/.*"\(Apple Development: [^"]*\)".*/\1/p' | head -1)"
   codesign --force --sign "${identity:--}" "$app" >/dev/null 2>&1
