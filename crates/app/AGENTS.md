@@ -12,3 +12,4 @@ GPUI desktop app (`working`). One main window plus optional Meet call windows.
 - Sign-in is an in-app webview (`welcome.rs`) that loads Google's account page, writes `cookies.json`, and sends `Command::Connect`. Cookie FFI for Meet and sign-in lives in `session.rs`.
 - `crates/app/assets/logo.png` and `logo-light.png` are built by `just logo` from `logo/logo.svg`. Edit the SVG, then regenerate.
 - Notifications and the Dock badge need the `.app` bundle (`just run`). A bare `cargo run -p working` binary has no notification center.
+- Rewrite tools (`rewrite.rs`) run one headless job with no instruction files, skills, tools, MCP servers, hooks, plugins, or memory. Before adding or changing one, meet [docs/rewrite-tools.md](../../docs/rewrite-tools.md); Grok is out until it has a bare mode.

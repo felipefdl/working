@@ -125,22 +125,23 @@ Translation
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RewriteTool {
-  #[default]
-  Off,
   Claude,
-  Grok,
   Codex,
   Pi,
+  /// Also what a tool name this build does not know reads as, so a removed tool does not reset every setting.
+  /// Last, as serde requires of the fallback.
+  #[default]
+  #[serde(other)]
+  Off,
 }
 
 impl RewriteTool {
-  pub const ALL: [Self; 5] = [Self::Off, Self::Claude, Self::Grok, Self::Codex, Self::Pi];
+  pub const ALL: [Self; 4] = [Self::Off, Self::Claude, Self::Codex, Self::Pi];
 
   pub const fn label(self) -> &'static str {
     match self {
       Self::Off => "Off",
       Self::Claude => "Claude",
-      Self::Grok => "Grok",
       Self::Codex => "Codex",
       Self::Pi => "Pi",
     }
@@ -150,7 +151,6 @@ impl RewriteTool {
     match self {
       Self::Off => None,
       Self::Claude => Some("claude"),
-      Self::Grok => Some("grok"),
       Self::Codex => Some("codex"),
       Self::Pi => Some("pi"),
     }
@@ -382,6 +382,12 @@ pub fn show_theme(index: usize, cx: &mut App) {
 mod tests {
   use super::{Appearance, Settings, Sound};
   use crate::theme::find;
+
+  #[test]
+  fn unknown_rewrite_tool_reads_as_off() {
+    let tool: super::RewriteTool = serde_json::from_str("\"grok\"").unwrap_or(super::RewriteTool::Pi);
+    assert_eq!(tool, super::RewriteTool::Off);
+  }
 
   #[test]
   fn notification_sound_files() {

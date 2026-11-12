@@ -27,11 +27,7 @@ pub fn run(tool: RewriteTool, extra: &str, draft: &str) -> Result<String, String
   let system = system_prompt(extra);
   let inv = invocation(tool, &system, draft, &tmp);
   let mut cmd = Command::new(&bin);
-  cmd
-    .args(&inv.args)
-    .current_dir(&tmp)
-    .env("PATH", enriched_path())
-    .env("GROK_DISABLE_AUTOUPDATER", "1");
+  cmd.args(&inv.args).current_dir(&tmp).env("PATH", enriched_path());
   let output = run_cmd(&mut cmd, inv.stdin.as_deref());
   let last = inv.last_message.as_ref().and_then(|path| std::fs::read_to_string(path).ok());
   let _ = std::fs::remove_dir_all(&tmp);
@@ -94,6 +90,10 @@ fn invocation(tool: RewriteTool, system: &str, draft: &str, tmp: &Path) -> Invoc
     RewriteTool::Claude => Invocation {
       args: vec![
         "-p".into(),
+        // No user, project, or local settings: no CLAUDE.md, hooks, or plugins. Managed (organization) policy
+        // still applies, by design.
+        "--setting-sources".into(),
+        String::new(),
         "--output-format".into(),
         "text".into(),
         "--tools".into(),
@@ -115,33 +115,6 @@ fn invocation(tool: RewriteTool, system: &str, draft: &str, tmp: &Path) -> Invoc
       ],
       stdin: Some(draft.into()),
       last_message: None,
-    },
-    RewriteTool::Grok => {
-      let prompt = tmp.join("prompt.txt");
-      let _ = std::fs::write(&prompt, draft);
-      Invocation {
-        args: vec![
-          "--cwd".into(),
-          tmp.display().to_string(),
-          "--prompt-file".into(),
-          prompt.display().to_string(),
-          "--verbatim".into(),
-          "--system-prompt-override".into(),
-          system.into(),
-          "--disable-web-search".into(),
-          "--no-subagents".into(),
-          "--disallowed-tools".into(),
-          "Agent,run_terminal_cmd,search_replace,read_file,grep,list_dir,web_search,web_fetch,search_tool,use_tool,memory_search,memory_get".into(),
-          "--max-turns".into(),
-          "1".into(),
-          "--permission-mode".into(),
-          "dontAsk".into(),
-          "--output-format".into(),
-          "plain".into(),
-        ],
-        stdin: None,
-        last_message: None,
-      }
     },
     RewriteTool::Codex => {
       let last = tmp.join("last.txt");
@@ -174,6 +147,23 @@ fn invocation(tool: RewriteTool, system: &str, draft: &str, tmp: &Path) -> Invoc
           "view_image".into(),
           "--disable".into(),
           "goals".into(),
+          // No user config (its MCP servers), rules, hooks, plugins, memories, or skills catalog.
+          "--ignore-user-config".into(),
+          "--ignore-rules".into(),
+          "--disable".into(),
+          "hooks".into(),
+          "--disable".into(),
+          "plugins".into(),
+          "--disable".into(),
+          "memories".into(),
+          "--disable".into(),
+          "skill_search".into(),
+          "--disable".into(),
+          "skill_mcp_dependency_install".into(),
+          "-c".into(),
+          "project_doc_max_bytes=0".into(),
+          "-c".into(),
+          "skills.include_instructions=false".into(),
           "-c".into(),
           "web_search=\"disabled\"".into(),
           "-o".into(),
@@ -304,18 +294,10 @@ mod tests {
     assert!(!inv.args.iter().any(|a| a == "--bare"));
     let tools = inv.args.iter().position(|a| a == "--tools").unwrap();
     assert_eq!(inv.args[tools + 1], "");
+    let sources = inv.args.iter().position(|a| a == "--setting-sources").unwrap();
+    assert_eq!(inv.args[sources + 1], "");
+    assert!(inv.args.iter().any(|a| a == "--strict-mcp-config"));
     assert_eq!(inv.stdin.as_deref(), Some("hello"));
-  }
-
-  #[test]
-  fn grok_uses_a_prompt_file_not_stdin() {
-    let tmp = std::env::temp_dir().join("working-rewrite-grok-test");
-    std::fs::create_dir_all(&tmp).unwrap();
-    let inv = invocation(RewriteTool::Grok, "sys", "hello", &tmp);
-    assert!(inv.stdin.is_none());
-    assert!(inv.args.iter().any(|a| a == "--prompt-file"));
-    assert!(inv.args.iter().any(|a| a == "--verbatim"));
-    let _ = std::fs::remove_dir_all(&tmp);
   }
 
   #[test]
@@ -325,6 +307,11 @@ mod tests {
     assert!(inv.args.windows(2).any(|w| w == ["-s", "read-only"]));
     assert!(inv.args.iter().any(|a| a == "--ephemeral"));
     assert!(inv.args.iter().any(|a| a == "--skip-git-repo-check"));
+    assert!(inv.args.iter().any(|a| a == "--ignore-user-config"));
+    for feature in ["hooks", "plugins", "memories", "skill_search"] {
+      assert!(inv.args.windows(2).any(|w| w == ["--disable", feature]), "{feature}");
+    }
+    assert!(inv.args.windows(2).any(|w| w == ["-c", "skills.include_instructions=false"]));
     assert_eq!(inv.stdin.as_deref(), Some("hello"));
     assert!(inv.last_message.is_some());
   }
