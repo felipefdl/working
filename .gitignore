@@ -1,0 +1,16 @@
+# Build
+/target
+**/*.rs.bk
+
+# macOS
+.DS_Store
+
+# Session files live in ~/.config/working. Ignore copies dropped in the tree.
+cookies.json
+mcp-token
+settings.json
+browser-profile
+
+# Local env
+.env
+.env.*

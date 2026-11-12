@@ -1,0 +1,132 @@
+# Working virtual workspace. Quality bar: docs/rust-quality.md
+
+[workspace]
+resolver = "3"
+members = ["crates/core", "crates/app"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.99.1"
+version = "0.1.0"
+publish = false
+
+[workspace.dependencies]
+gchat-core = { path = "crates/core", version = "0.1.0" }
+anyhow = "1"
+axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
+base64 = "0.22"
+block2 = "0.6"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+emojis = "0.9.1"
+flume = "0.11"
+gpui-kit = { version = "0.9.1", features = ["gpui-fast"] }
+gpui-webview = { version = "0.9.1", features = ["gpui-fast"] }
+iana-time-zone = "0.1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff", "bmp"] }
+mime_guess = "2"
+nucleo-matcher = "0.3"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSHTTPCookie", "NSDictionary", "NSString", "NSArray", "NSEnumerator", "NSError"] }
+objc2-user-notifications = "0.3"
+prost = "0.14"
+prost-build = "0.14"
+rand = "0.9"
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "cookies", "gzip", "brotli", "query"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+urlencoding = "2"
+wry = { version = "0.53.3", package = "lb-wry" }
+xcap = "0.9"
+
+# Line tables keep panic and backtrace locations for workspace code and drop the
+# type debuginfo that dominates test binary size and link time.
+[profile.dev]
+debug = "line-tables-only"
+overflow-checks = true
+
+# Dependencies rebuild only when the lockfile changes, so optimizing them costs
+# one build and pays back on every test run. Workspace crates stay unoptimized.
+# Debug assertions and overflow checks still apply everywhere.
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+# GPUI's layout and text pipeline is unusable at opt-level 0 even in dev.
+[profile.dev.package.gpui-pre]
+opt-level = 3
+
+[profile.dev.package.gpui-pre-platform]
+opt-level = 3
+
+[profile.dev.package.gpui-pre-macros]
+opt-level = 3
+
+# Full debug info on demand: `cargo build --profile debugging`.
+[profile.debugging]
+inherits = "dev"
+debug = true
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+overflow-checks = true
+debug = false
+# Aborting panics drops unwind tables from the shipped binary.
+panic = "abort"
+
+# Build scripts and proc macros are host dylibs that rustc `dlopen`s during the
+# build. Stripping one corrupts its load commands, and the macOS release build
+# then fails with "mis-aligned LINKEDIT string pool". The shipped binary above
+# stays stripped; only build-time artifacts opt out.
+[profile.release.build-override]
+strip = false
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "deny"
+
+[workspace.lints.clippy]
+# Groups at deny (priority -1 so individual allows/denies win).
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+
+# Allowed noise (docs/rust-quality.md). Do not expand casually.
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+double_must_use = "allow"
+redundant_pub_crate = "allow"
+multiple_crate_versions = "allow"
+wildcard_dependencies = "allow"
+cargo_common_metadata = "allow"
+mod_module_files = "allow"
+self_named_module_files = "allow"
+decimal_literal_representation = "allow"
+# GPUI views import the kit prelude.
+wildcard_imports = "allow"
+
+# Selected restriction / panic / silent-fail lints (full restriction group is not enabled).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+as_conversions = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+dbg_macro = "deny"
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+allow_attributes_without_reason = "deny"

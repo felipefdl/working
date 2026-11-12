@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="62.5 92.5 900 900" width="900" height="900">
+  <!-- The Working mark: two chat bubbles in one flat color. It draws in currentColor: black, unless the page or a
+       stylesheet sets `color`. logo/Working.icon/Assets holds the same two bubbles as the app icon's layers. -->
+  <defs>
+    <path id="back" d="M126.0,492.9 C145.4,546.9 154.9,643.8 122.6,713.1 C176.8,701.7 261.3,633.3 311.9,646.9 A285.0,228.0 0 1 0 126.0,492.9 Z"/>
+    <path id="front" d="M898.4,651.2 C878.0,708.0 868.0,810.0 902.0,883.0 C845.0,871.0 756.0,799.0 702.7,813.3 A300.0,240.0 0 1 1 898.4,651.2 Z"/>
+    <mask id="behind" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1072">
+      <rect width="1024" height="1072" fill="#fff"/>
+      <use href="#front" stroke="#000" stroke-width="144" stroke-linejoin="round"/>
+    </mask>
+    <mask id="dots" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1072">
+      <rect width="1024" height="1072" fill="#fff"/>
+      <circle cx="505" cy="585" r="42"/><circle cx="610" cy="585" r="42"/><circle cx="715" cy="585" r="42"/>
+    </mask>
+  </defs>
+  <g fill="currentColor" stroke="currentColor" stroke-width="84" stroke-linejoin="round">
+    <use href="#back" mask="url(#behind)" opacity="0.5"/>
+    <use href="#front" mask="url(#dots)"/>
+  </g>
+</svg>

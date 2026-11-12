@@ -1,0 +1,278 @@
+//! Shared small widgets: avatars and icons.
+
+use gchat_core::{Group, GroupKind, PersonStatus};
+use gpui_kit::*;
+
+use crate::images::Images;
+use crate::theme::{BG, FIELD, GREEN, MUTED, RED, TEXT, Tone, WHITE, rgb};
+use crate::util;
+
+/// Lucide icons embedded as SVG so no asset bundle is needed at runtime.
+#[derive(Clone, Copy)]
+pub enum Icon {
+  ArrowLeft,
+  ChevronDown,
+  ChevronRight,
+  ChevronUp,
+  ChevronsUpDown,
+  Search,
+  House,
+  Pin,
+  File,
+  X,
+  ZoomIn,
+  ZoomOut,
+  Fit,
+  Download,
+  Copy,
+  ExternalLink,
+  Play,
+  Phone,
+  Video,
+  VideoOff,
+  Mic,
+  MicOff,
+  ScreenShare,
+  Hand,
+  PhoneOff,
+  Monitor,
+  Shield,
+  Bot,
+  Activity,
+  Bell,
+  Check,
+  SmilePlus,
+  Pencil,
+  Reply,
+  Thread,
+  More,
+  Plus,
+  Sparkles,
+}
+
+macro_rules! lucide {
+  ($body:literal) => {
+    concat!(
+      r#"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="black" "#,
+      r#"stroke-width="2" stroke-linecap="round" stroke-linejoin="round">"#,
+      $body,
+      "</svg>"
+    )
+    .as_bytes()
+  };
+}
+
+impl Icon {
+  const fn svg(self) -> &'static [u8] {
+    match self {
+      Self::ArrowLeft => lucide!(r#"<path d="m12 19-7-7 7-7"/><path d="M19 12H5"/>"#),
+      Self::ChevronDown => lucide!(r#"<path d="m6 9 6 6 6-6"/>"#),
+      Self::ChevronRight => lucide!(r#"<path d="m9 18 6-6-6-6"/>"#),
+      Self::ChevronUp => lucide!(r#"<path d="m18 15-6-6-6 6"/>"#),
+      Self::ChevronsUpDown => lucide!(r#"<path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/>"#),
+      Self::Search => lucide!(r#"<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>"#),
+      Self::House => lucide!(
+        r#"<path d="M15 21v-8a1 1 0 0 0-1-1h-4a1 1 0 0 0-1 1v8"/><path d="M3 10a2 2 0 0 1 .709-1.528l7-5.999a2 2 0 0 1 2.582 0l7 5.999A2 2 0 0 1 21 10v9a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/>"#
+      ),
+      Self::Pin => lucide!(
+        r#"<path d="M12 17v5"/><path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z"/>"#
+      ),
+      Self::File => lucide!(
+        r#"<path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v4a2 2 0 0 0 2 2h4"/>"#
+      ),
+      Self::X => lucide!(r#"<path d="M18 6 6 18"/><path d="m6 6 12 12"/>"#),
+      Self::ZoomIn => lucide!(
+        r#"<circle cx="11" cy="11" r="8"/><line x1="21" x2="16.65" y1="21" y2="16.65"/><line x1="11" x2="11" y1="8" y2="14"/><line x1="8" x2="14" y1="11" y2="11"/>"#
+      ),
+      Self::ZoomOut => lucide!(
+        r#"<circle cx="11" cy="11" r="8"/><line x1="21" x2="16.65" y1="21" y2="16.65"/><line x1="8" x2="14" y1="11" y2="11"/>"#
+      ),
+      Self::Fit => lucide!(
+        r#"<path d="M8 3H5a2 2 0 0 0-2 2v3"/><path d="M21 8V5a2 2 0 0 0-2-2h-3"/><path d="M3 16v3a2 2 0 0 0 2 2h3"/><path d="M16 21h3a2 2 0 0 0 2-2v-3"/>"#
+      ),
+      Self::Download => lucide!(
+        r#"<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>"#
+      ),
+      Self::Copy => lucide!(
+        r#"<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>"#
+      ),
+      Self::ExternalLink => lucide!(
+        r#"<path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>"#
+      ),
+      Self::Play => lucide!(r#"<polygon points="6 3 20 12 6 21 6 3" fill="black"/>"#),
+      Self::Phone => lucide!(
+        r#"<path d="M13.832 16.568a1 1 0 0 0 1.213-.303l.355-.465A2 2 0 0 1 17 15h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2A18 18 0 0 1 2 4a2 2 0 0 1 2-2h3a2 2 0 0 1 2 2v3a2 2 0 0 1-.8 1.6l-.468.351a1 1 0 0 0-.292 1.233 14 14 0 0 0 6.392 6.384"/>"#
+      ),
+      Self::Video => lucide!(
+        r#"<path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"/><rect x="2" y="6" width="14" height="12" rx="2"/>"#
+      ),
+      Self::VideoOff => lucide!(
+        r#"<path d="M10.66 6H14a2 2 0 0 1 2 2v2.5l5.248-3.062A.5.5 0 0 1 22 7.87v8.196"/><path d="M16 16a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2"/><path d="m2 2 20 20"/>"#
+      ),
+      Self::Mic => lucide!(
+        r#"<path d="M12 19v3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><rect x="9" y="2" width="6" height="13" rx="3"/>"#
+      ),
+      Self::MicOff => lucide!(
+        r#"<path d="M12 19v3"/><path d="M15 9.34V5a3 3 0 0 0-5.68-1.33"/><path d="M16.95 16.95A7 7 0 0 1 5 12v-2"/><path d="M18.89 13.23A7 7 0 0 0 19 12v-2"/><path d="m2 2 20 20"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12"/>"#
+      ),
+      Self::ScreenShare => lucide!(
+        r#"<path d="m9 10 3-3 3 3"/><path d="M12 13V7"/><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M12 17v4"/><path d="M8 21h8"/>"#
+      ),
+      Self::Hand => lucide!(
+        r#"<path d="M18 11V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2"/><path d="M14 10V4a2 2 0 0 0-2-2a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/>"#
+      ),
+      Self::PhoneOff => lucide!(
+        r#"<path d="M10.1 13.9a14 14 0 0 0 3.732 2.668 1 1 0 0 0 1.213-.303l.355-.465A2 2 0 0 1 17 15h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2 18 18 0 0 1-12.728-5.272"/><path d="M22 2 2 22"/><path d="M4.76 13.582A18 18 0 0 1 2 4a2 2 0 0 1 2-2h3a2 2 0 0 1 2 2v3a2 2 0 0 1-.8 1.6l-.468.351a1 1 0 0 0-.292 1.233 14 14 0 0 0 .244.473"/>"#
+      ),
+      Self::Monitor => lucide!(
+        r#"<rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/>"#
+      ),
+      Self::Shield => lucide!(
+        r#"<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>"#
+      ),
+      Self::Bot => lucide!(
+        r#"<path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/>"#
+      ),
+      Self::Check => lucide!(r#"<path d="M20 6 9 17l-5-5"/>"#),
+      Self::SmilePlus => lucide!(
+        r#"<path d="M22 11v1a10 10 0 1 1-9-10"/><path d="M8 14s1.5 2 4 2 4-2 4-2"/><line x1="9" x2="9.01" y1="9" y2="9"/><line x1="15" x2="15.01" y1="9" y2="9"/><path d="M16 5h6"/><path d="M19 2v6"/>"#
+      ),
+      Self::Pencil => lucide!(
+        r#"<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>"#
+      ),
+      Self::Reply => lucide!(r#"<path d="M20 18v-2a4 4 0 0 0-4-4H4"/><path d="m9 17-5-5 5-5"/>"#),
+      Self::Thread => lucide!(
+        r#"<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M13 8H7"/><path d="M17 12H7"/>"#
+      ),
+      Self::More => {
+        lucide!(r#"<circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/>"#)
+      },
+      Self::Plus => lucide!(r#"<path d="M5 12h14"/><path d="M12 5v14"/>"#),
+      Self::Sparkles => lucide!(
+        r#"<path d="M11.017 2.814a1 1 0 0 1 1.966 0l1.051 5.558a2 2 0 0 0 1.594 1.594l5.558 1.051a1 1 0 0 1 0 1.966l-5.558 1.051a2 2 0 0 0-1.594 1.594l-1.051 5.558a1 1 0 0 1-1.966 0l-1.051-5.558a2 2 0 0 0-1.594-1.594l-5.558-1.051a1 1 0 0 1 0-1.966l5.558-1.051a2 2 0 0 0 1.594-1.594z"/><path d="M20 2v4"/><path d="M22 4h-4"/><circle cx="4" cy="20" r="2"/>"#
+      ),
+      Self::Activity => lucide!(
+        r#"<path d="M22 12h-2.48a2 2 0 0 0-1.93 1.46l-2.35 8.36a.25.25 0 0 1-.48 0L9.24 2.18a.25.25 0 0 0-.48 0l-2.35 8.36A2 2 0 0 1 4.49 12H2"/>"#
+      ),
+      Self::Bell => lucide!(
+        r#"<path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/>"#
+      ),
+    }
+  }
+}
+
+pub fn icon(name: Icon, size: f32, color: Tone) -> Svg {
+  svg().data(name.svg()).size(px(size)).flex_shrink_0().text_color(rgb(color))
+}
+
+/// Round avatar: the emoji when there is one, else the image when it is ready, else initials on a colored circle.
+pub fn avatar(images: &Images, cx: &App, url: Option<&str>, emoji: Option<&str>, name: &str, size: f32) -> AnyElement {
+  let circle = div()
+    .size(px(size))
+    .flex_shrink_0()
+    .rounded_full()
+    .flex()
+    .items_center()
+    .justify_center();
+  if let Some(emoji) = emoji.filter(|emoji| !emoji.is_empty()) {
+    return circle
+      .bg(rgb(FIELD))
+      .text_size(px(size * 0.55))
+      .child(emoji.to_string())
+      .into_any_element();
+  }
+  if let Some(url) = url {
+    let sized = util::sized_avatar(url, util::avatar_px(size));
+    if let Some(image) = images.get(&sized, 256, cx) {
+      return img(image)
+        .size(px(size))
+        .flex_shrink_0()
+        .rounded_full()
+        .object_fit(ObjectFit::Cover)
+        .into_any_element();
+    }
+  }
+  circle
+    .bg(util::name_color(name))
+    .text_size(px(size * 0.42))
+    .text_color(rgb(TEXT))
+    .font_weight(FontWeight::MEDIUM)
+    .child(util::initials(name))
+    .into_any_element()
+}
+
+/// How the people of the one-to-one conversations show right now, by user id.
+#[derive(Default, PartialEq, Eq)]
+pub struct People(pub std::collections::HashMap<String, PersonStatus>);
+
+impl Global for People {}
+
+/// The mark at the corner of a person's avatar: green when active, a hollow ring when away, red with a bar
+/// for do not disturb.
+fn status_badge(status: PersonStatus, avatar: f32) -> Div {
+  let size = (avatar * 0.42).max(9.);
+  let badge = div()
+    .absolute()
+    .bottom(px(-2.))
+    .right(px(-2.))
+    .size(px(size))
+    .rounded_full()
+    .border_2()
+    .border_color(rgb(BG));
+  match status {
+    PersonStatus::Active => badge.bg(rgb(GREEN)),
+    PersonStatus::Away => badge
+      .bg(rgb(BG))
+      .child(div().size_full().rounded_full().border(px(1.5)).border_color(rgb(MUTED))),
+    PersonStatus::DoNotDisturb => badge
+      .bg(rgb(RED))
+      .flex()
+      .items_center()
+      .justify_center()
+      .child(div().w(px(size * 0.4)).h(px(1.5)).rounded_full().bg(rgb(WHITE))),
+  }
+}
+
+pub fn group_avatar(images: &Images, cx: &App, group: &Group, size: f32) -> AnyElement {
+  let plain = group.emoji.is_some() || group.avatar_url.is_some() || group.member_avatars.len() < 2;
+  if plain {
+    let url = group.avatar_url.as_deref().or(group.member_avatars.first().map(String::as_str));
+    let picture = avatar(images, cx, url, group.emoji.as_deref(), &group.name, size);
+    // A one-to-one conversation shows how the other person is.
+    let person = (group.kind == GroupKind::Dm).then(|| group.member_ids.first()).flatten();
+    let status = person.and_then(|id| cx.try_global::<People>()?.0.get(id).copied());
+    return match status {
+      Some(status) => div()
+        .size(px(size))
+        .flex_shrink_0()
+        .relative()
+        .child(picture)
+        .child(status_badge(status, size))
+        .into_any_element(),
+      None => picture,
+    };
+  }
+  // Group DM: two participants, overlapping on the diagonal like the web app.
+  let small = size * 0.68;
+  div()
+    .size(px(size))
+    .flex_shrink_0()
+    .relative()
+    .child(div().absolute().top_0().left_0().child(avatar(
+      images,
+      cx,
+      Some(&group.member_avatars[0]),
+      None,
+      &group.name,
+      small,
+    )))
+    .child(div().absolute().bottom_0().right_0().child(avatar(
+      images,
+      cx,
+      Some(&group.member_avatars[1]),
+      None,
+      &group.name,
+      small,
+    )))
+    .into_any_element()
+}

@@ -1,0 +1,348 @@
+//! The user's settings: kept in `~/.config/working/settings.json` and held as a GPUI global, so views that
+//! read them are redrawn when they change.
+
+use gchat_core::{Command, Core, McpConfig, McpStatus};
+use gpui_kit::component::{Theme, ThemeMode};
+use gpui_kit::*;
+use serde::{Deserialize, Serialize};
+
+use crate::theme;
+
+/// Where the MCP server listens unless `mcp_port` in the settings file says otherwise.
+const MCP_PORT: u16 = 3021;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Appearance {
+  /// Follows macOS.
+  #[default]
+  System,
+  Light,
+  Dark,
+}
+
+/// How messages are laid out, as in Google Chat.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Density {
+  /// The user's own messages sit on the right, without avatar or name.
+  Comfortable,
+  /// Every message on the left, under its sender.
+  #[default]
+  Compact,
+}
+
+/// When the user shows as online to other people.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ActivityStatus {
+  /// Online while the Mac is in use, away after a while without input.
+  #[default]
+  Automatic,
+  /// As `Automatic` inside the set hours; away outside them.
+  AutomaticInHours,
+  /// Online for the whole of the set hours; away outside them.
+  OnlineInHours,
+  AlwaysOnline,
+  AlwaysOffline,
+}
+
+/// What a notification sounds like.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sound {
+  /// The sound macOS is set to use for alerts.
+  #[default]
+  Default,
+  None,
+  Glass,
+  Ping,
+  Pop,
+  Tink,
+  Hero,
+  Submarine,
+  Purr,
+  Funk,
+}
+
+impl Sound {
+  pub const ALL: [Self; 10] = [
+    Self::Default,
+    Self::None,
+    Self::Glass,
+    Self::Ping,
+    Self::Pop,
+    Self::Tink,
+    Self::Hero,
+    Self::Submarine,
+    Self::Purr,
+    Self::Funk,
+  ];
+
+  pub const fn label(self) -> &'static str {
+    match self {
+      Self::Default => "System default",
+      Self::None => "None",
+      Self::Glass => "Glass",
+      Self::Ping => "Ping",
+      Self::Pop => "Pop",
+      Self::Tink => "Tink",
+      Self::Hero => "Hero",
+      Self::Submarine => "Submarine",
+      Self::Purr => "Purr",
+      Self::Funk => "Funk",
+    }
+  }
+
+  /// The sound's file: one of the macOS system sounds, which `scripts/bundle.sh` copies into the app so
+  /// notifications can play it. `None` for the two that are not a file.
+  pub fn file(self) -> Option<String> {
+    (!matches!(self, Self::Default | Self::None)).then(|| format!("{}.aiff", self.label()))
+  }
+
+  /// Plays the sound once, for the user picking one.
+  pub fn preview(self) {
+    if let Some(file) = self.file() {
+      let _ = std::process::Command::new("afplay")
+        .arg(format!("/System/Library/Sounds/{file}"))
+        .spawn();
+    }
+  }
+}
+
+pub const DEFAULT_REWRITE_INSTRUCTION: &str = "\
+Always fix grammar, spelling, punctuation, clarity, and flow. Keep the original language. Only fix; keep the meaning, tone, and length.
+
+Style
+- Sound like a real native speaker, not an AI.
+- Never use em dashes, en dashes, or \"--\". Use commas, periods, colons, or parentheses instead.
+- No ellipses unless the original has them.
+- No AI clichés: delve, embark, tapestry, realm, unleash, pivotal, testament, unlock, game-changer, seamless, leverage, \"in today's world\", \"it's important to note\", \"at the end of the day\", \"in conclusion\", \"dive deep\".
+- Do not add facts that aren't in the text.
+";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RewriteTool {
+  #[default]
+  Off,
+  Claude,
+  Grok,
+  Codex,
+  Pi,
+}
+
+impl RewriteTool {
+  pub const ALL: [Self; 5] = [Self::Off, Self::Claude, Self::Grok, Self::Codex, Self::Pi];
+
+  pub const fn label(self) -> &'static str {
+    match self {
+      Self::Off => "Off",
+      Self::Claude => "Claude",
+      Self::Grok => "Grok",
+      Self::Codex => "Codex",
+      Self::Pi => "Pi",
+    }
+  }
+
+  pub const fn bin(self) -> Option<&'static str> {
+    match self {
+      Self::Off => None,
+      Self::Claude => Some("claude"),
+      Self::Grok => Some("grok"),
+      Self::Codex => Some("codex"),
+      Self::Pi => Some("pi"),
+    }
+  }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+  pub appearance: Appearance,
+  pub density: Density,
+  /// Calls never get the camera, and have no camera button.
+  pub camera_off: bool,
+  /// Open Google Meet in Working's call window. Off opens the link in the browser.
+  pub meet_builtin: bool,
+  /// After the call button posts a meeting, join it. Off only posts the link.
+  pub meet_auto_open: bool,
+  pub status: ActivityStatus,
+  /// The set hours of `status`, as minutes of the day.
+  pub hours_start: u16,
+  pub hours_end: u16,
+  pub sound: Sound,
+  /// Serve the MCP tools to AI agents on this Mac.
+  pub mcp: bool,
+  pub mcp_port: u16,
+  /// Agents may send messages, not only read.
+  pub mcp_send: bool,
+  /// The status button's "Set as away". Stays until Automatic is chosen, whatever the activity status says.
+  #[serde(default)]
+  pub away: bool,
+  /// CLI that rewrites the composer draft. Off hides the button.
+  pub rewrite: RewriteTool,
+  /// Extra instructions appended to the rewrite system prompt.
+  pub rewrite_instruction: String,
+}
+
+impl Default for Settings {
+  fn default() -> Self {
+    Self {
+      appearance: Appearance::default(),
+      density: Density::default(),
+      camera_off: false,
+      meet_builtin: true,
+      meet_auto_open: true,
+      status: ActivityStatus::default(),
+      hours_start: 9 * 60,
+      hours_end: 18 * 60,
+      sound: Sound::default(),
+      mcp: false,
+      mcp_port: MCP_PORT,
+      mcp_send: false,
+      away: false,
+      rewrite: RewriteTool::Off,
+      rewrite_instruction: DEFAULT_REWRITE_INSTRUCTION.into(),
+    }
+  }
+}
+
+/// What the core last said about the MCP server, for the Settings window.
+#[derive(Default)]
+pub struct McpState(pub McpStatus);
+
+impl Global for McpState {}
+
+impl Global for Settings {}
+
+fn path() -> std::path::PathBuf {
+  gchat_core::config_dir().join("settings.json")
+}
+
+impl Settings {
+  pub fn load() -> Self {
+    std::fs::read_to_string(path())
+      .ok()
+      .and_then(|text| serde_json::from_str(&text).ok())
+      .unwrap_or_default()
+  }
+
+  /// Changes the settings, saves them and applies them.
+  pub fn update(cx: &mut App, change: impl FnOnce(&mut Self)) {
+    let mut settings = cx.global::<Self>().clone();
+    change(&mut settings);
+    if &settings == cx.global::<Self>() {
+      return;
+    }
+    match serde_json::to_string_pretty(&settings) {
+      Ok(text) => {
+        if let Err(error) = std::fs::write(path(), text) {
+          tracing::warn!("could not save settings: {error}");
+        }
+      },
+      Err(error) => tracing::warn!("could not save settings: {error}"),
+    }
+    cx.set_global(settings);
+    apply_appearance(cx);
+  }
+
+  /// How the MCP server should run: `None` while it is off.
+  fn mcp_config(&self) -> Option<McpConfig> {
+    if !self.mcp {
+      return None;
+    }
+    match gchat_core::mcp::token() {
+      Ok(token) => Some(McpConfig {
+        port: self.mcp_port,
+        token,
+        allow_send: self.mcp_send,
+      }),
+      Err(error) => {
+        tracing::warn!("could not store the MCP token: {error}");
+        None
+      },
+    }
+  }
+}
+
+/// Starts the MCP server when the settings ask for it, and restarts or stops it whenever they (or its token)
+/// change.
+pub fn keep_mcp(core: Core, cx: &mut App) {
+  cx.set_global(McpState::default());
+  let mut running = None;
+  let mut follow = move |cx: &mut App| {
+    let wanted = cx.global::<Settings>().mcp_config();
+    if wanted != running {
+      running = wanted.clone();
+      core.send(Command::SetMcp(wanted));
+    }
+  };
+  follow(cx);
+  cx.observe_global::<Settings>(follow).detach();
+}
+
+/// Replaces the MCP token, which cuts off every agent that holds the old one.
+pub fn replace_mcp_token(cx: &mut App) {
+  if let Err(error) = gchat_core::mcp::rotate_token() {
+    tracing::warn!("could not store the MCP token: {error}");
+  }
+  // Tells whoever follows the settings to look again: the server restarts with the new token.
+  let settings = cx.global::<Settings>().clone();
+  cx.set_global(settings);
+}
+
+/// Puts the chosen appearance (or the system's) on every window.
+pub fn apply_appearance(cx: &mut App) {
+  let light = match cx.global::<Settings>().appearance {
+    Appearance::Light => true,
+    Appearance::Dark => false,
+    Appearance::System => matches!(cx.window_appearance(), WindowAppearance::Light | WindowAppearance::VibrantLight),
+  };
+  theme::set_light(light);
+  Theme::change(
+    if light {
+      ThemeMode::Light
+    } else {
+      ThemeMode::Dark
+    },
+    None,
+    cx,
+  );
+  cx.refresh_windows();
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{Settings, Sound};
+
+  #[test]
+  fn notification_sound_files() {
+    assert_eq!(Sound::Glass.file().as_deref(), Some("Glass.aiff"));
+    assert_eq!(Sound::Default.file(), None);
+    assert_eq!(Sound::None.file(), None);
+  }
+
+  #[test]
+  fn meet_settings_default_on() {
+    let settings = Settings::default();
+    assert!(settings.meet_builtin);
+    assert!(settings.meet_auto_open);
+  }
+
+  #[test]
+  fn meet_settings_missing_keys_are_on() {
+    let settings: Settings = serde_json::from_str("{}").expect("empty object uses Default");
+    assert!(settings.meet_builtin);
+    assert!(settings.meet_auto_open);
+  }
+
+  #[test]
+  fn meet_settings_off_roundtrip() {
+    let settings = Settings {
+      meet_builtin: false,
+      meet_auto_open: false,
+      ..Settings::default()
+    };
+    let text = serde_json::to_string(&settings).expect("serialize");
+    let loaded: Settings = serde_json::from_str(&text).expect("deserialize");
+    assert!(!loaded.meet_builtin);
+    assert!(!loaded.meet_auto_open);
+  }
+}

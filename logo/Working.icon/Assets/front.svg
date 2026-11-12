@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!-- Front bubble of the mark in logo/logo.svg, with the three dots cut out. icon.json sets the color. -->
+  <defs>
+    <mask id="dots" maskUnits="userSpaceOnUse" x="0" y="0" width="1024" height="1072">
+      <rect width="1024" height="1072" fill="#fff"/>
+      <circle cx="505" cy="585" r="42"/><circle cx="610" cy="585" r="42"/><circle cx="715" cy="585" r="42"/>
+    </mask>
+  </defs>
+  <g transform="translate(512 512) scale(0.72) translate(-512.5 -542.5)">
+    <path d="M898.4,651.2 C878.0,708.0 868.0,810.0 902.0,883.0 C845.0,871.0 756.0,799.0 702.7,813.3 A300.0,240.0 0 1 1 898.4,651.2 Z" stroke="#000" stroke-width="84" stroke-linejoin="round" mask="url(#dots)"/>
+  </g>
+</svg>

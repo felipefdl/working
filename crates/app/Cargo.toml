@@ -1,0 +1,29 @@
+[package]
+name = "working"
+edition.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish.workspace = true
+
+[dependencies]
+gchat-core.workspace = true
+gpui-kit.workspace = true
+chrono.workspace = true
+image.workspace = true
+gpui-webview.workspace = true
+wry.workspace = true
+flume.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-user-notifications.workspace = true
+block2.workspace = true
+xcap.workspace = true
+base64.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+emojis.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true
