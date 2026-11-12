@@ -658,6 +658,7 @@ impl Render for RootView {
       .child(self.composer.clone())
       .child(self.menu.clone())
       .child(self.emoji.clone())
+      .children(crate::updater::card(cx))
       .into_any_element()
   }
 }

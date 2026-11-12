@@ -17,6 +17,7 @@ objc2.workspace = true
 objc2-foundation.workspace = true
 objc2-user-notifications.workspace = true
 block2.workspace = true
+cargo-packager-updater.workspace = true
 xcap.workspace = true
 base64.workspace = true
 serde.workspace = true

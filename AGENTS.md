@@ -18,6 +18,14 @@ Native macOS Google Chat client. The GPUI app is `crates/app` (crate `working`);
 - New crates add a child `AGENTS.md` in the same change, with only local obligations. Protocol, cache, and MCP: [crates/core/AGENTS.md](crates/core/AGENTS.md). GPUI, Meet, and theming: [crates/app/AGENTS.md](crates/app/AGENTS.md).
 - `scripts/bundle.sh` signs `Working.app` with the Apple Development identity when the keychain has one. macOS ties camera, microphone, and screen-recording grants to that signature; an ad-hoc signature changes every rebuild and drops them.
 
+## Release
+
+- `just release <version>` bumps `[workspace.package].version`, commits `chore(release): v<version>`, and tags. Push the tag (`git push origin HEAD --tags`), review the draft release, then publish it.
+- `.github/workflows/publish.yml` (tag `v*`, `macos-26`) runs `scripts/release.sh`: universal binary built with `WORKING_UPDATES=1`, Developer ID signature with hardened runtime and `crates/app/assets/Working.entitlements`, notarized and stapled. It uploads `Working_<v>_universal.dmg`, `.app.tar.gz` plus minisign `.sig`, and `latest.json` to a draft release.
+- Publishing the release runs `.github/workflows/homebrew.yml`, which writes only `Casks/working.rb` in the shared `felipefdl/homebrew-tap` (deploy key `HOMEBREW_TAP_DEPLOY_KEY`). The tap holds every felipefdl app.
+- Secrets: `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_API_KEY`, `APPLE_API_ISSUER`, `APPLE_API_KEY_CONTENT`, `PACKAGER_SIGN_PRIVATE_KEY`, `PACKAGER_SIGN_PRIVATE_KEY_PASSWORD`, `HOMEBREW_TAP_DEPLOY_KEY`.
+- Self-update lives in `crates/app/src/updater.rs`: no setting, only builds with `WORKING_UPDATES=1` check. The minisign public key there must match `PACKAGER_SIGN_PRIVATE_KEY`.
+
 ## Commands
 
 ```bash

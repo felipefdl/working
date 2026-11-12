@@ -1,0 +1,89 @@
+name: Update Homebrew Cask
+
+# Publishing a release writes Casks/working.rb in the shared felipefdl/homebrew-tap.
+# The tap holds every felipefdl app, so this job touches only this app's cask.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Published release tag (vX.Y.Z)
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-tap
+  cancel-in-progress: false
+
+jobs:
+  cask:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Resolve release
+        shell: bash
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          DMG="Working_${VERSION}_universal.dmg"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$DMG" --dir "$RUNNER_TEMP"
+          SHA256="$(sha256sum "$RUNNER_TEMP/$DMG" | cut -d' ' -f1)"
+          {
+            echo "VERSION=${VERSION}"
+            echo "SHA256=${SHA256}"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@v7
+        with:
+          repository: felipefdl/homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+          path: tap
+
+      - name: Write and push the cask
+        shell: bash
+        working-directory: tap
+        run: |
+          set -euo pipefail
+          mkdir -p Casks
+          cat > Casks/working.rb <<RUBY
+          cask "working" do
+            version "${VERSION}"
+            sha256 "${SHA256}"
+
+            url "https://github.com/felipefdl/working/releases/download/v#{version}/Working_#{version}_universal.dmg"
+            name "Working"
+            desc "Native macOS Google Chat client"
+            homepage "https://github.com/felipefdl/working"
+
+            livecheck do
+              url :url
+              strategy :github_latest
+            end
+
+            auto_updates true
+            depends_on macos: ">= :ventura"
+
+            app "Working.app"
+
+            zap trash: [
+              "~/.config/working",
+              "~/Library/Caches/working",
+            ]
+          end
+          RUBY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add Casks/working.rb
+          if git diff --cached --quiet; then
+            echo "cask already at ${VERSION}"
+            exit 0
+          fi
+          git commit -m "working ${VERSION}"
+          git push origin HEAD:main

@@ -72,13 +72,23 @@ run-readonly:
   ./scripts/bundle.sh
   WORKING_READONLY=1 target/release/Working.app/Contents/MacOS/Working
 
-# Rebuild the top-bar logo from logo/logo.svg (needs resvg).
+# Rebuild the top-bar logo (needs resvg) and the README icon (needs Xcode).
 logo:
   ./scripts/logo.sh
 
 # Read-only protocol smoke run: prints counts and event types, never message text.
 probe seconds="20":
   WORKING_READONLY=1 WORKING_TRACE=1 cargo run -p gchat-core --example probe -- {{seconds}}
+
+# Bump the version, commit, and tag. Pushing the tag runs .github/workflows/publish.yml.
+release version:
+  sed -i '' 's/^version = "[^"]*"/version = "{{version}}"/' Cargo.toml
+  sed -i '' 's/gchat-core = { path = "crates\/core", version = "[^"]*"/gchat-core = { path = "crates\/core", version = "{{version}}"/' Cargo.toml
+  cargo update -w
+  git add Cargo.toml Cargo.lock
+  git commit -m "chore(release): v{{version}}"
+  git tag "v{{version}}"
+  @echo "Push with: git push origin HEAD --tags"
 
 # Ordered cheapest first: a formatting failure reports in seconds instead of
 # after the compile steps.

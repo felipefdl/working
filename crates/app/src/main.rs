@@ -52,6 +52,7 @@ mod switcher;
 mod theme;
 mod theme_picker;
 mod ui;
+mod updater;
 mod util;
 mod viewer;
 mod welcome;
@@ -146,6 +147,7 @@ fn main() {
       }
     });
     cx.set_menus(menus());
+    updater::start(cx);
 
     let images = Images::new(core.clone(), cx);
     let store = cx.new(|_| Store::new(core.clone(), images));

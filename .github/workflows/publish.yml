@@ -1,0 +1,157 @@
+name: Publish Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    # Xcode 26+ compiles the Icon Composer document (logo/Working.icon).
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Cache cargo-packager
+        id: cache-packager
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/cargo-packager
+          key: cargo-packager-0.11.8-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-packager
+        if: steps.cache-packager.outputs.cache-hit != 'true'
+        run: cargo install cargo-packager --version 0.11.8 --locked
+
+      - name: Resolve version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="$(python3 -c 'import pathlib, tomllib; print(tomllib.loads(pathlib.Path("Cargo.toml").read_text())["workspace"]["package"]["version"])')"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+            if [[ "${TAG#v}" != "${VERSION}" ]]; then
+              echo "tag does not match Cargo.toml version" >&2
+              exit 1
+            fi
+          else
+            TAG="v${VERSION}"
+          fi
+          {
+            echo "VERSION=${VERSION}"
+            echo "TAG=${TAG}"
+          } >> "$GITHUB_ENV"
+
+      - name: Import Apple Developer Certificate
+        uses: apple-actions/import-codesign-certs@v7
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERTIFICATE }}
+          p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+
+      - name: Verify codesigning identity
+        shell: bash
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APPLE_SIGNING_IDENTITY}" ]] || \
+            ! security find-identity -p codesigning -v 2>/dev/null | grep -F -q -- "${APPLE_SIGNING_IDENTITY}"; then
+            echo "codesigning identity not found" >&2
+            exit 1
+          fi
+
+      - name: Write Apple API key for notarization
+        shell: bash
+        env:
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_KEY_CONTENT: ${{ secrets.APPLE_API_KEY_CONTENT }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${APPLE_API_KEY}" || -z "${APPLE_API_KEY_CONTENT}" ]]; then
+            echo "APPLE_API_KEY or APPLE_API_KEY_CONTENT is empty" >&2
+            exit 1
+          fi
+          key_dir="${HOME}/private_keys"
+          mkdir -p "$key_dir"
+          umask 077
+          key_path="${key_dir}/AuthKey_${APPLE_API_KEY}.p8"
+          printf '%s\n' "$APPLE_API_KEY_CONTENT" > "$key_path"
+          echo "APPLE_API_KEY_PATH=${key_path}" >> "$GITHUB_ENV"
+
+      - name: Build, sign, and notarize
+        env:
+          WORKING_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.PACKAGER_SIGN_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
+        run: ./scripts/release.sh
+
+      - name: Generate latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          tag = os.environ["TAG"]
+          version = os.environ["VERSION"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          name = f"Working_{version}_universal.app.tar.gz"
+          dist = Path("target/dist")
+          signature = (dist / f"{name}.sig").read_text().strip()
+          if not signature:
+              raise SystemExit("updater signature is empty")
+          # cargo-packager-updater keys are macos-{arch}; the universal bundle serves both.
+          entry = {
+              "signature": signature,
+              "url": f"https://github.com/{repo}/releases/download/{tag}/{name}",
+              "format": "app",
+          }
+          manifest = {
+              "version": version,
+              "notes": "",
+              "pub_date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": {"macos-aarch64": entry, "macos-x86_64": entry},
+          }
+          (dist / "latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
+
+      - name: Upload draft release
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if is_draft=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [[ "$is_draft" != "true" ]]; then
+              echo "release ${TAG} is published; refusing to replace assets in place" >&2
+              exit 1
+            fi
+          else
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft \
+              --title "Working v${VERSION}" \
+              --notes "" \
+              --target "${GITHUB_SHA}"
+          fi
+          gh release upload "$TAG" target/dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          echo "draft release ${TAG}"

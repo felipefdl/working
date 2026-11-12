@@ -1,31 +1,52 @@
 <br/>
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="crates/app/assets/logo.png">
-    <img src="crates/app/assets/logo-light.png" width="200px" alt="Working"></img>
+    <source media="(prefers-color-scheme: dark)" srcset="logo/icon-dark.png">
+    <img src="logo/icon-light.png" width="128" alt="Working app icon">
   </picture>
 </p>
 
-# Working
+<h1 align="center">Working</h1>
 
-Native macOS client for Google Chat.
-
-Repo: [felipefdl/working](https://github.com/felipefdl/working)
+<p align="center">Google Chat as a real Mac app.</p>
 
 ---
 
-Working is a GPUI desktop app. It signs in with a Google Chat web session, keeps the protocol and cache in a Tokio engine, and draws spaces, DMs, Meet calls, and notifications as a Mac app.
+Google Chat lives in a browser tab or a wrapped web page: slow to open, easy to lose, and blind to the rest of your Mac. Working is a native client written in Rust. It opens from a local cache before the network answers, keeps up through Google's realtime stream, and behaves like a Mac app: Dock badge, system notifications, keyboard first, light and dark.
 
-It is independent of Google.
+Working is an independent project. It is not affiliated with or endorsed by Google.
 
-## Prerequisites
+## Features
 
-- macOS 13 or newer
-- Rust **1.99.1** (workspace `rust-version`)
-- [just](https://github.com/casey/just)
-- Xcode (`actool`) to wrap `Working.app`
+- **Every conversation in one place.** DMs, group DMs, spaces, and apps in a sidebar, with Mentions and Starred views that gather messages from every chat.
+- **Fast to open, fast to switch.** A disk cache paints the last state on launch. `Cmd+K` jumps to any conversation with fuzzy search, and Enter in the search bar searches message text.
+- **Full conversations.** Formatted text, threads, replies, quotes, edits, reactions with a full emoji picker, cards, and attachments.
+- **Media viewer.** Images open in a zoomable viewer; video, audio, PDF, and text files open inside the app.
+- **Google Meet in its own window.** Join calls with camera, microphone, and screen sharing, in a window that looks like the rest of the app.
+- **Notifications that respect your time.** System notifications with a choice of sounds, an unread count on the Dock icon, and the do-not-disturb schedules your Google account already keeps.
+- **Presence on your terms.** Show as active automatically, only during working hours, or always online or away, and set a custom status.
+- **Rewrite a draft.** `Cmd+Shift+R` rewrites the message you are writing through the Claude Code or Codex CLI you already have installed, with its tools turned off.
+- **28 color themes.** Pick one for light mode and one for dark mode, and Working follows the system.
+- **Local MCP server.** Optional. Lets AI agents on your Mac read and search your chats, and send as you if you allow it. It listens on localhost only and requires a token.
+- **Updates itself.** New versions install in the background. A **Restart** card appears when one is ready.
 
-## Quick start
+## Install
+
+```bash
+brew install --cask felipefdl/tap/working
+```
+
+Or download the `.dmg` from [Releases](https://github.com/felipefdl/working/releases). Working runs on macOS 13 or newer, on Apple silicon and Intel.
+
+Open the app and sign in with Google on the welcome screen. Settings, the session, and the MCP token live in `~/.config/working`; the cache lives in `~/Library/Caches/working`.
+
+## MCP server
+
+Turn it on in Settings. It listens on `http://127.0.0.1:3021/mcp` and needs the token in `~/.config/working/mcp-token`. Agents can list and search conversations and read messages. Sending is a separate switch.
+
+## Build from source
+
+You need Rust 1.99.1 or newer, [just](https://github.com/casey/just), and Xcode (its `actool` compiles the app icon).
 
 ```bash
 git clone https://github.com/felipefdl/working.git
@@ -33,42 +54,17 @@ cd working
 just run
 ```
 
-`just run` builds `Working.app` and opens it. Sign in with Google on the welcome screen. That writes `~/.config/working/cookies.json`.
+| Command | What it does |
+|---|---|
+| `just run` | Build `Working.app` and open it |
+| `just run-readonly` | Same app, but it refuses anything that writes to the Google account |
+| `just check` | Quality gate: format, lints, supply chain, tests |
+| `just probe` | Read-only protocol smoke test that prints counts and event types, never message text |
+| `just logo` | Rebuild the logo and icon images |
 
-`just login` still opens Chrome for the same session file, if you want to sign in outside the app. It needs Google Chrome, [agent-browser](https://github.com/vercel-labs/agent-browser) (`npm i -g agent-browser && agent-browser install`), and python3.
+With an Apple Development certificate in your keychain, local builds keep camera, microphone, and screen-recording permissions across rebuilds. Without one, macOS asks again after every build.
 
-An Apple Development signing identity in the keychain keeps camera, microphone, and screen-recording grants across rebuilds. Without one, the bundle is ad-hoc signed and those grants reset every build.
-
-## Commands
-
-```bash
-just login            # optional Chrome sign-in; writes ~/.config/working/cookies.json
-just run              # release Working.app and open it
-just run-readonly     # same binary, WORKING_READONLY=1
-just probe            # read-only core smoke: counts and event types, never message text
-just check            # quality gate
-just logo             # rebuild top-bar PNGs from logo/logo.svg (needs resvg)
-```
-
-`WORKING_READONLY=1` refuses sends, read marks, reactions, typing, presence, and DND writes. Use it for live runs that should not change the Google account.
-
-Session files live in `~/.config/working` (`cookies.json`, `settings.json`, `mcp-token`). The disk cache is `~/Library/Caches/working`. Do not commit, print, or paste cookie or token values.
-
-## MCP
-
-The app can serve a loopback MCP server (default `http://127.0.0.1:3021/mcp`) so local agents can read, search, and optionally send as the signed-in user. Turn it on in Settings. The secret is `~/.config/working/mcp-token`. The server listens on localhost only.
-
-## Layout
-
-| Path | Role |
-|------|------|
-| `crates/app` | GPUI app (crate `working`), bundled as `Working.app` |
-| `crates/core` | Tokio engine (crate `gchat-core`): session, protobuf, WebChannel, cache, MCP |
-| `docs/rust-quality.md` | Quality bar |
-| `logo/` | Mark and app icon |
-| `scripts/` | Login, bundle, logo |
-
-The UI talks to the core only through `Command` / `Event` on `gchat_core::Core`.
+The app is `crates/app` (GPUI). The Google Chat protocol, realtime stream, cache, and MCP server are in `crates/core`, and the app talks to them only through commands and events.
 
 ## Contributing
 
@@ -76,4 +72,4 @@ Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) and
 
 ## License
 
-Working is **MIT** (Copyright (c) 2026 Felipe Lima). See [LICENSE.md](LICENSE.md).
+[MIT](LICENSE.md)
