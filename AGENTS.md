@@ -13,6 +13,7 @@ Native macOS Google Chat client. The GPUI app is `crates/app` (crate `working`);
 - The UI talks to the core only through `Command` / `Event` on `gchat_core::Core`. HTTP, protobuf, cookies, and the WebChannel stream stay in `gchat-core`.
 - Session and settings live under `~/.config/working` (`cookies.json`, `settings.json`, `mcp-token`). The disk cache is `~/Library/Caches/working`. Those paths are machine-local: never commit, print, or paste cookie or token values.
 - Live runs that were not asked to write to the account use `WORKING_READONLY=1` (`just run-readonly`, `just probe`). Send, read marks, reactions, typing, presence, and DND writes mutate the signed-in Google account.
+- `WORKING_DEMO=1` (`just demo`) swaps the engine for `crates/core/src/demo`: a made-up workspace in memory that answers every `Command`, with replies, typing, slash commands, and card buttons. No sign-in, network, or disk cache; settings live under the temp dir. Use it to check UI features without an account. A new `Command` needs a demo answer too.
 - Hard rule: tests, examples, fixtures, docs, comments, tool descriptions, and commit messages use made-up people (`Jordan Park`, `Riley Brooks`, `jpark@example.com`). Never a name, email, space, file, or message from a screenshot, the signed-in account, or the developer's own life, not even a first name. Real coworker names landed in `fuzzy.rs` tests and the MCP tool text once.
 - `WORKING_TRACE=1` prints stream array types (and Meet screen-share shapes). Never message text, cookie values, or token values.
 - The product is unshipped: replace a surface in place rather than keeping a compatibility path.
@@ -36,6 +37,7 @@ just check            # quality gate
 just login            # optional Chrome sign-in; writes ~/.config/working/cookies.json
 just run              # release Working.app and open it
 just run-readonly     # same binary, WORKING_READONLY=1
+just demo             # same binary, WORKING_DEMO=1: made-up workspace, no sign-in
 just probe            # read-only core smoke: counts and event types, never message text
 just logo             # rebuild top-bar PNGs from logo/logo.svg (needs resvg)
 ```

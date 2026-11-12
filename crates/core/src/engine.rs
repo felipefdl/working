@@ -48,15 +48,19 @@ const OLDER_PAGE: i32 = 30;
 const PREFETCH_GROUPS: usize = 16;
 const XSRF_MAX_AGE_SECS: u64 = 6 * 3600;
 
-type FetchReply = flume::Sender<Result<Arc<Vec<u8>>, String>>;
+pub(crate) type FetchReply = flume::Sender<Result<Arc<Vec<u8>>, String>>;
 
-/// Authenticated, disk-cached downloads for the UI, served on the core's runtime.
 /// Authenticated, disk-cached downloads for the UI, served on the core's runtime.
 pub struct Fetcher {
   requests: flume::Sender<(String, FetchReply)>,
 }
 
 impl Fetcher {
+  /// A fetcher whose requests go to whoever holds the other end.
+  pub(crate) const fn new(requests: flume::Sender<(String, FetchReply)>) -> Self {
+    Self { requests }
+  }
+
   pub async fn fetch(&self, url: String) -> Result<Arc<Vec<u8>>> {
     let (reply, answer) = flume::bounded(1);
     self.requests.send((url, reply)).map_err(|_| anyhow!("the core stopped"))?;
@@ -89,7 +93,7 @@ pub fn spawn(commands: flume::Receiver<Command>, events: flume::Sender<Event>) -
       tracing::error!("the core thread did not start: {error}");
       std::process::exit(1);
     });
-  Arc::new(Fetcher { requests })
+  Arc::new(Fetcher::new(requests))
 }
 
 fn now_micros() -> Micros {

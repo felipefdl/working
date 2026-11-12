@@ -58,6 +58,7 @@ just run
 |---|---|
 | `just run` | Build `Working.app` and open it |
 | `just run-readonly` | Same app, but it refuses anything that writes to the Google account |
+| `just demo` | Same app with a made-up workspace instead of a Google account: no sign-in, nothing leaves the Mac |
 | `just check` | Quality gate: format, lints, supply chain, tests |
 | `just probe` | Read-only protocol smoke test that prints counts and event types, never message text |
 | `just logo` | Rebuild the logo and icon images |

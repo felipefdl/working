@@ -72,6 +72,11 @@ run-readonly:
   ./scripts/bundle.sh
   WORKING_READONLY=1 target/release/Working.app/Contents/MacOS/Working
 
+# Run with a made-up workspace instead of a Google account: no sign-in, no network, no real cache or settings.
+demo:
+  ./scripts/bundle.sh
+  WORKING_DEMO=1 target/release/Working.app/Contents/MacOS/Working
+
 # Rebuild the top-bar logo (needs resvg) and the README icon (needs Xcode).
 logo:
   ./scripts/logo.sh
