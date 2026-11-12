@@ -6,7 +6,7 @@ use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 use serde::{Deserialize, Serialize};
 
-use crate::theme::{self, ACCENT, ACCENT_BG, BORDER, MUTED, POPOVER, TEXT, THEMES, rgb};
+use crate::theme::{self, ACCENT, ACCENT_BG, BORDER, MUTED, POPOVER, ROW_HOVER, ROW_SELECTED, TEXT, THEMES, rgb};
 
 /// Where the MCP server listens unless `mcp_port` in the settings file says otherwise.
 const MCP_PORT: u16 = 3021;
@@ -24,9 +24,9 @@ pub enum Appearance {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Density {
   /// The user's own messages sit on the right, without avatar or name.
+  #[default]
   Comfortable,
   /// Every message on the left, under its sender.
-  #[default]
   Compact,
 }
 
@@ -369,6 +369,11 @@ pub fn show_theme(index: usize, cx: &mut App) {
     kit.popover_foreground = rgb(TEXT).into();
     kit.border = rgb(BORDER).into();
     kit.input = rgb(BORDER).into();
+    // Menus and selects: the kit's rows highlight with its own colors unless given the theme's.
+    kit.list_hover = rgb(ROW_HOVER).into();
+    kit.list_active = rgb(ROW_SELECTED).into();
+    kit.accent = rgb(ROW_SELECTED).into();
+    kit.accent_foreground = rgb(TEXT).into();
   });
   cx.refresh_windows();
 }

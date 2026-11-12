@@ -5,7 +5,8 @@
 //! themes of One, Ayu, Gruvbox, Catppuccin, Dracula, GitHub, Tokyo Night, Nord, Solarized, and Rosé Pine.
 //! See-through colors are blended over the surface they sit on, and the accent tints are the accent over the panel.
 //! Hover, selection, field, and bubble colors that match the surface under them are moved toward the text color
-//! until they stand apart, as Working's own do.
+//! until they stand apart, as Working's own do. Text that reads below 7:1 on its surfaces (4.5:1 for muted) keeps its
+//! hue and moves in lightness until it clears that: Solarized's body text and GitHub Dark Dimmed's menu rows.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -646,8 +647,8 @@ pub static THEMES: [Theme; 28] = [
       bg: 0x151b23,
       panel: 0x212830,
       popover: 0x2a313c,
-      row_hover: 0x252b34,
-      row_selected: 0x2a3039,
+      row_hover: 0x343c47,
+      row_selected: 0x3d4653,
       field: 0x2f363e,
       border: 0x353c44,
       text: 0xd1d7e0,
@@ -850,11 +851,11 @@ pub static THEMES: [Theme; 28] = [
       panel: 0x002b36,
       popover: 0x002b36,
       row_hover: 0x123e4a,
-      row_selected: 0x13587c,
+      row_selected: 0x125273,
       field: 0x123e4a,
       border: 0x586e75,
-      text: 0x839496,
-      muted: 0x586e75,
+      text: 0xb8c1c1,
+      muted: 0x8b9b9d,
       accent: 0x268bd2,
       accent_bg: 0x084058,
       bubble: 0x073642,
@@ -866,8 +867,8 @@ pub static THEMES: [Theme; 28] = [
       green: 0x859900,
       amber: 0xcb4b16,
       red: 0xdc322f,
-      text_strong: 0x839496,
-      text_dim: 0x6e8186,
+      text_strong: 0xeee8d5,
+      text_dim: 0x9facac,
     },
   },
   Theme {
@@ -882,8 +883,8 @@ pub static THEMES: [Theme; 28] = [
       row_selected: 0x9ec3d4,
       field: 0xe2dece,
       border: 0x93a1a1,
-      text: 0x657b83,
-      muted: 0x93a1a1,
+      text: 0x3e4d52,
+      muted: 0x586b72,
       accent: 0x268bd2,
       accent_bg: 0xcededf,
       bubble: 0xeee8d5,
@@ -895,8 +896,8 @@ pub static THEMES: [Theme; 28] = [
       green: 0x859900,
       amber: 0xcb4b16,
       red: 0xdc322f,
-      text_strong: 0x657b83,
-      text_dim: 0x7c8e92,
+      text_strong: 0x073642,
+      text_dim: 0x4b5e64,
     },
   },
   Theme {
