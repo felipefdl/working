@@ -9,8 +9,8 @@ use gpui_kit::*;
 use gchat_core::SearchHit;
 
 use crate::store::Store;
-use crate::theme::{ACCENT, BG, BORDER, MARK, MUTED, ROW_HOVER, TEXT, rgb};
-use crate::ui::{avatar, group_avatar};
+use crate::theme::{ACCENT, MARK, MUTED, ROW_HOVER, TEXT, rgb};
+use crate::ui::{avatar, group_avatar, switch};
 use crate::util;
 
 const ROW_HEIGHT: f32 = 56.0;
@@ -154,17 +154,7 @@ impl Render for HomeView {
           .cursor_pointer()
           .on_click(move |_, _, cx| store_handle.update(cx, |s, cx| s.set_unread_only(!s.unread_only, cx)))
           .child(div().text_size(px(13.)).text_color(rgb(TEXT)).child("Unread"))
-          .child(
-            div()
-              .w(px(34.))
-              .h(px(18.))
-              .rounded_full()
-              .p(px(2.))
-              .flex()
-              .when(unread_only, |d| d.bg(rgb(ACCENT)).justify_end())
-              .when(!unread_only, |d| d.bg(rgb(BORDER)).justify_start())
-              .child(div().size(px(14.)).rounded_full().bg(rgb(if unread_only { BG } else { MUTED }))),
-          ),
+          .child(switch(unread_only, 18.)),
       );
 
     let body = if count == 0 {

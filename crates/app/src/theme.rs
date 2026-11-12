@@ -88,6 +88,17 @@ pub fn rgb(tone: Tone) -> Rgba {
   gpui_kit::rgb((tone.0)(&current().colors))
 }
 
+/// The fill of a button, field, or picker on a settings card. A faint wash of the text color shows over every
+/// theme's card, where a theme tone such as `FIELD` or `BG` can match the card and leave only the label.
+pub fn control_fill() -> Rgba {
+  Rgba { a: 0.12, ..rgb(TEXT) }
+}
+
+/// The track of a switch that is off, see-through for the same reason as `control_fill`.
+pub fn switch_off() -> Rgba {
+  Rgba { a: 0.5, ..rgb(MUTED) }
+}
+
 pub const BG: Tone = Tone(|c| c.bg);
 pub const PANEL: Tone = Tone(|c| c.panel);
 pub const POPOVER: Tone = Tone(|c| c.popover);

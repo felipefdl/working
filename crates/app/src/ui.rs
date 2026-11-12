@@ -1,10 +1,11 @@
-//! Shared small widgets: avatars and icons.
+//! Shared small widgets: avatars, icons, and switches.
 
 use gchat_core::{Group, GroupKind, PersonStatus};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::images::Images;
-use crate::theme::{BG, FIELD, GREEN, MUTED, RED, TEXT, Tone, WHITE, rgb};
+use crate::theme::{ACCENT, BG, FIELD, GREEN, MUTED, RED, TEXT, Tone, WHITE, rgb, switch_off};
 use crate::util;
 
 /// Lucide icons embedded as SVG so no asset bundle is needed at runtime.
@@ -169,6 +170,22 @@ impl Icon {
 
 pub fn icon(name: Icon, size: f32, color: Tone) -> Svg {
   svg().data(name.svg()).size(px(size)).flex_shrink_0().text_color(rgb(color))
+}
+
+/// An on/off switch `height` tall: a white knob on the accent when on, on a see-through track when off.
+pub fn switch(on: bool, height: f32) -> Div {
+  let inset = height / 8.;
+  div()
+    .w(px(height * 5. / 3.))
+    .h(px(height))
+    .px(px(inset))
+    .flex()
+    .flex_shrink_0()
+    .items_center()
+    .when(on, gpui_kit::Styled::justify_end)
+    .rounded_full()
+    .bg(if on { rgb(ACCENT) } else { switch_off() })
+    .child(div().size(px(height * 0.75)).rounded_full().bg(rgb(WHITE)))
 }
 
 /// Round avatar: the emoji when there is one, else the image when it is ready, else initials on a colored circle.

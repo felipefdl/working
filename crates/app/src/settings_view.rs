@@ -18,9 +18,9 @@ use crate::settings::{
 };
 use crate::status::{self, DndState};
 use crate::theme::{
-  ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, FIELD, GREEN, MUTED, POPOVER, RED, ROW_HOVER, TEXT, THEMES, WHITE, rgb,
+  ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, GREEN, MUTED, POPOVER, RED, ROW_HOVER, TEXT, THEMES, WHITE, control_fill, rgb,
 };
-use crate::ui::{Icon, icon};
+use crate::ui::{Icon, icon, switch};
 
 const CAMERA_PANE: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera";
 const MICROPHONE_PANE: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
@@ -246,7 +246,7 @@ impl SettingsView {
       .py_1()
       .flex_shrink_0()
       .rounded_full()
-      .bg(rgb(FIELD))
+      .bg(control_fill())
       .text_size(px(12.))
       .cursor_pointer()
       .hover(|button| button.opacity(0.85))
@@ -297,23 +297,11 @@ impl SettingsView {
   }
 
   fn toggle(id: impl Into<ElementId>, on: bool) -> Stateful<Div> {
-    div()
-      .id(id)
-      .w(px(40.))
-      .h(px(24.))
-      .px(px(3.))
-      .flex()
-      .flex_shrink_0()
-      .items_center()
-      .when(on, gpui_kit::Styled::justify_end)
-      .rounded_full()
-      .cursor_pointer()
-      .bg(rgb(if on { ACCENT } else { BORDER }))
-      .child(div().size(px(18.)).rounded_full().bg(gpui_kit::rgb(0xffffff)))
+    switch(on, 24.).id(id).cursor_pointer()
   }
 
   fn appearance_picker(current: Appearance) -> Div {
-    let mut picker = h_flex().flex_shrink_0().p(px(3.)).gap_1().rounded(px(9.)).bg(rgb(BG));
+    let mut picker = h_flex().flex_shrink_0().p(px(3.)).gap_1().rounded(px(9.)).bg(control_fill());
     for (label, value) in [
       ("System", Appearance::System),
       ("Light", Appearance::Light),
@@ -329,6 +317,12 @@ impl SettingsView {
           .text_size(px(12.))
           .text_color(rgb(if selected { TEXT } else { MUTED }))
           .cursor_pointer()
+          .border_1()
+          .border_color(if selected {
+            rgb(ACCENT)
+          } else {
+            transparent_black().into()
+          })
           .when(selected, |option| option.bg(rgb(ACCENT_BG)))
           .on_click(move |_, _, cx| Settings::update(cx, |settings| settings.appearance = value))
           .child(label),
@@ -344,7 +338,7 @@ impl SettingsView {
       .p(px(3.))
       .gap_1()
       .rounded(px(9.))
-      .bg(rgb(BG));
+      .bg(control_fill());
     for value in RewriteTool::ALL {
       let selected = value == current;
       picker = picker.child(
@@ -356,6 +350,12 @@ impl SettingsView {
           .text_size(px(12.))
           .text_color(rgb(if selected { TEXT } else { MUTED }))
           .cursor_pointer()
+          .border_1()
+          .border_color(if selected {
+            rgb(ACCENT)
+          } else {
+            transparent_black().into()
+          })
           .when(selected, |option| option.bg(rgb(ACCENT_BG)))
           .on_click(move |_, _, cx| Settings::update(cx, |settings| settings.rewrite = value))
           .child(value.label()),
@@ -458,7 +458,7 @@ impl SettingsView {
         .py_1()
         .flex_shrink_0()
         .rounded_full()
-        .bg(rgb(FIELD))
+        .bg(control_fill())
         .text_size(px(12.))
         .cursor_pointer()
         .hover(|button| button.opacity(0.85))
@@ -616,7 +616,7 @@ impl SettingsView {
         .items_center()
         .justify_center()
         .rounded_full()
-        .bg(rgb(FIELD))
+        .bg(control_fill())
         .text_size(px(14.))
         .cursor_pointer()
         .hover(|button| button.opacity(0.85))
@@ -716,7 +716,17 @@ impl SettingsView {
           .px_3()
           .py_1()
           .rounded_full()
-          .bg(rgb(if selected { ACCENT_BG } else { FIELD }))
+          .border_1()
+          .border_color(if selected {
+            rgb(ACCENT)
+          } else {
+            transparent_black().into()
+          })
+          .bg(if selected {
+            rgb(ACCENT_BG)
+          } else {
+            control_fill()
+          })
           .text_size(px(12.))
           .cursor_pointer()
           .hover(|button| button.opacity(0.85))
@@ -826,7 +836,13 @@ impl SettingsView {
           .flex()
           .justify_center()
           .rounded_full()
-          .bg(rgb(if on { ACCENT_BG } else { FIELD }))
+          .border_1()
+          .border_color(if on {
+            rgb(ACCENT)
+          } else {
+            transparent_black().into()
+          })
+          .bg(if on { rgb(ACCENT_BG) } else { control_fill() })
           .text_size(px(12.))
           .text_color(rgb(if on { TEXT } else { MUTED }))
           .cursor_pointer()
@@ -1016,7 +1032,7 @@ impl SettingsView {
                     .when(armed, |button| button.bg(rgb(RED)).text_color(rgb(WHITE)))
                     .when(!armed, |button| {
                       button
-                        .bg(rgb(FIELD))
+                        .bg(control_fill())
                         .text_color(rgb(MUTED))
                         .hover(|style| style.bg(rgb(ROW_HOVER)))
                     })
@@ -1035,7 +1051,7 @@ impl SettingsView {
               .px_2()
               .py_1()
               .rounded(px(9.))
-              .bg(rgb(BG))
+              .bg(control_fill())
               .child(Textarea::new(&self.rewrite_instruction).appearance(false).bordered(false)),
           ),
       )
