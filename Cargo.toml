@@ -9,7 +9,7 @@ members = ["crates/core", "crates/app"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.99.1"
-version = "0.0.3"
+version = "0.0.4"
 description = "Native macOS Google Chat client"
 license = "MIT"
 repository = "https://github.com/felipefdl/working"
