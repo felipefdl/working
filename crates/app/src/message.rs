@@ -18,7 +18,7 @@ use crate::menu::{self, MenuItem};
 use crate::settings::{Density, Settings};
 use crate::theme::{
   ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, BUBBLE_OWN, CODE_BG, FIELD, MARK, MONO, MUTED, PANEL, PLACEHOLDER, POPOVER,
-  RED, ROW_HOVER, TEXT, WHITE, rgb,
+  RED, ROW_HOVER, TEXT, Tone, WHITE, rgb,
 };
 use crate::ui::{Icon, avatar, icon};
 use crate::util;
@@ -146,6 +146,8 @@ pub struct MsgCtx<'a> {
   pub find_hit: Option<Range<usize>>,
   /// Runs what a message's toolbar asks for.
   pub act: &'a Actor,
+  /// Opens the chat with a user id: clicking a sender's name or avatar, or a mention.
+  pub open_person: &'a Opener,
   /// "Reply in thread" is offered: the main list of a space.
   pub threads: bool,
   /// The message under the pointer: the one that shows its toolbar.
@@ -216,9 +218,24 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
   } else {
     msg.sender_avatar.as_deref()
   };
+  // Someone else's avatar and name open the chat with them.
+  let person = (!row.own).then(|| (msg.sender_id.clone(), ctx.open_person.clone()));
   let avatar_col = (!aside).then(|| {
     div().w(px(36.)).flex_shrink_0().when(row.head, |d| {
-      d.child(avatar(ctx.images, cx, avatar_url, None, &msg.sender_name, 32.))
+      let picture = div().id(SharedString::from(format!("{}-avatar", msg.id))).child(avatar(
+        ctx.images,
+        cx,
+        avatar_url,
+        None,
+        &msg.sender_name,
+        32.,
+      ));
+      d.child(match person.clone() {
+        Some((user_id, open)) => picture
+          .cursor_pointer()
+          .on_click(move |_, window, cx| open(&user_id, window, cx)),
+        None => picture,
+      })
     })
   });
 
@@ -240,13 +257,21 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
       h_flex()
         .gap_2()
         .items_baseline()
-        .child(
-          div()
+        .child({
+          let label = div()
+            .id(SharedString::from(format!("{}-name", msg.id)))
             .text_size(px(13.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(rgb(TEXT))
-            .child(name),
-        )
+            .child(name);
+          match person {
+            Some((user_id, open)) => label
+              .cursor_pointer()
+              .hover(gpui_kit::Styled::underline)
+              .on_click(move |_, window, cx| open(&user_id, window, cx)),
+            None => label,
+          }
+        })
         .child(time)
     });
   }
@@ -287,7 +312,14 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
       );
     }
     if has_text {
-      bubble = bubble.child(rich_text(&msg.id, &msg.text, &msg.spans, ctx.find, ctx.find_hit.as_ref()));
+      bubble = bubble.child(rich_text(
+        &msg.id,
+        &msg.text,
+        &msg.spans,
+        ctx.find,
+        ctx.find_hit.as_ref(),
+        ctx.open_person,
+      ));
       if msg.edited {
         bubble = bubble.child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("(edited)"));
       }
@@ -297,7 +329,7 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
 
   for (i, attachment) in msg.attachments.iter().enumerate() {
     let id = SharedString::from(format!("{}-a{i}", msg.id));
-    content = content.child(attachment_view(attachment, id, ctx, cx));
+    content = content.child(attachment_view(attachment, id, bubble_bg, ctx, cx));
   }
   if msg.starred {
     content = content.child(
@@ -680,7 +712,14 @@ fn marked_plain(text: &str, find: Option<&str>, current: Option<&Range<usize>>) 
   StyledText::new(text.to_string()).with_highlights(highlights).into_any_element()
 }
 
-fn rich_text(id: &str, text: &str, spans: &[Span], find: Option<&str>, current: Option<&Range<usize>>) -> AnyElement {
+fn rich_text(
+  id: &str,
+  text: &str,
+  spans: &[Span],
+  find: Option<&str>,
+  current: Option<&Range<usize>>,
+  open_person: &Opener,
+) -> AnyElement {
   // Code blocks and list items each take their own row; the text between them flows as plain segments.
   let mut blocks: Vec<(Range<usize>, bool)> = spans
     .iter()
@@ -707,6 +746,7 @@ fn rich_text(id: &str, text: &str, spans: &[Span], find: Option<&str>, current: 
       spans,
       find,
       current,
+      open_person,
     ))
   };
   for (block, item) in blocks {
@@ -734,6 +774,7 @@ fn rich_text(id: &str, text: &str, spans: &[Span], find: Option<&str>, current: 
             spans,
             find,
             current,
+            open_person,
           ))),
       )
     } else {
@@ -768,6 +809,7 @@ fn text_segment(
   spans: &[Span],
   find: Option<&str>,
   current: Option<&Range<usize>>,
+  open_person: &Opener,
 ) -> AnyElement {
   let slice = &text[seg.clone()];
   let clipped: Vec<(Range<usize>, &SpanKind)> = spans
@@ -841,13 +883,17 @@ fn text_segment(
   }
   let highlights = compact_highlights(slice, highlights);
 
+  // What a click opens: a link's address, or the chat with the person a mention names.
   let mut link_ranges = Vec::new();
-  let mut urls = Vec::new();
+  let mut targets = Vec::new();
   for (range, kind) in &clipped {
-    if let SpanKind::Link(url) = kind {
-      link_ranges.push(range.clone());
-      urls.push(url.clone());
-    }
+    let target = match kind {
+      SpanKind::Link(url) => Target::Url(url.clone()),
+      SpanKind::Mention(user_id) => Target::Person(user_id.clone()),
+      _ => continue,
+    };
+    link_ranges.push(range.clone());
+    targets.push(target);
   }
 
   let marks = mention_marks(slice, &clipped);
@@ -869,14 +915,21 @@ fn text_segment(
   if link_ranges.is_empty() {
     styled.into_any_element()
   } else {
+    let open_person = open_person.clone();
     InteractiveText::new(id, styled)
-      .on_click(link_ranges, move |ix, _, cx| {
-        if let Some(url) = urls.get(ix) {
-          cx.open_url(url);
-        }
+      .on_click(link_ranges, move |ix, window, cx| match targets.get(ix) {
+        Some(Target::Url(url)) => cx.open_url(url),
+        Some(Target::Person(user_id)) => open_person(user_id, window, cx),
+        None => {},
       })
       .into_any_element()
   }
+}
+
+/// What clicking a span of message text opens.
+enum Target {
+  Url(String),
+  Person(String),
 }
 
 /// Padding inside a mention's highlight, at both ends: a text run's background has no padding of its own, so
@@ -997,13 +1050,15 @@ fn fit(width: Option<u32>, height: Option<u32>, max_w: f32, max_h: f32) -> (f32,
   }
 }
 
-fn attachment_view(att: &Attachment, id: SharedString, ctx: &MsgCtx, cx: &App) -> AnyElement {
-  let previewable = matches!(att.kind, AttachmentKind::Image | AttachmentKind::LinkPreview);
-  if let (true, Some(thumb)) = (previewable, att.thumb_url.as_deref()) {
+fn attachment_view(att: &Attachment, id: SharedString, bubble: Tone, ctx: &MsgCtx, cx: &App) -> AnyElement {
+  if att.kind == AttachmentKind::LinkPreview {
+    return link_card(att, id, bubble, ctx, cx);
+  }
+  if let (AttachmentKind::Image, Some(thumb)) = (att.kind, att.thumb_url.as_deref()) {
     let (w, h) = fit(att.width, att.height, 420., 320.);
     let (open, menu_att, menu_core) = (att.clone(), att.clone(), ctx.core.clone());
     let mut frame = div()
-      .id(id.clone())
+      .id(id)
       .w(px(w))
       .h(px(h))
       .flex_shrink_0()
@@ -1016,10 +1071,6 @@ fn attachment_view(att: &Attachment, id: SharedString, ctx: &MsgCtx, cx: &App) -
       });
     if let Some(image) = ctx.images.get(thumb, 1600, cx) {
       frame = frame.child(img(image).size_full().rounded(px(14.)).object_fit(ObjectFit::Cover));
-    }
-    if att.kind == AttachmentKind::LinkPreview {
-      let link = chip(att, SharedString::from(format!("{id}-link")), false);
-      return v_flex().gap_1().items_start().child(frame).child(link).into_any_element();
     }
     return frame.into_any_element();
   }
@@ -1034,6 +1085,89 @@ fn attachment_view(att: &Attachment, id: SharedString, ctx: &MsgCtx, cx: &App) -
     return video_tile(att, id, ctx, cx);
   }
   chip(att, id, true)
+}
+
+/// A link's preview, drawn as a second bubble of its message so it reads as part of it: the page's image at its
+/// own proportions, then its title and domain. The whole card opens the link; hovering shows the full address.
+fn link_card(att: &Attachment, id: SharedString, bubble: Tone, ctx: &MsgCtx, cx: &App) -> AnyElement {
+  const RADIUS: f32 = 16.;
+  const GROUP: &str = "link-card";
+  // The image keeps its proportions, as image attachments do; the card is never narrower than its text needs.
+  let (image_w, image_h) = fit(att.width, att.height, 400., 300.);
+  let card_w = image_w.max(280.);
+  let (open, address, menu_att, menu_core) = (att.url.clone(), att.url.clone(), att.clone(), ctx.core.clone());
+  let image = att.thumb_url.as_deref().map(|thumb| {
+    let mut frame = h_flex()
+      .w_full()
+      .h(px(image_h))
+      .justify_center()
+      .rounded_t(px(RADIUS))
+      .bg(rgb(PLACEHOLDER))
+      .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+        viewer::image_menu(&menu_core, &menu_att, event.position, window, cx);
+      });
+    if let Some(image) = ctx.images.get(thumb, 1600, cx) {
+      // An explicit size: with `size_full` the image's own aspect ratio sets its height.
+      frame = frame.child(
+        img(image)
+          .w(px(image_w))
+          .h(px(image_h))
+          .flex_shrink_0()
+          .when(image_w >= card_w, |image| image.rounded_t(px(RADIUS))),
+      );
+    }
+    frame
+  });
+  let domain = link_domain(&att.url);
+  let title = (!att.name.is_empty() && att.name != domain).then(|| att.name.clone());
+  v_flex()
+    .id(id)
+    .group(GROUP)
+    .w(px(card_w))
+    .flex_shrink_0()
+    .rounded(px(RADIUS))
+    .bg(rgb(bubble))
+    .cursor_pointer()
+    .tooltip(move |window, cx| Tooltip::new(address.clone()).build(window, cx))
+    .on_click(move |_, _, cx| cx.open_url(&open))
+    .children(image)
+    .child(
+      v_flex()
+        .px_3p5()
+        .py_2p5()
+        .gap_1()
+        .children(title.map(|title| {
+          div()
+            .text_size(px(14.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(TEXT))
+            .line_clamp(2)
+            .group_hover(GROUP, |title| title.text_color(rgb(ACCENT)))
+            .child(title)
+        }))
+        .child(
+          h_flex()
+            .gap_1p5()
+            .items_center()
+            .child(icon(Icon::ExternalLink, 12., MUTED))
+            .child(
+              div()
+                .min_w_0()
+                .text_size(px(12.))
+                .text_color(rgb(MUTED))
+                .truncate()
+                .child(domain),
+            ),
+        ),
+    )
+    .into_any_element()
+}
+
+/// The host a link points at, without `www.`, as the card's second line.
+fn link_domain(url: &str) -> String {
+  let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
+  let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+  host.strip_prefix("www.").unwrap_or(host).to_string()
 }
 
 /// A video: poster frame (when the server has one) under a play button, like the web app. Opens the viewer.
@@ -1321,8 +1455,15 @@ fn react(core: &Core, group: &GroupId, topic: &str, id: &str, emoji: &str, add: 
 
 #[cfg(test)]
 mod tests {
-  use super::{MENTION_PAD, find_ranges, mention_marks, pad_at, shift_end, shift_start};
+  use super::{MENTION_PAD, find_ranges, link_domain, mention_marks, pad_at, shift_end, shift_start};
   use gchat_core::SpanKind;
+
+  #[test]
+  fn link_domain_is_the_host_without_www() {
+    assert_eq!(link_domain("https://www.example.com/a/b?c=1"), "example.com");
+    assert_eq!(link_domain("https://docs.example.org#top"), "docs.example.org");
+    assert_eq!(link_domain("example.net/path"), "example.net");
+  }
 
   /// The padded text, and each mention's text as its highlight covers it.
   fn padded(text: &str, mentions: &[std::ops::Range<usize>]) -> (String, Vec<String>) {
