@@ -143,6 +143,55 @@ pub struct User {
   pub deleted: bool,
 }
 
+/// A Chat app command the composer offers after `/`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlashCommand {
+  /// The app's user id.
+  pub bot_id: String,
+  /// The app's display name.
+  pub bot_name: String,
+  /// The app's avatar.
+  pub bot_avatar: Option<String>,
+  /// The id the app registered the command under.
+  pub id: i64,
+  /// The name with its slash, such as `/help`.
+  pub name: String,
+  /// What the command does.
+  pub description: String,
+}
+
+/// A part of an outgoing message's text that stands for someone or something, as one unit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Chip {
+  /// Byte range of the message text, on char boundaries.
+  pub range: Range<usize>,
+  /// What it stands for.
+  pub kind: ChipKind,
+}
+
+/// What a `Chip` stands for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChipKind {
+  /// @mention of one person or app.
+  Mention {
+    /// User id.
+    user_id: String,
+    /// True for a Chat app.
+    bot: bool,
+  },
+  /// @all: everyone in the space.
+  MentionAll,
+  /// A slash command, which the app answers. It starts the message.
+  Command {
+    /// The app's user id.
+    bot_id: String,
+    /// `SlashCommand::id`.
+    command_id: i64,
+    /// `SlashCommand::name`.
+    name: String,
+  },
+}
+
 /// Inline formatting on `Message::text`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SpanKind {
@@ -597,6 +646,20 @@ pub enum Event {
   Mine(MyStatus),
   /// Directory of people the user can start a chat with. Replaces what came before.
   People(Vec<User>),
+  /// Who can be @mentioned in a conversation, by name: answer to `Command::LoadMembers`. Never the signed-in user.
+  Members {
+    /// Conversation.
+    group: GroupId,
+    /// Joined members, people and apps.
+    users: Arc<Vec<User>>,
+  },
+  /// The commands of the apps in a conversation, by name: answer to `Command::LoadSlashCommands`.
+  SlashCommands {
+    /// Conversation.
+    group: GroupId,
+    /// Commands that answer in the conversation. Commands that open a dialog are left out.
+    commands: Arc<Vec<SlashCommand>>,
+  },
   /// Open this conversation: answer to `Command::CreateChat`, or an existing chat it found.
   OpenChat(GroupId),
   /// A command or stream step failed. The string is already safe to show.
@@ -648,7 +711,13 @@ pub enum Command {
     quote: Option<String>,
     /// Local files to upload and attach.
     files: Vec<PathBuf>,
+    /// Mentions and the slash command in `text`.
+    chips: Vec<Chip>,
   },
+  /// Fetch who can be @mentioned in a conversation. Answers `Event::Members`.
+  LoadMembers(GroupId),
+  /// Fetch the slash commands of the apps in a conversation. Answers `Event::SlashCommands`.
+  LoadSlashCommands(GroupId),
   /// Replaces the text of one of the user's own messages.
   Edit {
     /// Conversation.

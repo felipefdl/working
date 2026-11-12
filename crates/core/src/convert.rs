@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 
 use crate::model::{
-  Attachment, AttachmentKind, Card, CardAction, CardButton, CardSection, Group, GroupId, GroupKind, Message, Notify,
-  Placement, Quote, Reaction, Snippet, Span, SpanKind, User,
+  Attachment, AttachmentKind, Card, CardAction, CardButton, CardSection, Chip, ChipKind, Group, GroupId, GroupKind,
+  Message, Notify, Placement, Quote, Reaction, SlashCommand, Snippet, Span, SpanKind, User,
 };
 use crate::proto;
 
@@ -305,6 +305,108 @@ impl Utf16Index<'_> {
     let start = start.max(0) as usize;
     self.byte(start)..self.byte(start + length.max(0) as usize)
   }
+}
+
+/// The annotations that mark `chips` in an outgoing message: mentions and the slash command, at UTF-16 offsets.
+pub fn chip_annotations(text: &str, chips: &[Chip]) -> Vec<proto::Annotation> {
+  let units = |bytes: &str| i32::try_from(bytes.encode_utf16().count()).unwrap_or(i32::MAX);
+  chips
+    .iter()
+    .filter_map(|chip| {
+      let covered = text.get(chip.range.clone()).filter(|covered| !covered.is_empty())?;
+      let start = units(text.get(..chip.range.start)?);
+      let user_id = |id: &str, bot: bool| proto::UserId {
+        id: Some(id.to_string()),
+        r#type: Some(if bot {
+          proto::UserType::Bot
+        } else {
+          proto::UserType::Human
+        } as i32),
+        ..Default::default()
+      };
+      let mut annotation = proto::Annotation {
+        start_index: Some(start),
+        length: Some(units(covered)),
+        ..Default::default()
+      };
+      match &chip.kind {
+        ChipKind::Mention { user_id: id, bot } => {
+          annotation.r#type = Some(proto::AnnotationType::UserMention as i32);
+          annotation.user_mention_metadata = Some(proto::UserMentionMetadata {
+            id: Some(user_id(id, *bot)),
+            r#type: Some(proto::user_mention_metadata::Type::Mention as i32),
+            ..Default::default()
+          });
+        },
+        ChipKind::MentionAll => {
+          annotation.r#type = Some(proto::AnnotationType::UserMention as i32);
+          annotation.user_mention_metadata = Some(proto::UserMentionMetadata {
+            r#type: Some(proto::user_mention_metadata::Type::MentionAll as i32),
+            ..Default::default()
+          });
+        },
+        ChipKind::Command { bot_id, command_id, name } => {
+          annotation.r#type = Some(proto::AnnotationType::SlashCommand as i32);
+          annotation.slash_command_metadata = Some(proto::SlashCommandMetadata {
+            id: Some(user_id(bot_id, true)),
+            r#type: Some(proto::slash_command_metadata::Type::Invoke as i32),
+            command_name: Some(name.clone()),
+            command_id: Some(*command_id),
+            triggers_dialog: Some(false),
+            ..Default::default()
+          });
+        },
+      }
+      Some(annotation)
+    })
+    .collect()
+}
+
+/// How `chips` show on the message while it is pending: its mentions.
+pub fn chip_spans(chips: &[Chip]) -> Vec<Span> {
+  chips
+    .iter()
+    .filter_map(|chip| {
+      let kind = match &chip.kind {
+        ChipKind::Mention { user_id, .. } => SpanKind::Mention(user_id.clone()),
+        ChipKind::MentionAll => SpanKind::MentionAll,
+        ChipKind::Command { .. } => return None,
+      };
+      Some(Span { range: chip.range.clone(), kind })
+    })
+    .collect()
+}
+
+/// The commands of the apps in the conversation, by name, without the ones that open a dialog.
+pub fn slash_commands(response: &proto::AutocompleteSlashCommandsResponse) -> Vec<SlashCommand> {
+  let mut commands: Vec<SlashCommand> = response
+    .bots_in_group
+    .iter()
+    .filter_map(|bot| {
+      let app = bot.bot.as_ref().and_then(user)?;
+      Some(bot.slash_commands.iter().filter_map(move |command| {
+        let name = command.name.clone().filter(|name| !name.is_empty())?;
+        if command.triggers_dialog.unwrap_or(false) {
+          return None;
+        }
+        Some(SlashCommand {
+          bot_id: app.id.clone(),
+          bot_name: app.name.clone(),
+          bot_avatar: app.avatar_url.clone(),
+          id: command.command_id?,
+          name: if name.starts_with('/') {
+            name
+          } else {
+            format!("/{name}")
+          },
+          description: command.description.clone().unwrap_or_default(),
+        })
+      }))
+    })
+    .flatten()
+    .collect();
+  commands.sort_by_cached_key(|command| command.name.to_lowercase());
+  commands
 }
 
 fn attachment_url(url_type: &str, upload: &proto::UploadMetadata, size: &str) -> String {

@@ -7,13 +7,14 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gchat_core::{Command, Core, Group, GroupKind, Message, User};
+use gchat_core::{Command, Core, Group, GroupKind, Message, SlashCommand, User};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Paste, Textarea, TextareaState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::completion::{self, Menu, Trigger};
 use crate::images::Images;
 use crate::message::{self, Act, Actor, MsgCtx, Opener, Row};
 use crate::settings::{Density, RewriteTool, Settings};
@@ -75,6 +76,8 @@ pub struct ConversationView {
   density: Density,
   thread: Option<Thread>,
   opener: Opener,
+  /// Opens the chat with the person a name or a mention names.
+  open_person: Opener,
   actor: Actor,
   /// The message the next one sent from the main composer quotes.
   quoting: Option<Arc<Message>>,
@@ -109,6 +112,15 @@ pub struct ConversationView {
   rewrite_error: Option<String>,
   _rewrite_error_clear: Option<Task<()>>,
   find: Option<Find>,
+  /// Who `@` offers, once `Command::LoadMembers` answered.
+  members: Option<Arc<Vec<User>>>,
+  /// What `/` offers, once `Command::LoadSlashCommands` answered.
+  commands: Option<Arc<Vec<SlashCommand>>>,
+  /// Members and commands are asked for on the first `@` or `/`, once.
+  asked_members: bool,
+  asked_commands: bool,
+  /// The `@` or `/` menu over one of the composers.
+  menu: Option<Menu>,
 }
 
 impl ConversationView {
@@ -168,7 +180,10 @@ impl ConversationView {
     });
     let subs = vec![
       cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| match event {
-        InputEvent::Change => this.on_typed(cx),
+        InputEvent::Change => {
+          this.on_typed(cx);
+          this.refresh_menu(false, cx);
+        },
         InputEvent::PressEnter { shift: false, .. } => this.submit(false, window, cx),
         _ => {},
       }),
@@ -183,6 +198,12 @@ impl ConversationView {
         }
       }
     });
+    let open_person: Opener = {
+      let store = store.clone();
+      Rc::new(move |user_id, window, cx| {
+        store.update(cx, |store, cx| store.open_person(user_id, window, cx)).ok();
+      })
+    };
     let opener: Opener = {
       let weak = cx.weak_entity();
       Rc::new(move |topic, window, cx| {
@@ -207,6 +228,7 @@ impl ConversationView {
       density: cx.global::<Settings>().density,
       thread: None,
       opener,
+      open_person,
       actor,
       quoting: None,
       editing: None,
@@ -233,6 +255,11 @@ impl ConversationView {
       rewrite_error: None,
       _rewrite_error_clear: None,
       find: None,
+      members: None,
+      commands: None,
+      asked_members: false,
+      asked_commands: false,
+      menu: None,
     };
     // Rows change height with the message layout: measure the lists again.
     view._subs.push(cx.observe_global::<Settings>(|this, cx| {
@@ -626,7 +653,7 @@ impl ConversationView {
     if self.rewriting == Some(false) {
       return;
     }
-    let text = self.composer.read(cx).value().trim().to_string();
+    let (text, chips) = completion::message(&self.composer.read(cx).content());
     let editing = self.editing.as_ref().is_some_and(|editing| !editing.in_thread);
     // Files alone make a message; a change to an existing one needs text.
     if text.is_empty() && (editing || self.files.is_empty()) {
@@ -652,6 +679,7 @@ impl ConversationView {
         text,
         quote,
         files,
+        chips,
       });
       self.list.scroll_to_end();
     }
@@ -803,10 +831,10 @@ impl ConversationView {
         .submit_on_enter(true)
         .placeholder("Reply")
     });
-    let sub = cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| {
-      if let InputEvent::PressEnter { shift: false, .. } = event {
-        this.submit(true, window, cx);
-      }
+    let sub = cx.subscribe_in(&composer, window, |this, _, event: &InputEvent, window, cx| match event {
+      InputEvent::Change => this.refresh_menu(true, cx),
+      InputEvent::PressEnter { shift: false, .. } => this.submit(true, window, cx),
+      _ => {},
     });
     composer.update(cx, |state, cx| state.focus(window, cx));
     self.thread = Some(Thread {
@@ -838,7 +866,7 @@ impl ConversationView {
     let Some(thread) = &mut self.thread else {
       return;
     };
-    let text = thread.composer.read(cx).value().trim().to_string();
+    let (text, chips) = completion::message(&thread.composer.read(cx).content());
     let editing = self.editing.as_ref().is_some_and(|editing| editing.in_thread);
     if text.is_empty() && (editing || thread.files.is_empty()) {
       return;
@@ -858,6 +886,7 @@ impl ConversationView {
         text,
         quote: None,
         files,
+        chips,
       });
       thread.list.scroll_to_end();
     }
@@ -1045,6 +1074,7 @@ impl ConversationView {
       _ => self.composer.clone(),
     };
     let draft = composer.read(cx).value().to_string();
+    let tokens = composer.read(cx).tokens().to_vec();
     if draft.trim().is_empty() {
       // Files alone have nothing to rewrite.
       if then_send {
@@ -1066,6 +1096,9 @@ impl ConversationView {
             state.set_disabled(false, cx);
             if let Ok(text) = &result {
               state.replace_all(text.clone(), window, cx);
+              for (range, token) in completion::reattach(text, &tokens) {
+                state.replace_range_with_token(range, token, window, cx).ok();
+              }
             }
             state.focus(window, cx);
           });
@@ -1113,9 +1146,8 @@ impl ConversationView {
     } else {
       sparkle.into_any_element()
     };
-    h_flex()
+    let field = h_flex()
       .w_full()
-      .max_w(px(780.))
       .pl_2()
       .pr_4()
       .py_2()
@@ -1173,7 +1205,156 @@ impl ConversationView {
             })
             .child(sparkle),
         )
-      })
+      });
+    let menu = self.menu.as_ref().filter(|menu| menu.in_thread == in_thread).map(|menu| {
+      let view = cx.weak_entity();
+      let pick: Rc<dyn Fn(usize, &mut Window, &mut App)> = Rc::new(move |ix, window, cx| {
+        view.update(cx, |this, cx| this.pick(ix, window, cx)).ok();
+      });
+      deferred(
+        div()
+          .absolute()
+          .bottom_full()
+          .left_0()
+          .right_0()
+          .mb_2()
+          .child(menu.render(&self.images, pick, cx)),
+      )
+      .with_priority(1)
+    });
+    div().relative().w_full().max_w(px(780.)).child(field).children(menu)
+  }
+
+  // Mentions and slash commands.
+
+  /// Members and commands of this conversation arrived: show them if a menu is waiting on them.
+  pub fn set_members(&mut self, users: Arc<Vec<User>>, cx: &mut Context<Self>) {
+    self.members = Some(users);
+    self.refresh_menus(cx);
+  }
+
+  pub fn set_slash_commands(&mut self, commands: Arc<Vec<SlashCommand>>, cx: &mut Context<Self>) {
+    self.commands = Some(commands);
+    self.refresh_menus(cx);
+  }
+
+  fn refresh_menus(&mut self, cx: &mut Context<Self>) {
+    let in_thread = self.menu.as_ref().map_or(self.thread.is_some(), |menu| menu.in_thread);
+    self.refresh_menu(in_thread, cx);
+  }
+
+  fn composer_of(&self, in_thread: bool) -> Option<&Entity<TextareaState>> {
+    if in_thread {
+      self.thread.as_ref().map(|thread| &thread.composer)
+    } else {
+      Some(&self.composer)
+    }
+  }
+
+  /// Opens, updates, or closes a composer's menu for the text before its cursor. A change to a message has no
+  /// menu: an edit keeps only the text.
+  fn refresh_menu(&mut self, in_thread: bool, cx: &mut Context<Self>) {
+    let editing = self.editing.as_ref().is_some_and(|editing| editing.in_thread == in_thread);
+    let found = self.composer_of(in_thread).filter(|_| !editing).and_then(|composer| {
+      let state = composer.read(cx);
+      let text = state.value();
+      let (trigger, range) = completion::find(&text, state.cursor(), state.tokens())?;
+      let query = text.get(range.start + 1..range.end)?.to_string();
+      Some((trigger, range, query))
+    });
+    let Some((trigger, range, query)) = found else {
+      if self.menu.take().is_some() {
+        cx.notify();
+      }
+      return;
+    };
+    match trigger {
+      Trigger::Mention if !self.asked_members => {
+        self.asked_members = true;
+        self.core.send(Command::LoadMembers(self.group.id.clone()));
+      },
+      Trigger::Command if !self.asked_commands => {
+        self.asked_commands = true;
+        self.core.send(Command::LoadSlashCommands(self.group.id.clone()));
+      },
+      _ => {},
+    }
+    let members = self.members.as_deref().map_or(&[][..], Vec::as_slice);
+    let commands = self.commands.as_deref().map_or(&[][..], Vec::as_slice);
+    let all = self.group.kind == GroupKind::Space;
+    let items = completion::items(trigger, &query, members, all, commands);
+    if items.is_empty() {
+      self.menu = None;
+    } else {
+      match &mut self.menu {
+        Some(menu) if menu.in_thread == in_thread => {
+          if menu.range.start != range.start {
+            menu.selected = 0;
+          }
+          menu.selected = menu.selected.min(items.len() - 1);
+          menu.range = range;
+          menu.items = items;
+        },
+        _ => {
+          let view = cx.weak_entity();
+          let keys = cx.intercept_keystrokes(move |event, window, cx| {
+            view.update(cx, |this, cx| this.menu_key(event, window, cx)).ok();
+          });
+          self.menu = Some(Menu {
+            in_thread,
+            range,
+            items,
+            selected: 0,
+            _keys: keys,
+          });
+        },
+      }
+    }
+    cx.notify();
+  }
+
+  /// The menu's keys, taken before the composer sees them: arrows move, Return or Tab picks, Escape closes.
+  fn menu_key(&mut self, event: &KeystrokeEvent, window: &mut Window, cx: &mut Context<Self>) {
+    let Some(in_thread) = self.menu.as_ref().map(|menu| menu.in_thread) else {
+      return;
+    };
+    let focused = self
+      .composer_of(in_thread)
+      .is_some_and(|composer| composer.read(cx).focus_handle(cx).is_focused(window));
+    let keystroke = &event.keystroke;
+    let Some(menu) = self.menu.as_mut().filter(|_| focused && !keystroke.modifiers.modified()) else {
+      return;
+    };
+    match keystroke.key.as_str() {
+      "up" => menu.selected = menu.selected.checked_sub(1).unwrap_or(menu.items.len() - 1),
+      "down" => menu.selected = (menu.selected + 1) % menu.items.len(),
+      "enter" | "tab" => {
+        let selected = menu.selected;
+        self.pick(selected, window, cx);
+      },
+      "escape" => self.menu = None,
+      _ => return,
+    }
+    cx.stop_propagation();
+    cx.notify();
+  }
+
+  /// Puts the row's chip in place of the trigger and query, followed by a space.
+  fn pick(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+    let Some(menu) = self.menu.take() else {
+      return;
+    };
+    let (Some(item), Some(composer)) = (menu.items.get(ix), self.composer_of(menu.in_thread).cloned()) else {
+      return;
+    };
+    let token = item.token();
+    composer.update(cx, |state, cx| {
+      if state.replace_range_with_token(menu.range, token, window, cx).is_ok() {
+        state.insert(" ", window, cx);
+      }
+      state.focus(window, cx);
+    });
+    cx.notify();
   }
 
   fn composer_status(&self, in_thread: bool, cx: &App) -> Option<String> {
@@ -1225,6 +1406,7 @@ impl ConversationView {
       find,
       find_hit,
       act: &self.actor,
+      open_person: &self.open_person,
       threads: self.group.kind == GroupKind::Space,
       hovered: self.hovered.as_deref(),
       on_tools: &self.on_tools,
@@ -1249,6 +1431,7 @@ impl ConversationView {
       find,
       find_hit,
       act: &self.actor,
+      open_person: &self.open_person,
       threads: false,
       hovered: self.hovered.as_deref(),
       on_tools: &self.on_tools,

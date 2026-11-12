@@ -344,6 +344,20 @@ impl Store {
           }
         },
         Event::People(people) => self.people = people,
+        Event::Members { group, users } => {
+          if self.is_open(&group)
+            && let Some(view) = &self.conv
+          {
+            view.update(cx, |view, cx| view.set_members(users, cx));
+          }
+        },
+        Event::SlashCommands { group, commands } => {
+          if self.is_open(&group)
+            && let Some(view) = &self.conv
+          {
+            view.update(cx, |view, cx| view.set_slash_commands(commands, cx));
+          }
+        },
         Event::OpenChat(id) => self.open(id, window, cx),
         Event::Error(message) => tracing::warn!("core error: {message}"),
       }
@@ -618,6 +632,22 @@ impl Store {
       };
       (kind_ok && members == want).then(|| conv.g.id.clone())
     })
+  }
+
+  /// Opens the one-to-one chat with a person or app, as clicking their name or a mention of them asks. Without one
+  /// yet, the core creates it and answers `Event::OpenChat`.
+  pub fn open_person(&mut self, user_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+    if user_id.is_empty() || user_id == self.me_id() {
+      return;
+    }
+    let existing = self.groups.values().find_map(|conv| {
+      let one = matches!(conv.g.kind, GroupKind::Dm | GroupKind::App) && conv.g.member_ids == [user_id];
+      one.then(|| conv.g.id.clone())
+    });
+    match existing {
+      Some(id) => self.open(id, window, cx),
+      None => self.core.send(Command::CreateChat { user_ids: vec![user_id.to_string()] }),
+    }
   }
 
   pub fn open(&mut self, id: GroupId, window: &mut Window, cx: &mut Context<Self>) {

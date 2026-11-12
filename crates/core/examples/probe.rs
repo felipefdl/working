@@ -76,6 +76,15 @@ fn main() {
           opened = true;
           println!("[{at}ms] opening the most recent DM");
           core.send(Command::Open(group.id.clone()));
+          // Who and what the composer offers after @ and /, in the most recent space.
+          if let Some(space) = groups
+            .iter()
+            .filter(|group| group.kind == gchat_core::GroupKind::Space)
+            .max_by_key(|group| group.sort_time)
+          {
+            core.send(Command::LoadMembers(space.id.clone()));
+            core.send(Command::LoadSlashCommands(space.id.clone()));
+          }
         }
       },
       Event::SearchResults { query, hits } => {
@@ -190,6 +199,21 @@ fn main() {
         );
       },
       Event::People(people) => println!("[{at}ms] people: {}", people.len()),
+      Event::Members { users, .. } => println!(
+        "[{at}ms] members: {} (apps {})",
+        users.len(),
+        users.iter().filter(|user| user.is_bot).count()
+      ),
+      Event::SlashCommands { commands, .. } => println!(
+        "[{at}ms] slash commands: {} from {} apps, all named /x: {}",
+        commands.len(),
+        commands
+          .iter()
+          .map(|command| &command.bot_id)
+          .collect::<std::collections::HashSet<_>>()
+          .len(),
+        commands.iter().all(|command| command.name.starts_with('/'))
+      ),
       Event::OpenChat(id) => println!("[{at}ms] open chat: {id:?}"),
       Event::Error(error) => println!("[{at}ms] error: {error}"),
     }

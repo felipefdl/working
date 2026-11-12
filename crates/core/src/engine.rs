@@ -35,7 +35,7 @@ use crate::convert::{self, Users};
 use crate::http::{Http, SignedOut, request_header};
 use crate::mcp;
 use crate::model::{
-  Attachment, AttachmentKind, CardAction, Command, Connection, DndFor, DndSchedule, DndSchedules, Event, Group,
+  Attachment, AttachmentKind, CardAction, Chip, Command, Connection, DndFor, DndSchedule, DndSchedules, Event, Group,
   GroupId, GroupKind, McpConfig, McpStatus, Message, Micros, MyStatus, Notify, PersonStatus, Placement, Presence,
   Quote, Reaction, SearchHit, Shortcut, Snippet, User,
 };
@@ -1153,7 +1153,26 @@ impl Engine {
           engine.report(result);
         });
       },
-      Command::Send { group, topic_id, text, quote, files } => {
+      Command::LoadMembers(group) => {
+        tokio::spawn(async move {
+          let result = engine.load_members(group).await;
+          engine.report(result);
+        });
+      },
+      Command::LoadSlashCommands(group) => {
+        tokio::spawn(async move {
+          let result = engine.load_slash_commands(group).await;
+          engine.report(result);
+        });
+      },
+      Command::Send {
+        group,
+        topic_id,
+        text,
+        quote,
+        files,
+        chips,
+      } => {
         if self.readonly {
           return self.emit(Event::Error("Read-only mode: the message was not sent.".into()));
         }
@@ -1163,14 +1182,14 @@ impl Engine {
           text: quoted.text.clone(),
         });
         let attached = files.iter().map(|path| local_attachment(path)).collect();
-        let Some(pending) = self.add_pending(&group, topic_id.as_deref(), &text, shown, attached) else {
+        let Some(pending) = self.add_pending(&group, topic_id.as_deref(), &text, &chips, shown, attached) else {
           return;
         };
         tokio::spawn(async move {
           let result = async {
             let uploads = engine.upload_files(&group, files).await?;
             engine
-              .send_message(&group, topic_id.as_deref(), &text, quoted.as_deref(), uploads, &pending)
+              .send_message(&group, topic_id.as_deref(), &text, &chips, quoted.as_deref(), uploads, &pending)
               .await
           }
           .await;
@@ -1246,7 +1265,7 @@ impl Engine {
         if self.readonly {
           return self.emit(Event::Error("Read-only mode: the meeting was not started.".into()));
         }
-        let Some(pending) = self.add_pending(&group, None, "Starting a video meeting…", None, Vec::new()) else {
+        let Some(pending) = self.add_pending(&group, None, "Starting a video meeting…", &[], None, Vec::new()) else {
           return;
         };
         tokio::spawn(async move {
@@ -1441,6 +1460,7 @@ impl Engine {
     group: &GroupId,
     topic_id: Option<&str>,
     text: &str,
+    chips: &[Chip],
     quote: Option<Quote>,
     attachments: Vec<Attachment>,
   ) -> Option<String> {
@@ -1459,7 +1479,7 @@ impl Engine {
       sender_name: me.name.clone(),
       sender_avatar: me.avatar_url,
       text: text.to_string(),
-      spans: Vec::new(),
+      spans: convert::chip_spans(chips),
       time: now_micros(),
       update_time: 0,
       edited: false,
@@ -1519,24 +1539,24 @@ impl Engine {
     Ok(done)
   }
 
+  #[allow(clippy::too_many_arguments, reason = "one message's independent parts")]
   async fn send_message(
     &self,
     group: &GroupId,
     topic_id: Option<&str>,
     text: &str,
+    chips: &[Chip],
     quoted: Option<&Message>,
     uploads: Vec<proto::UploadMetadata>,
     local_id: &str,
   ) -> Result<()> {
-    let annotations: Vec<proto::Annotation> = uploads
-      .into_iter()
-      .map(|upload| proto::Annotation {
-        r#type: Some(proto::AnnotationType::UploadMetadata as i32),
-        chip_render_type: Some(proto::annotation::ChipRenderType::Render as i32),
-        upload_metadata: Some(upload),
-        ..Default::default()
-      })
-      .collect();
+    let mut annotations = convert::chip_annotations(text, chips);
+    annotations.extend(uploads.into_iter().map(|upload| proto::Annotation {
+      r#type: Some(proto::AnnotationType::UploadMetadata as i32),
+      chip_render_type: Some(proto::annotation::ChipRenderType::Render as i32),
+      upload_metadata: Some(upload),
+      ..Default::default()
+    }));
     let sent = match topic_id {
       // A reply joins an existing topic (thread).
       Some(topic_id) => {
@@ -1591,6 +1611,87 @@ impl Engine {
     });
     let message = converted.ok_or_else(|| anyhow!("the server accepted the message but did not return it"))?;
     self.upsert_message(Arc::new(message), Some(local_id));
+    Ok(())
+  }
+
+  /// Joined members of a conversation, people and apps, by name, without the signed-in user. Members whose
+  /// profile the answer leaves out are looked up.
+  async fn load_members(self: &Arc<Self>, group: GroupId) -> Result<()> {
+    let mut ids = Vec::new();
+    let mut page_token = None;
+    loop {
+      let request = proto::ListMembersRequest {
+        request_header: Some(request_header()),
+        group_id: Some(convert::proto_group_id(&group)),
+        page_size: Some(500),
+        page_token: page_token.take(),
+        ..Default::default()
+      };
+      let response: proto::ListMembersResponse = self.http.api("list_members", &request).await?;
+      {
+        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for user in response
+          .members
+          .iter()
+          .filter_map(|member| member.user.as_ref())
+          .filter_map(convert::user)
+        {
+          state.users.insert(user.id.clone(), user);
+        }
+      }
+      let joined = proto::MembershipState::MemberJoined as i32;
+      ids.extend(
+        response
+          .memberships
+          .iter()
+          .filter(|membership| membership.membership_state.is_none_or(|state| state == joined))
+          .filter_map(|membership| membership.id.as_ref()?.member_id.as_ref()?.user_id.as_ref()?.id.clone()),
+      );
+      match response.next_page_token.filter(|token| !token.is_empty()) {
+        Some(token) => page_token = Some(token),
+        None => break,
+      }
+    }
+    let me = self.me_id();
+    ids.retain(|id| *id != me);
+    ids.sort();
+    ids.dedup();
+    let unknown: Vec<String> = {
+      let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      ids.iter().filter(|id| !state.users.contains_key(*id)).cloned().collect()
+    };
+    if !unknown.is_empty() {
+      self.fetch_users(unknown).await?;
+    }
+    let mut users: Vec<User> = {
+      let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      ids
+        .iter()
+        .filter_map(|id| state.users.get(id))
+        .filter(|user| !user.name.is_empty() && !user.deleted)
+        .cloned()
+        .collect()
+    };
+    users.sort_by_cached_key(|user| user.name.to_lowercase());
+    self.emit(Event::Members { group, users: Arc::new(users) });
+    Ok(())
+  }
+
+  /// The commands of the apps in a conversation. The web app's other `/` entries (Drive, Calendar, Docs) are not
+  /// apps of the conversation and are not asked for.
+  async fn load_slash_commands(&self, group: GroupId) -> Result<()> {
+    let request = proto::AutocompleteSlashCommandsRequest {
+      request_header: Some(request_header()),
+      query: Some(String::new()),
+      group_id: Some(convert::proto_group_id(&group)),
+      max_num_results: Some(200),
+      restrict_to_bots_in_group: Some(true),
+      ..Default::default()
+    };
+    let response: proto::AutocompleteSlashCommandsResponse =
+      self.http.api("autocomplete_slash_commands", &request).await?;
+    let commands = convert::slash_commands(&response);
+    self.emit(Event::SlashCommands { group, commands: Arc::new(commands) });
     Ok(())
   }
 
@@ -1858,11 +1959,11 @@ impl Engine {
     }
     let attached = files.iter().map(|path| local_attachment(path)).collect();
     let pending = self
-      .add_pending(group, topic_id, text, None, attached)
+      .add_pending(group, topic_id, text, &[], None, attached)
       .ok_or_else(|| anyhow!("the account is not loaded yet"))?;
     let result = async {
       let uploads = self.upload_files(group, files).await?;
-      self.send_message(group, topic_id, text, None, uploads, &pending).await
+      self.send_message(group, topic_id, text, &[], None, uploads, &pending).await
     }
     .await;
     if result.is_err() {

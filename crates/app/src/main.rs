@@ -28,6 +28,7 @@
 )]
 
 mod call;
+mod completion;
 mod conversation;
 mod emoji_picker;
 mod home;
