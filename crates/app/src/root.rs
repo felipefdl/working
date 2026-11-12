@@ -1,4 +1,4 @@
-//! Window root: title bar with search and status, sidebar, content panel, switcher overlay.
+//! Window root: title bar with search and status, sidebar, content panel, switcher and theme picker overlays.
 
 use gchat_core::{Connection, Core};
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
@@ -16,12 +16,14 @@ use crate::menu::{ContextMenu, MenuHandle};
 use crate::new_chat::{NewChat, NewChatEvent, OpenNewChat};
 use crate::settings;
 use crate::settings_view::{SettingsEvent, SettingsView};
+use crate::shortcut::ShortcutView;
 use crate::sidebar::Sidebar;
 use crate::status;
 use crate::status_menu::{self, ComposerHandle, OpenNotificationSettings, StatusComposer};
 use crate::store::{Store, View};
 use crate::switcher::{Switcher, SwitcherEvent};
 use crate::theme::{BG, FIELD, MUTED, PANEL, ROW_HOVER, TEXT, is_light, rgb};
+use crate::theme_picker::{ThemePicker, ThemePickerEvent};
 use crate::ui::{Icon, icon};
 use crate::viewer::{Viewer, ViewerHandle};
 use crate::welcome::WelcomeView;
@@ -30,6 +32,7 @@ actions!(
   working,
   [
     OpenSwitcher,
+    OpenThemePicker,
     OpenSettings,
     GoHome,
     Quit,
@@ -56,6 +59,7 @@ pub fn menus() -> Vec<Menu> {
       disabled: false,
       items: vec![
         MenuItem::action("Settings...", OpenSettings),
+        MenuItem::action("Color Theme…", OpenThemePicker),
         MenuItem::separator(),
         MenuItem::action("Hide Working", Hide),
         MenuItem::action("Hide Others", HideOthers),
@@ -116,6 +120,7 @@ pub struct RootView {
   store: Entity<Store>,
   sidebar: Entity<Sidebar>,
   home: Entity<HomeView>,
+  shortcuts: Entity<ShortcutView>,
   search: Entity<InputState>,
   focus: FocusHandle,
   /// The top-bar mark, for the dark look and for the light one.
@@ -126,6 +131,7 @@ pub struct RootView {
   emoji: Entity<EmojiPicker>,
   composer: Entity<StatusComposer>,
   switcher: Option<(Entity<Switcher>, Subscription)>,
+  theme_picker: Option<(Entity<ThemePicker>, Subscription)>,
   settings: Option<(Entity<SettingsView>, Subscription)>,
   new_chat: Option<(Entity<NewChat>, Subscription)>,
   welcome: Option<Entity<WelcomeView>>,
@@ -138,6 +144,7 @@ impl RootView {
   pub fn new(core: Core, store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
     let sidebar = cx.new(|_| Sidebar::new(store.clone()));
     let home = cx.new(|_| HomeView::new(store.clone()));
+    let shortcuts = cx.new(|_| ShortcutView::new(store.clone()));
     let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search chat"));
     let focus = cx.focus_handle();
     window.focus(&focus, cx);
@@ -222,6 +229,7 @@ impl RootView {
       home,
       search,
       focus,
+      shortcuts,
       logo,
       swipe,
       viewer,
@@ -229,6 +237,7 @@ impl RootView {
       emoji,
       composer,
       switcher: None,
+      theme_picker: None,
       settings: None,
       new_chat: None,
       welcome: None,
@@ -276,6 +285,35 @@ impl RootView {
       }
     });
     self.switcher = Some((switcher, sub));
+    cx.notify();
+  }
+
+  fn open_theme_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.theme_picker.is_some() {
+      return;
+    }
+    let picker = cx.new(|cx| ThemePicker::new(window, cx));
+    let sub = cx.subscribe_in(&picker, window, |this, _, event: &ThemePickerEvent, window, cx| {
+      if let ThemePickerEvent::Pick(index) = *event {
+        settings::Settings::update(cx, |settings| settings.pick_theme(index));
+      }
+      this.close_theme_picker(window, cx);
+    });
+    self.theme_picker = Some((picker, sub));
+    cx.notify();
+  }
+
+  /// Closes the picker and shows the saved theme again, which is the picked one after a pick.
+  fn close_theme_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.theme_picker.take().is_none() {
+      return;
+    }
+    settings::apply_appearance(cx);
+    let conv = self.store.read(cx).conv.clone();
+    match conv {
+      Some(conv) => conv.update(cx, |conv, cx| conv.focus_composer(window, cx)),
+      None => window.focus(&self.focus, cx),
+    }
     cx.notify();
   }
 
@@ -341,6 +379,8 @@ impl RootView {
       self.close_new_chat(window, cx);
     } else if self.switcher.is_some() {
       self.close_switcher(window, cx);
+    } else if self.theme_picker.is_some() {
+      self.close_theme_picker(window, cx);
     } else if !self.store.read(cx).query.is_empty() {
       self.search.update(cx, |state, cx| state.set_value("", window, cx));
       self.store.update(cx, |store, cx| store.set_query(String::new(), cx));
@@ -356,6 +396,11 @@ impl RootView {
         self.go_home(window, cx);
       }
     }
+  }
+
+  /// A modal overlay has the keyboard: conversation hotkeys stay out of its way.
+  const fn modal_open(&self) -> bool {
+    self.settings.is_some() || self.switcher.is_some() || self.theme_picker.is_some() || self.new_chat.is_some()
   }
 
   /// The mouse or trackpad "back" gesture: closes the viewer, then the thread panel, then the conversation.
@@ -443,6 +488,7 @@ impl Render for RootView {
     let store = self.store.read(cx);
     let signed_out = store.signed_out.clone();
     let at_home = store.view == View::Home;
+    let on_shortcut = matches!(store.view, View::Shortcut(_));
     let open_conv = match (&store.view, &store.conv) {
       (View::Conversation(_), Some(conv)) => Some(conv.clone()),
       _ => None,
@@ -461,13 +507,14 @@ impl Render for RootView {
       self.welcome = None;
     }
 
-    if at_home && window.focused(cx).is_none() {
+    if (at_home || on_shortcut) && window.focused(cx).is_none() {
       let focus = self.focus.clone();
       window.defer(cx, move |window, cx| window.focus(&focus, cx));
     }
 
     let content: AnyElement = match open_conv {
       Some(conv) => conv.into_any_element(),
+      None if on_shortcut => self.shortcuts.clone().into_any_element(),
       None => self.home.clone().into_any_element(),
     };
 
@@ -547,12 +594,13 @@ impl Render for RootView {
       .track_focus(&self.focus)
       .on_action(cx.listener(|this, _: &Escape, window, cx| this.on_escape(window, cx)))
       .on_action(cx.listener(|this, _: &OpenSwitcher, window, cx| this.open_switcher(window, cx)))
+      .on_action(cx.listener(|this, _: &OpenThemePicker, window, cx| this.open_theme_picker(window, cx)))
       .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
       .on_action(cx.listener(|this, _: &OpenNotificationSettings, window, cx| this.open_settings_at(true, window, cx)))
       .on_action(cx.listener(|this, _: &GoHome, window, cx| this.go_home(window, cx)))
       .on_action(cx.listener(|this, _: &OpenNewChat, window, cx| this.open_new_chat(window, cx)))
       .on_action(cx.listener(|this, _: &RewriteDraft, window, cx| {
-        if this.settings.is_some() || this.switcher.is_some() || this.new_chat.is_some() {
+        if this.modal_open() {
           return;
         }
         let Some(conv) = this.store.read(cx).conv.clone() else {
@@ -561,7 +609,7 @@ impl Render for RootView {
         conv.update(cx, |conv, cx| conv.rewrite_hotkey(window, cx));
       }))
       .on_action(cx.listener(|this, _: &FindInChat, window, cx| {
-        if this.settings.is_some() || this.switcher.is_some() || this.new_chat.is_some() {
+        if this.modal_open() {
           return;
         }
         if let Some(conv) = this.store.read(cx).conv.clone() {
@@ -603,6 +651,7 @@ impl Render for RootView {
         ),
       )
       .children(self.switcher.as_ref().map(|(switcher, _)| switcher.clone()))
+      .children(self.theme_picker.as_ref().map(|(picker, _)| picker.clone()))
       .children(self.new_chat.as_ref().map(|(view, _)| view.clone()))
       .children(self.settings.as_ref().map(|(view, _)| view.clone()))
       .child(self.viewer.clone())

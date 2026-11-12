@@ -296,6 +296,48 @@ impl Http {
     Resp::decode(decoded.as_slice()).with_context(|| format!("{endpoint} answer does not decode"))
   }
 
+  /// Calls a Chat API endpoint the way the web app does for requests the protobuf schema here cannot express: the
+  /// body and the answer are the positional JSON form of the protobuf messages (index `n` is field `n + 1`).
+  pub async fn api_json(&self, endpoint: &str, request: &serde_json::Value) -> Result<serde_json::Value> {
+    match self.api_json_once(endpoint, request).await {
+      Err(error) if error.downcast_ref::<StaleToken>().is_some() => {
+        self.refresh_xsrf().await?;
+        self.api_json_once(endpoint, request).await
+      },
+      other => other,
+    }
+  }
+
+  async fn api_json_once(&self, endpoint: &str, request: &serde_json::Value) -> Result<serde_json::Value> {
+    let token = match self.xsrf() {
+      Some(token) => token,
+      None => self.refresh_xsrf().await?,
+    };
+    let counter = self.request_id.fetch_add(1, Ordering::Relaxed).to_string();
+    let response = self
+      .client
+      .post(format!("{API_BASE}/{endpoint}"))
+      .query(&[("c", counter.as_str())])
+      .header("content-type", "application/json")
+      .header("x-framework-xsrf-token", token)
+      .header("referer", "https://chat.google.com/")
+      .body(request.to_string())
+      .send()
+      .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+      return Err(StaleToken.into());
+    }
+    if !status.is_success() {
+      let body = text.chars().take(300).collect::<String>();
+      bail!("{endpoint} answered {status}: {body}");
+    }
+    // The answer starts with an anti-JSON-hijacking line.
+    let json = text.trim_start_matches(")]}'").trim_start();
+    serde_json::from_str(json).with_context(|| format!("{endpoint} answer is not JSON"))
+  }
+
   /// Plain authenticated GET, following redirects.
   pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
     let response = self.client.get(url).send().await?;
@@ -380,6 +422,8 @@ pub fn request_header() -> proto::RequestHeader {
       can_handle_batch_reaction_update: full,
       dm_inline_threading_support_level: full,
       named_gdms_support_level: full,
+      // Without it, messages come back without their labels, and so without the user's star.
+      starred_shortcut_level: full,
       ..Default::default()
     }),
     ..Default::default()

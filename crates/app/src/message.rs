@@ -299,6 +299,17 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
     let id = SharedString::from(format!("{}-a{i}", msg.id));
     content = content.child(attachment_view(attachment, id, ctx, cx));
   }
+  if msg.starred {
+    content = content.child(
+      h_flex()
+        .gap_1()
+        .items_center()
+        .text_size(px(11.))
+        .text_color(rgb(MUTED))
+        .child(icon(Icon::Star, 11., MUTED))
+        .child("Starred"),
+    );
+  }
   for (i, card) in msg.cards.iter().enumerate() {
     content = content.child(card_view(card, &msg.id, i));
   }
@@ -490,6 +501,18 @@ fn toolbar(row: &Row, ctx: &MsgCtx) -> Div {
         let msg = target.clone();
         items.push(MenuItem::new("Copy Text", move |_, cx| {
           cx.write_to_clipboard(ClipboardItem::new_string(msg.text.clone()));
+        }));
+      }
+      if !target.pending {
+        let (core, msg) = (core.clone(), target.clone());
+        let label = if msg.starred { "Unstar" } else { "Star" };
+        items.push(MenuItem::new(label, move |_, _| {
+          core.send(Command::Star {
+            group: msg.group.clone(),
+            topic_id: msg.topic_id.clone(),
+            message_id: msg.id.clone(),
+            starred: !msg.starred,
+          });
         }));
       }
       if own {
@@ -1159,6 +1182,7 @@ mod tests {
         attachments: Vec::new(),
         cards: Vec::new(),
         quote: None,
+        starred: false,
         pending: false,
         failed: false,
       })

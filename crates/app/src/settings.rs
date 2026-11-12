@@ -6,7 +6,7 @@ use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 use serde::{Deserialize, Serialize};
 
-use crate::theme;
+use crate::theme::{self, ACCENT, ACCENT_BG, BORDER, MUTED, POPOVER, TEXT, THEMES, rgb};
 
 /// Where the MCP server listens unless `mcp_port` in the settings file says otherwise.
 const MCP_PORT: u16 = 3021;
@@ -156,6 +156,9 @@ impl RewriteTool {
 #[serde(default)]
 pub struct Settings {
   pub appearance: Appearance,
+  /// Theme ids in `theme::THEMES`, one for each appearance.
+  pub dark_theme: String,
+  pub light_theme: String,
   pub density: Density,
   /// Calls never get the camera, and have no camera button.
   pub camera_off: bool,
@@ -186,6 +189,8 @@ impl Default for Settings {
   fn default() -> Self {
     Self {
       appearance: Appearance::default(),
+      dark_theme: theme::DEFAULT_DARK.into(),
+      light_theme: theme::DEFAULT_LIGHT.into(),
       density: Density::default(),
       camera_off: false,
       meet_builtin: true,
@@ -260,6 +265,44 @@ impl Settings {
       },
     }
   }
+
+  /// Whether windows show the light theme: the chosen appearance, or the system's.
+  fn light(&self, cx: &App) -> bool {
+    match self.appearance {
+      Appearance::Light => true,
+      Appearance::Dark => false,
+      Appearance::System => matches!(cx.window_appearance(), WindowAppearance::Light | WindowAppearance::VibrantLight),
+    }
+  }
+
+  /// Index in `THEMES` of the theme windows show now.
+  pub fn shown_theme(&self, cx: &App) -> usize {
+    if self.light(cx) {
+      theme::find(&self.light_theme, false)
+    } else {
+      theme::find(&self.dark_theme, true)
+    }
+  }
+
+  /// Keeps the theme at `index` for its appearance. A pinned appearance of the other kind switches over to it, so
+  /// the pick shows; System keeps following macOS.
+  pub fn pick_theme(&mut self, index: usize) {
+    let Some(picked) = THEMES.get(index) else {
+      return;
+    };
+    if picked.dark {
+      self.dark_theme = picked.id.into();
+    } else {
+      self.light_theme = picked.id.into();
+    }
+    if self.appearance != Appearance::System {
+      self.appearance = if picked.dark {
+        Appearance::Dark
+      } else {
+        Appearance::Light
+      };
+    }
+  }
 }
 
 /// Starts the MCP server when the settings ask for it, and restarts or stops it whenever they (or its token)
@@ -288,16 +331,17 @@ pub fn replace_mcp_token(cx: &mut App) {
   cx.set_global(settings);
 }
 
-/// Puts the chosen appearance (or the system's) on every window.
+/// Puts the theme of the chosen appearance (or the system's) on every window.
 pub fn apply_appearance(cx: &mut App) {
-  let light = match cx.global::<Settings>().appearance {
-    Appearance::Light => true,
-    Appearance::Dark => false,
-    Appearance::System => matches!(cx.window_appearance(), WindowAppearance::Light | WindowAppearance::VibrantLight),
-  };
-  theme::set_light(light);
+  let index = cx.global::<Settings>().shown_theme(cx);
+  show_theme(index, cx);
+}
+
+/// Puts the theme at `index` in `THEMES` on every window, without saving it: the theme picker previews with it.
+pub fn show_theme(index: usize, cx: &mut App) {
+  theme::set(index);
   Theme::change(
-    if light {
+    if theme::is_light() {
       ThemeMode::Light
     } else {
       ThemeMode::Dark
@@ -305,12 +349,25 @@ pub fn apply_appearance(cx: &mut App) {
     None,
     cx,
   );
+  // gpui-kit's inputs and tooltips paint with its own colors; give them the theme's. A separate update from the
+  // mode change, which reloads the kit's colors.
+  Theme::update(cx, |kit| {
+    kit.foreground = rgb(TEXT).into();
+    kit.muted_foreground = rgb(MUTED).into();
+    kit.caret = rgb(ACCENT).into();
+    kit.selection = rgb(ACCENT_BG).into();
+    kit.popover = rgb(POPOVER).into();
+    kit.popover_foreground = rgb(TEXT).into();
+    kit.border = rgb(BORDER).into();
+    kit.input = rgb(BORDER).into();
+  });
   cx.refresh_windows();
 }
 
 #[cfg(test)]
 mod tests {
-  use super::{Settings, Sound};
+  use super::{Appearance, Settings, Sound};
+  use crate::theme::find;
 
   #[test]
   fn notification_sound_files() {
@@ -344,5 +401,27 @@ mod tests {
     let loaded: Settings = serde_json::from_str(&text).expect("deserialize");
     assert!(!loaded.meet_builtin);
     assert!(!loaded.meet_auto_open);
+  }
+
+  #[test]
+  fn a_pick_keeps_the_theme_for_its_own_appearance() {
+    let mut settings = Settings::default();
+    settings.pick_theme(find("dracula", true));
+    settings.pick_theme(find("solarized-light", false));
+    assert_eq!(settings.dark_theme, "dracula");
+    assert_eq!(settings.light_theme, "solarized-light");
+    assert_eq!(settings.appearance, Appearance::System);
+  }
+
+  #[test]
+  fn a_pick_of_the_other_kind_switches_a_pinned_appearance() {
+    let mut settings = Settings {
+      appearance: Appearance::Dark,
+      ..Settings::default()
+    };
+    settings.pick_theme(find("github-light", false));
+    assert_eq!(settings.appearance, Appearance::Light);
+    assert_eq!(settings.light_theme, "github-light");
+    assert_eq!(settings.dark_theme, crate::theme::DEFAULT_DARK);
   }
 }

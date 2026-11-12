@@ -284,6 +284,9 @@ pub struct Message {
   pub cards: Vec<Card>,
   /// Quoted parent, when this message quotes one.
   pub quote: Option<Quote>,
+  /// The signed-in user starred it.
+  #[serde(default)]
+  pub starred: bool,
   /// Set while a sent message waits for the server; `id` is the local id until then.
   pub pending: bool,
   /// True when sending failed.
@@ -423,7 +426,7 @@ pub enum McpStatus {
   Failed(String),
 }
 
-/// One message found by `Command::Search`.
+/// One message found by `Command::Search`, or listed by a shortcut.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SearchHit {
   /// Conversation that holds the hit.
@@ -442,6 +445,15 @@ pub struct SearchHit {
   pub text: String,
   /// When it was sent.
   pub time: Micros,
+}
+
+/// A sidebar shortcut that lists messages from every conversation, as Google Chat's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Shortcut {
+  /// Messages that @mention the user.
+  Mentions,
+  /// Messages the user starred.
+  Starred,
 }
 
 /// Everything the core tells the UI. Lists are complete replacements unless stated otherwise.
@@ -478,6 +490,17 @@ pub enum Event {
     query: String,
     /// Best matches first.
     hits: Arc<Vec<SearchHit>>,
+  },
+  /// One page of a shortcut's messages, answering `Command::LoadShortcut`. Newest first.
+  Shortcut {
+    /// Which shortcut.
+    shortcut: Shortcut,
+    /// The messages of this page.
+    hits: Arc<Vec<SearchHit>>,
+    /// Whether this page follows the ones already shown (it answers a `cursor`), rather than replacing them.
+    appended: bool,
+    /// Asks for the next, older page when there is one.
+    cursor: Option<String>,
   },
   /// The meeting asked for with `Command::StartMeet` was created and posted; this is its link.
   MeetStarted(String),
@@ -541,6 +564,14 @@ pub enum Command {
   LoadNewer(GroupId),
   /// Search messages across all conversations. Answers `SearchResults`.
   Search(String),
+  /// Fetch a shortcut's messages: the newest page without `cursor`, the next older page with one.
+  /// Answers `Event::Shortcut`.
+  LoadShortcut {
+    /// Which shortcut.
+    shortcut: Shortcut,
+    /// `Event::Shortcut::cursor` of the last page shown, for the page after it.
+    cursor: Option<String>,
+  },
   /// Show the conversation around one message (a search hit): answers `History` with that window and `focus`.
   /// `Open` on the same conversation returns to the latest messages.
   Jump {
@@ -585,6 +616,17 @@ pub enum Command {
   StartMeet(GroupId),
   /// Mark this conversation read.
   MarkRead(GroupId),
+  /// Star or unstar a message, which lists it in the Starred shortcut.
+  Star {
+    /// Conversation.
+    group: GroupId,
+    /// Topic the message belongs to.
+    topic_id: String,
+    /// Message to star.
+    message_id: String,
+    /// True to star, false to unstar.
+    starred: bool,
+  },
   /// Add or remove an emoji reaction.
   React {
     /// Conversation.
@@ -658,6 +700,7 @@ mod tests {
       attachments: Vec::new(),
       cards: Vec::new(),
       quote: None,
+      starred: false,
       pending: false,
       failed: false,
     }

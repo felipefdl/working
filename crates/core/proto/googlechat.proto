@@ -1163,7 +1163,7 @@ message Message {
 	optional RichTextFormattingType rich_text_formatting_type = 40;
 	// optional MessageSearchInfo message_search_info = 41;
 	// optional MessageReference message_reference = 42;
-	// repeated MessageLabel message_labels = 43;
+	repeated MessageLabel message_labels = 43;
 	optional int32 number_of_unicode_emojis = 44;
 	optional bool request_reply_in_thread = 45;
 	// repeated MessageLabelId message_label_ids = 46;
@@ -2115,7 +2115,9 @@ message BadgeCountUpdatedEvent {
 }
 
 message MessageLabel {
-
+	// 1 is the user's star.
+	optional int32 label_type = 1;
+	optional string label_id = 2;
 }
 
 message MessageLabelEvent {

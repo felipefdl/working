@@ -3,7 +3,9 @@
 use std::time::Duration;
 
 use gchat_core::{Command, Core, DndSchedule, DndSchedules, McpStatus};
+use gpui_kit::component::IndexPath;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -13,7 +15,9 @@ use crate::permissions::{self, Media, Status};
 use crate::screen;
 use crate::settings::{self, ActivityStatus, Appearance, Density, McpState, RewriteTool, Settings, Sound};
 use crate::status::{self, DndState};
-use crate::theme::{ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, FIELD, GREEN, MUTED, POPOVER, RED, ROW_HOVER, TEXT, rgb};
+use crate::theme::{
+  ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, FIELD, GREEN, MUTED, POPOVER, RED, ROW_HOVER, TEXT, THEMES, rgb,
+};
 use crate::ui::{Icon, icon};
 
 const CAMERA_PANE: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera";
@@ -115,10 +119,13 @@ pub struct SettingsView {
   /// The do-not-disturb schedule whose days and times are open for changing.
   editing: Option<usize>,
   rewrite_instruction: Entity<TextareaState>,
+  dark_theme: Entity<SelectState<Vec<ThemeChoice>>>,
+  light_theme: Entity<SelectState<Vec<ThemeChoice>>>,
   _copied_reset: Option<Task<()>>,
   _refresh: Task<()>,
-  _globals: [Subscription; 2],
+  _globals: [Subscription; 3],
   _rewrite_sub: Subscription,
+  _theme_subs: [Subscription; 2],
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -159,6 +166,17 @@ impl SettingsView {
         Settings::update(cx, |settings| settings.rewrite_instruction = text);
       }
     });
+    let dark_theme = Self::theme_select(true, window, cx);
+    let light_theme = Self::theme_select(false, window, cx);
+    let theme_subs = [&dark_theme, &light_theme].map(|select| {
+      cx.subscribe(select, |_, _, event: &SelectEvent<Vec<ThemeChoice>>, cx| {
+        let SelectEvent::Confirm(Some(index)) = event else {
+          return;
+        };
+        let index = *index;
+        Settings::update(cx, |settings| settings.pick_theme(index));
+      })
+    });
     Self {
       core,
       section: Section::Appearance,
@@ -166,13 +184,18 @@ impl SettingsView {
       copied: None,
       editing: None,
       rewrite_instruction,
+      dark_theme,
+      light_theme,
       _copied_reset: None,
       _refresh: refresh,
       _globals: [
         cx.observe_global::<McpState>(|_, cx| cx.notify()),
         cx.observe_global::<DndState>(|_, cx| cx.notify()),
+        // ⌘⇧T picks themes too: keep both selects on the saved ones.
+        cx.observe_global_in::<Settings>(window, Self::sync_theme_selects),
       ],
       _rewrite_sub: rewrite_sub,
+      _theme_subs: theme_subs,
     }
   }
 
@@ -446,15 +469,58 @@ impl SettingsView {
       .child(div().w(px(108.)).flex_shrink_0().flex().justify_end().children(button))
   }
 
-  fn appearance(settings: Settings) -> Div {
+  /// The themes of one appearance, the saved one selected.
+  fn theme_select(dark: bool, window: &mut Window, cx: &mut Context<Self>) -> Entity<SelectState<Vec<ThemeChoice>>> {
+    let choices = ThemeChoice::of(dark);
+    let selected = Self::saved_theme_row(&choices, dark, cx);
+    cx.new(|cx| SelectState::new(choices, selected, window, cx))
+  }
+
+  /// Where the saved theme of one appearance sits in its select.
+  fn saved_theme_row(choices: &[ThemeChoice], dark: bool, cx: &App) -> Option<IndexPath> {
+    let settings = cx.global::<Settings>();
+    let saved = crate::theme::find(
+      if dark {
+        &settings.dark_theme
+      } else {
+        &settings.light_theme
+      },
+      dark,
+    );
+    choices.iter().position(|choice| choice.index == saved).map(IndexPath::new)
+  }
+
+  fn sync_theme_selects(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    for (select, dark) in [(self.dark_theme.clone(), true), (self.light_theme.clone(), false)] {
+      let saved = Self::saved_theme_row(&ThemeChoice::of(dark), dark, cx);
+      if select.read(cx).selected_index(cx) != saved {
+        select.update(cx, |select, cx| select.set_selected_index(saved, window, cx));
+      }
+    }
+  }
+
+  fn appearance(&self, settings: Settings) -> Div {
     v_flex()
       .gap_5()
       .child(Self::group(
         "Theme",
-        Self::card().child(
-          Self::row("Color mode", "System follows the macOS appearance.", true)
-            .child(Self::appearance_picker(settings.appearance)),
-        ),
+        Self::card()
+          .child(
+            Self::row("Color mode", "System follows the macOS appearance.", true)
+              .child(Self::appearance_picker(settings.appearance)),
+          )
+          .child(
+            Self::row("Dark theme", "⌘⇧T previews every theme before you pick.", false)
+              .child(Select::new(&self.dark_theme).id("dark-theme").w(px(220.)).menu_max_h(px(320.))),
+          )
+          .child(
+            Self::row("Light theme", "Shown when the color mode is light.", false).child(
+              Select::new(&self.light_theme)
+                .id("light-theme")
+                .w(px(220.))
+                .menu_max_h(px(320.)),
+            ),
+          ),
       ))
       .child(Self::group(
         "Density",
@@ -1017,7 +1083,7 @@ impl Render for SettingsView {
     }
 
     let body = match self.section {
-      Section::Appearance => Self::appearance(settings),
+      Section::Appearance => self.appearance(settings),
       Section::Status => Self::status(settings),
       Section::Notifications => self.notifications(settings, cx),
       Section::Calls => Self::calls(settings),
@@ -1066,5 +1132,35 @@ impl Render for SettingsView {
           .child(sections)
           .child(content),
       )
+  }
+}
+
+/// One theme in a theme select; its value is the index into [`THEMES`].
+#[derive(Clone)]
+struct ThemeChoice {
+  index: usize,
+  name: &'static str,
+}
+
+impl ThemeChoice {
+  fn of(dark: bool) -> Vec<Self> {
+    THEMES
+      .iter()
+      .enumerate()
+      .filter(|(_, theme)| theme.dark == dark)
+      .map(|(index, theme)| Self { index, name: theme.name })
+      .collect()
+  }
+}
+
+impl SelectItem for ThemeChoice {
+  type Value = usize;
+
+  fn title(&self) -> SharedString {
+    self.name.into()
+  }
+
+  fn value(&self) -> &usize {
+    &self.index
   }
 }

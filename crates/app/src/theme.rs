@@ -1,67 +1,944 @@
-//! Colors and metrics. Every color has a dark and a light value; `rgb` picks the one for the appearance in use.
+//! Colors and metrics. A color theme is one dark or one light look, giving every `Tone` a color; `rgb` reads the
+//! theme in use. The settings keep one theme for the dark appearance and one for the light.
+//!
+//! Besides Working's own, the themes are copied from their published sources: Warm Burnout's palette, and the Zed
+//! themes of One, Ayu, Gruvbox, Catppuccin, Dracula, GitHub, Tokyo Night, Nord, Solarized, and Rosé Pine.
+//! See-through colors are blended over the surface they sit on, and the accent tints are the accent over the panel.
+//! Hover, selection, field, and bubble colors that match the surface under them are moved toward the text color
+//! until they stand apart, as Working's own do.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use gpui_kit::Rgba;
 
-/// A named color of the app's look.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Tone {
-  dark: u32,
-  light: u32,
+/// The colors of one theme.
+pub struct Colors {
+  /// The window behind the panels: the top bar and the sidebar.
+  bg: u32,
+  panel: u32,
+  /// Floating surfaces: menus, the quick switcher, the settings window.
+  popover: u32,
+  row_hover: u32,
+  row_selected: u32,
+  field: u32,
+  border: u32,
+  text: u32,
+  muted: u32,
+  accent: u32,
+  accent_bg: u32,
+  bubble: u32,
+  bubble_own: u32,
+  code_bg: u32,
+  placeholder: u32,
+  /// Background of the words a search matched.
+  mark: u32,
+  /// Background of a microphone or camera button that is off.
+  off_bg: u32,
+  green: u32,
+  amber: u32,
+  red: u32,
+  /// Sidebar names: unread or selected, and everything else (`text_dim`).
+  text_strong: u32,
+  text_dim: u32,
 }
 
-const fn tone(dark: u32, light: u32) -> Tone {
-  Tone { dark, light }
+/// A named color of the app's look: which of the theme's `Colors` it is.
+#[derive(Clone, Copy)]
+pub struct Tone(fn(&Colors) -> u32);
+
+pub struct Theme {
+  /// What the settings file keeps.
+  pub id: &'static str,
+  pub name: &'static str,
+  pub dark: bool,
+  colors: Colors,
 }
 
-static LIGHT: AtomicBool = AtomicBool::new(false);
+pub const DEFAULT_DARK: &str = "working-dark";
+pub const DEFAULT_LIGHT: &str = "working-light";
 
-/// Switches every `Tone` to its light or dark value. Windows need a refresh afterwards.
-pub fn set_light(light: bool) {
-  LIGHT.store(light, Ordering::Relaxed);
+/// The theme with `id`, or the default of its appearance when no theme has it.
+pub fn find(id: &str, dark: bool) -> usize {
+  let fallback = if dark { DEFAULT_DARK } else { DEFAULT_LIGHT };
+  THEMES
+    .iter()
+    .position(|theme| theme.id == id && theme.dark == dark)
+    .or_else(|| THEMES.iter().position(|theme| theme.id == fallback))
+    .unwrap_or_default()
+}
+
+/// Index into `THEMES` of the theme in use.
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
+
+/// Switches every `Tone` to the theme at `index` in `THEMES`. Windows need a refresh afterwards.
+pub fn set(index: usize) {
+  CURRENT.store(index.min(THEMES.len() - 1), Ordering::Relaxed);
+}
+
+pub fn current() -> &'static Theme {
+  &THEMES[CURRENT.load(Ordering::Relaxed)]
 }
 
 pub fn is_light() -> bool {
-  LIGHT.load(Ordering::Relaxed)
+  !current().dark
 }
 
 pub fn rgb(tone: Tone) -> Rgba {
-  gpui_kit::rgb(if LIGHT.load(Ordering::Relaxed) {
-    tone.light
-  } else {
-    tone.dark
-  })
+  gpui_kit::rgb((tone.0)(&current().colors))
 }
 
-pub const BG: Tone = tone(0x131314, 0xf0f4f9);
-pub const PANEL: Tone = tone(0x1e1f20, 0xffffff);
-/// Floating surfaces: menus, the quick switcher, the settings window.
-pub const POPOVER: Tone = tone(0x232426, 0xffffff);
-pub const ROW_HOVER: Tone = tone(0x2a2b2d, 0xe2e7ee);
-pub const ROW_SELECTED: Tone = tone(0x2c3b52, 0xc2e7ff);
-pub const FIELD: Tone = tone(0x2a2b2d, 0xe4e9f0);
-pub const BORDER: Tone = tone(0x3c3d40, 0xd3d7dd);
-pub const TEXT: Tone = tone(0xe3e3e3, 0x1f1f1f);
-pub const MUTED: Tone = tone(0x9aa0a6, 0x5f6368);
-pub const ACCENT: Tone = tone(0x8ab4f8, 0x0b57d0);
-pub const ACCENT_BG: Tone = tone(0x2f4366, 0xd3e3fd);
-pub const BUBBLE: Tone = tone(0x2d2e30, 0xf0f4f9);
-pub const BUBBLE_OWN: Tone = tone(0x4b403c, 0xeadfd8);
-pub const CODE_BG: Tone = tone(0x161617, 0xe4e7ec);
-pub const PLACEHOLDER: Tone = tone(0x2a2b2d, 0xe1e3e8);
-/// Background of the words a search matched.
-pub const MARK: Tone = tone(0x5c4a12, 0xfde293);
-/// Background of a microphone or camera button that is off.
-pub const OFF_BG: Tone = tone(0x5c2b29, 0xf9dedc);
-pub const GREEN: Tone = tone(0x34a853, 0x1e8e3e);
-pub const AMBER: Tone = tone(0xfbbc04, 0xe37400);
-pub const RED: Tone = tone(0xea4335, 0xd93025);
-/// Sidebar names: unread or selected, and everything else.
-pub const TEXT_STRONG: Tone = tone(0xffffff, 0x1f1f1f);
-pub const TEXT_DIM: Tone = tone(0xb1b5ba, 0x444746);
-/// Drawn over pictures and video, which stay dark in both appearances.
-pub const WHITE: Tone = tone(0xffffff, 0xffffff);
+pub const BG: Tone = Tone(|c| c.bg);
+pub const PANEL: Tone = Tone(|c| c.panel);
+pub const POPOVER: Tone = Tone(|c| c.popover);
+pub const ROW_HOVER: Tone = Tone(|c| c.row_hover);
+pub const ROW_SELECTED: Tone = Tone(|c| c.row_selected);
+pub const FIELD: Tone = Tone(|c| c.field);
+pub const BORDER: Tone = Tone(|c| c.border);
+pub const TEXT: Tone = Tone(|c| c.text);
+pub const MUTED: Tone = Tone(|c| c.muted);
+pub const ACCENT: Tone = Tone(|c| c.accent);
+pub const ACCENT_BG: Tone = Tone(|c| c.accent_bg);
+pub const BUBBLE: Tone = Tone(|c| c.bubble);
+pub const BUBBLE_OWN: Tone = Tone(|c| c.bubble_own);
+pub const CODE_BG: Tone = Tone(|c| c.code_bg);
+pub const PLACEHOLDER: Tone = Tone(|c| c.placeholder);
+pub const MARK: Tone = Tone(|c| c.mark);
+pub const OFF_BG: Tone = Tone(|c| c.off_bg);
+pub const GREEN: Tone = Tone(|c| c.green);
+pub const AMBER: Tone = Tone(|c| c.amber);
+pub const RED: Tone = Tone(|c| c.red);
+pub const TEXT_STRONG: Tone = Tone(|c| c.text_strong);
+pub const TEXT_DIM: Tone = Tone(|c| c.text_dim);
+/// Drawn over pictures and video, which stay dark in every theme.
+pub const WHITE: Tone = Tone(|_| 0xffffff);
 
 pub const SIDEBAR_WIDTH: f32 = 264.0;
 pub const MONO: &str = "Menlo";
+
+pub static THEMES: [Theme; 28] = [
+  Theme {
+    id: "working-dark",
+    name: "Working Dark",
+    dark: true,
+    colors: Colors {
+      bg: 0x131314,
+      panel: 0x1e1f20,
+      popover: 0x232426,
+      row_hover: 0x2a2b2d,
+      row_selected: 0x2c3b52,
+      field: 0x2a2b2d,
+      border: 0x3c3d40,
+      text: 0xe3e3e3,
+      muted: 0x9aa0a6,
+      accent: 0x8ab4f8,
+      accent_bg: 0x2f4366,
+      bubble: 0x2d2e30,
+      bubble_own: 0x4b403c,
+      code_bg: 0x161617,
+      placeholder: 0x2a2b2d,
+      mark: 0x5c4a12,
+      off_bg: 0x5c2b29,
+      green: 0x34a853,
+      amber: 0xfbbc04,
+      red: 0xea4335,
+      text_strong: 0xffffff,
+      text_dim: 0xb1b5ba,
+    },
+  },
+  Theme {
+    id: "working-light",
+    name: "Working Light",
+    dark: false,
+    colors: Colors {
+      bg: 0xf0f4f9,
+      panel: 0xffffff,
+      popover: 0xffffff,
+      row_hover: 0xe2e7ee,
+      row_selected: 0xc2e7ff,
+      field: 0xe4e9f0,
+      border: 0xd3d7dd,
+      text: 0x1f1f1f,
+      muted: 0x5f6368,
+      accent: 0x0b57d0,
+      accent_bg: 0xd3e3fd,
+      bubble: 0xf0f4f9,
+      bubble_own: 0xeadfd8,
+      code_bg: 0xe4e7ec,
+      placeholder: 0xe1e3e8,
+      mark: 0xfde293,
+      off_bg: 0xf9dedc,
+      green: 0x1e8e3e,
+      amber: 0xe37400,
+      red: 0xd93025,
+      text_strong: 0x1f1f1f,
+      text_dim: 0x444746,
+    },
+  },
+  Theme {
+    id: "warm-burnout-dark",
+    name: "Warm Burnout Dark",
+    dark: true,
+    colors: Colors {
+      bg: 0x14120f,
+      panel: 0x1a1510,
+      popover: 0x1f1d17,
+      row_hover: 0x2a2620,
+      row_selected: 0x3a3128,
+      field: 0x24221c,
+      border: 0x2a2620,
+      text: 0xbfbdb6,
+      muted: 0x9e968c,
+      accent: 0xb8522e,
+      accent_bg: 0x3a3128,
+      bubble: 0x2a2520,
+      bubble_own: 0x322c23,
+      code_bg: 0x0e0c09,
+      placeholder: 0x2a2620,
+      mark: 0x4c4126,
+      off_bg: 0x2a1510,
+      green: 0x70bf56,
+      amber: 0xfdb04c,
+      red: 0xf49090,
+      text_strong: 0xf5ede0,
+      text_dim: 0xada69c,
+    },
+  },
+  Theme {
+    id: "warm-burnout-light",
+    name: "Warm Burnout Light",
+    dark: false,
+    colors: Colors {
+      bg: 0xede6da,
+      panel: 0xf5ede0,
+      popover: 0xf0e8dc,
+      row_hover: 0xd8d0c2,
+      row_selected: 0xcdc1a8,
+      field: 0xdfdbd5,
+      border: 0xddd6ca,
+      text: 0x3a3630,
+      muted: 0x665e52,
+      accent: 0xb8522e,
+      accent_bg: 0xcdc1a8,
+      bubble: 0xe5ddd0,
+      bubble_own: 0xccbfa8,
+      code_bg: 0xede5d8,
+      placeholder: 0xe0d8cc,
+      mark: 0xe0c890,
+      off_bg: 0xf8e8e8,
+      green: 0x226414,
+      amber: 0x8a6000,
+      red: 0xb03434,
+      text_strong: 0x3a3630,
+      text_dim: 0x544c40,
+    },
+  },
+  Theme {
+    id: "one-dark",
+    name: "One Dark",
+    dark: true,
+    colors: Colors {
+      bg: 0x2f343e,
+      panel: 0x282c33,
+      popover: 0x2f343e,
+      row_hover: 0x363c46,
+      row_selected: 0x454a56,
+      field: 0x373d46,
+      border: 0x363c46,
+      text: 0xdce0e5,
+      muted: 0xa9afbc,
+      accent: 0x74ade8,
+      accent_bg: 0x39485b,
+      bubble: 0x333943,
+      bubble_own: 0x333e4c,
+      code_bg: 0x2f343e,
+      placeholder: 0x363c46,
+      mark: 0x46607b,
+      off_bg: 0x523e44,
+      green: 0xa1c181,
+      amber: 0xdec184,
+      red: 0xd07277,
+      text_strong: 0xdce0e5,
+      text_dim: 0xc2c8d0,
+    },
+  },
+  Theme {
+    id: "one-light",
+    name: "One Light",
+    dark: false,
+    colors: Colors {
+      bg: 0xebebec,
+      panel: 0xfafafa,
+      popover: 0xebebec,
+      row_hover: 0xdfdfe0,
+      row_selected: 0xcacaca,
+      field: 0xdfdfe0,
+      border: 0xdfdfe0,
+      text: 0x242529,
+      muted: 0x58585a,
+      accent: 0x5c78e2,
+      accent_bg: 0xd7ddf5,
+      bubble: 0xe3e3e4,
+      bubble_own: 0xe4e8f7,
+      code_bg: 0xebebec,
+      placeholder: 0xdfdfe0,
+      mark: 0xbbc6f0,
+      off_bg: 0xf0d4d0,
+      green: 0x669f59,
+      amber: 0xa48819,
+      red: 0xd36151,
+      text_strong: 0x242529,
+      text_dim: 0x3e3e42,
+    },
+  },
+  Theme {
+    id: "ayu-dark",
+    name: "Ayu Dark",
+    dark: true,
+    colors: Colors {
+      bg: 0x1f2127,
+      panel: 0x0d1016,
+      popover: 0x1f2127,
+      row_hover: 0x2d2f34,
+      row_selected: 0x3e4043,
+      field: 0x292a30,
+      border: 0x2d2f34,
+      text: 0xbfbdb6,
+      muted: 0x8a8986,
+      accent: 0x5ac1fe,
+      accent_bg: 0x1e3749,
+      bubble: 0x24262b,
+      bubble_own: 0x182936,
+      code_bg: 0x1f2127,
+      placeholder: 0x2d2f34,
+      mark: 0x2c5773,
+      off_bg: 0x46282e,
+      green: 0xaad84c,
+      amber: 0xfeb454,
+      red: 0xef7177,
+      text_strong: 0xbfbdb6,
+      text_dim: 0xa4a39e,
+    },
+  },
+  Theme {
+    id: "ayu-mirage",
+    name: "Ayu Mirage",
+    dark: true,
+    colors: Colors {
+      bg: 0x353944,
+      panel: 0x242835,
+      popover: 0x353944,
+      row_hover: 0x43464f,
+      row_selected: 0x53565d,
+      field: 0x3e424c,
+      border: 0x43464f,
+      text: 0xcccac2,
+      muted: 0x9a9a98,
+      accent: 0x72cffe,
+      accent_bg: 0x354d61,
+      bubble: 0x3a3d48,
+      bubble_own: 0x2f3f51,
+      code_bg: 0x353944,
+      placeholder: 0x43464f,
+      mark: 0x446b85,
+      off_bg: 0x574046,
+      green: 0xd5fe80,
+      amber: 0xfecf72,
+      red: 0xf18779,
+      text_strong: 0xcccac2,
+      text_dim: 0xb3b2ad,
+    },
+  },
+  Theme {
+    id: "ayu-light",
+    name: "Ayu Light",
+    dark: false,
+    colors: Colors {
+      bg: 0xececed,
+      panel: 0xfcfcfc,
+      popover: 0xececed,
+      row_hover: 0xdfe0e1,
+      row_selected: 0xcfd0d2,
+      field: 0xe0e1e2,
+      border: 0xdfe0e1,
+      text: 0x5c6166,
+      muted: 0x8b8e92,
+      accent: 0x3b9ee5,
+      accent_bg: 0xd2e7f7,
+      bubble: 0xe5e5e6,
+      bubble_own: 0xe1eff9,
+      code_bg: 0xececed,
+      placeholder: 0xdfe0e1,
+      mark: 0xafd6f3,
+      off_bg: 0xf9dad9,
+      green: 0x85b304,
+      amber: 0xf1ad49,
+      red: 0xef7271,
+      text_strong: 0x5c6166,
+      text_dim: 0x74787c,
+    },
+  },
+  Theme {
+    id: "gruvbox-dark",
+    name: "Gruvbox Dark",
+    dark: true,
+    colors: Colors {
+      bg: 0x3a3735,
+      panel: 0x282828,
+      popover: 0x3a3735,
+      row_hover: 0x494340,
+      row_selected: 0x5b524c,
+      field: 0x44403c,
+      border: 0x494340,
+      text: 0xfbf1c7,
+      muted: 0xc5b597,
+      accent: 0x83a598,
+      accent_bg: 0x3c4441,
+      bubble: 0x3e3b38,
+      bubble_own: 0x353a38,
+      code_bg: 0x3a3735,
+      placeholder: 0x494340,
+      mark: 0x4c5a55,
+      off_bg: 0x5d302b,
+      green: 0xb7bb26,
+      amber: 0xf9bd2f,
+      red: 0xfb4a35,
+      text_strong: 0xfbf1c7,
+      text_dim: 0xe0d3af,
+    },
+  },
+  Theme {
+    id: "gruvbox-light",
+    name: "Gruvbox Light",
+    dark: false,
+    colors: Colors {
+      bg: 0xecddb4,
+      panel: 0xfbf1c7,
+      popover: 0xecddb4,
+      row_hover: 0xddcca7,
+      row_selected: 0xc8b899,
+      field: 0xe0d2ac,
+      border: 0xddcca7,
+      text: 0x282828,
+      muted: 0x5f5650,
+      accent: 0x0b6678,
+      accent_bg: 0xc6d2b6,
+      bubble: 0xe4d6ae,
+      bubble_own: 0xd9debc,
+      code_bg: 0xecddb4,
+      placeholder: 0xddcca7,
+      mark: 0x9bb9a7,
+      off_bg: 0xe4b697,
+      green: 0x797410,
+      amber: 0xb57615,
+      red: 0x9d0308,
+      text_strong: 0x282828,
+      text_dim: 0x443f3c,
+    },
+  },
+  Theme {
+    id: "catppuccin-mocha",
+    name: "Catppuccin Mocha",
+    dark: true,
+    colors: Colors {
+      bg: 0x181825,
+      panel: 0x1e1e2e,
+      popover: 0x181825,
+      row_hover: 0x313244,
+      row_selected: 0x353646,
+      field: 0x282935,
+      border: 0x2c293d,
+      text: 0xcdd6f4,
+      muted: 0xbac2de,
+      accent: 0xcba6f7,
+      accent_bg: 0x443c5a,
+      bubble: 0x11111b,
+      bubble_own: 0x36314a,
+      code_bg: 0x181825,
+      placeholder: 0x313244,
+      mark: 0x425960,
+      off_bg: 0x53394c,
+      green: 0xa6e3a1,
+      amber: 0xf9e2af,
+      red: 0xf38ba8,
+      text_strong: 0xcdd6f4,
+      text_dim: 0xc4cce9,
+    },
+  },
+  Theme {
+    id: "catppuccin-macchiato",
+    name: "Catppuccin Macchiato",
+    dark: true,
+    colors: Colors {
+      bg: 0x1e2030,
+      panel: 0x24273a,
+      popover: 0x1e2030,
+      row_hover: 0x363a4f,
+      row_selected: 0x3a3e51,
+      field: 0x2f3141,
+      border: 0x313148,
+      text: 0xcad3f5,
+      muted: 0xb8c0e0,
+      accent: 0xc6a0f6,
+      accent_bg: 0x484263,
+      bubble: 0x181926,
+      bubble_own: 0x3b3854,
+      code_bg: 0x1e2030,
+      placeholder: 0x363a4f,
+      mark: 0x435c65,
+      off_bg: 0x563f51,
+      green: 0xa6da95,
+      amber: 0xeed49f,
+      red: 0xed8796,
+      text_strong: 0xcad3f5,
+      text_dim: 0xc1caea,
+    },
+  },
+  Theme {
+    id: "catppuccin-frappe",
+    name: "Catppuccin Frappé",
+    dark: true,
+    colors: Colors {
+      bg: 0x292c3c,
+      panel: 0x303446,
+      popover: 0x292c3c,
+      row_hover: 0x414559,
+      row_selected: 0x454a5e,
+      field: 0x383c4d,
+      border: 0x3c3c53,
+      text: 0xc6d0f5,
+      muted: 0xb5bfe2,
+      accent: 0xca9ee6,
+      accent_bg: 0x524b69,
+      bubble: 0x232634,
+      bubble_own: 0x46435c,
+      code_bg: 0x292c3c,
+      placeholder: 0x414559,
+      mark: 0x48616a,
+      off_bg: 0x5e4856,
+      green: 0xa6d189,
+      amber: 0xe5c890,
+      red: 0xe78284,
+      text_strong: 0xc6d0f5,
+      text_dim: 0xbec8ec,
+    },
+  },
+  Theme {
+    id: "catppuccin-latte",
+    name: "Catppuccin Latte",
+    dark: false,
+    colors: Colors {
+      bg: 0xe6e9ef,
+      panel: 0xeff1f5,
+      popover: 0xe6e9ef,
+      row_hover: 0xccd0da,
+      row_selected: 0xc5c8d3,
+      field: 0xd9dde5,
+      border: 0xe7e2f5,
+      text: 0x4c4f69,
+      muted: 0x5c5f77,
+      accent: 0x8839ef,
+      accent_bg: 0xd8c9f4,
+      bubble: 0xdce0e8,
+      bubble_own: 0xe1d7f4,
+      code_bg: 0xe6e9ef,
+      placeholder: 0xccd0da,
+      mark: 0xaed4d9,
+      off_bg: 0xe8b8c6,
+      green: 0x40a02b,
+      amber: 0xdf8e1d,
+      red: 0xd20f39,
+      text_strong: 0x4c4f69,
+      text_dim: 0x545770,
+    },
+  },
+  Theme {
+    id: "dracula",
+    name: "Dracula",
+    dark: true,
+    colors: Colors {
+      bg: 0x16121b,
+      panel: 0x282a36,
+      popover: 0x1e1925,
+      row_hover: 0x3c324b,
+      row_selected: 0x3f3a47,
+      field: 0x1e1f28,
+      border: 0x48435d,
+      text: 0xf8f8f2,
+      muted: 0xa186c7,
+      accent: 0xc9a8f9,
+      accent_bg: 0x4b4661,
+      bubble: 0x20212a,
+      bubble_own: 0x3f3c51,
+      code_bg: 0x232530,
+      placeholder: 0x3c324b,
+      mark: 0x356b4c,
+      off_bg: 0x583c45,
+      green: 0x79e96d,
+      amber: 0xe6e373,
+      red: 0xe67373,
+      text_strong: 0xf8f8f2,
+      text_dim: 0xccbfdc,
+    },
+  },
+  Theme {
+    id: "dracula-light",
+    name: "Dracula Light (Alucard)",
+    dark: false,
+    colors: Colors {
+      bg: 0xedeff4,
+      panel: 0xf5f5f5,
+      popover: 0xf6f6f6,
+      row_hover: 0xccd0da,
+      row_selected: 0xc8c8d6,
+      field: 0xdce0e8,
+      border: 0xe4e4e4,
+      text: 0x1f1f1f,
+      muted: 0x353535,
+      accent: 0x836ed4,
+      accent_bg: 0xdcd7ee,
+      bubble: 0xdce0e8,
+      bubble_own: 0xe5e2f0,
+      code_bg: 0xdededf,
+      placeholder: 0xccd0da,
+      mark: 0xcbdcc9,
+      off_bg: 0xe6c4c4,
+      green: 0x1b7108,
+      amber: 0xccb517,
+      red: 0xb83233,
+      text_strong: 0x1f1f1f,
+      text_dim: 0x2a2a2a,
+    },
+  },
+  Theme {
+    id: "github-dark",
+    name: "GitHub Dark",
+    dark: true,
+    colors: Colors {
+      bg: 0x010409,
+      panel: 0x0d1117,
+      popover: 0x010409,
+      row_hover: 0x15191f,
+      row_selected: 0x1c2026,
+      field: 0x1f232a,
+      border: 0x2f353d,
+      text: 0xf0f6fc,
+      muted: 0x9198a1,
+      accent: 0x4493f8,
+      accent_bg: 0x192e48,
+      bubble: 0x1f232a,
+      bubble_own: 0x152337,
+      code_bg: 0x010409,
+      placeholder: 0x1f232a,
+      mark: 0x52492d,
+      off_bg: 0x482124,
+      green: 0x3fb950,
+      amber: 0xd29922,
+      red: 0xf85149,
+      text_strong: 0xf0f6fc,
+      text_dim: 0xc0c7ce,
+    },
+  },
+  Theme {
+    id: "github-dark-dimmed",
+    name: "GitHub Dark Dimmed",
+    dark: true,
+    colors: Colors {
+      bg: 0x151b23,
+      panel: 0x212830,
+      popover: 0x2a313c,
+      row_hover: 0x252b34,
+      row_selected: 0x2a3039,
+      field: 0x2f363e,
+      border: 0x353c44,
+      text: 0xd1d7e0,
+      muted: 0x9198a1,
+      accent: 0x478be6,
+      accent_bg: 0x293e58,
+      bubble: 0x2f363e,
+      bubble_own: 0x263649,
+      code_bg: 0x151b23,
+      placeholder: 0x2f363e,
+      mark: 0x5e573e,
+      off_bg: 0x523337,
+      green: 0x57ab5a,
+      amber: 0xc69026,
+      red: 0xe5534b,
+      text_strong: 0xd1d7e0,
+      text_dim: 0xb1b8c0,
+    },
+  },
+  Theme {
+    id: "github-light",
+    name: "GitHub Light",
+    dark: false,
+    colors: Colors {
+      bg: 0xf6f8fa,
+      panel: 0xffffff,
+      popover: 0xffffff,
+      row_hover: 0xe8ebee,
+      row_selected: 0xe0e3e6,
+      field: 0xecedee,
+      border: 0xdfe4e9,
+      text: 0x1f2328,
+      muted: 0x59636e,
+      accent: 0x0969da,
+      accent_bg: 0xc9def7,
+      bubble: 0xf0f1f2,
+      bubble_own: 0xddeafa,
+      code_bg: 0xf6f8fa,
+      placeholder: 0xf0f1f2,
+      mark: 0xfdf6d8,
+      off_bg: 0xf4c8cb,
+      green: 0x1a7f37,
+      amber: 0x9a6700,
+      red: 0xd1242f,
+      text_strong: 0x1f2328,
+      text_dim: 0x3c434b,
+    },
+  },
+  Theme {
+    id: "tokyo-night",
+    name: "Tokyo Night",
+    dark: true,
+    colors: Colors {
+      bg: 0x16161e,
+      panel: 0x1a1b26,
+      popover: 0x14141b,
+      row_hover: 0x565f89,
+      row_selected: 0x58618b,
+      field: 0x242632,
+      border: 0x101014,
+      text: 0xa9b1d6,
+      muted: 0x787c99,
+      accent: 0x7dcfff,
+      accent_bg: 0x304356,
+      bubble: 0x242632,
+      bubble_own: 0x283444,
+      code_bg: 0x16161e,
+      placeholder: 0x565f89,
+      mark: 0x414868,
+      off_bg: 0x513240,
+      green: 0x9ece6a,
+      amber: 0xe0af68,
+      red: 0xf7768e,
+      text_strong: 0xa9b1d6,
+      text_dim: 0x9096b8,
+    },
+  },
+  Theme {
+    id: "tokyo-night-storm",
+    name: "Tokyo Night Storm",
+    dark: true,
+    colors: Colors {
+      bg: 0x1f2335,
+      panel: 0x24283b,
+      popover: 0x1b1e2e,
+      row_hover: 0x565f89,
+      row_selected: 0x59628c,
+      field: 0x2d3246,
+      border: 0x1b1e2e,
+      text: 0xa9b1d6,
+      muted: 0x7982a9,
+      accent: 0x7dcfff,
+      accent_bg: 0x384d66,
+      bubble: 0x2d3246,
+      bubble_own: 0x303f56,
+      code_bg: 0x1f2335,
+      placeholder: 0x565f89,
+      mark: 0x414868,
+      off_bg: 0x593c50,
+      green: 0x9ece6a,
+      amber: 0xe0af68,
+      red: 0xf7768e,
+      text_strong: 0xa9b1d6,
+      text_dim: 0x919ac0,
+    },
+  },
+  Theme {
+    id: "tokyo-night-light",
+    name: "Tokyo Night Light",
+    dark: false,
+    colors: Colors {
+      bg: 0xcbccd1,
+      panel: 0xd5d6db,
+      popover: 0xd5d6db,
+      row_hover: 0x9699a3,
+      row_selected: 0x9295a0,
+      field: 0xc0c2ca,
+      border: 0xc1c2c7,
+      text: 0x343b58,
+      muted: 0x4c505e,
+      accent: 0x0f4b6e,
+      accent_bg: 0xa9b7c3,
+      bubble: 0xcacbd2,
+      bubble_own: 0xb9c3cc,
+      code_bg: 0xcbccd1,
+      placeholder: 0x9699a3,
+      mark: 0x9699a3,
+      off_bg: 0xc3b1b8,
+      green: 0x485e30,
+      amber: 0x8f5e15,
+      red: 0x8c4351,
+      text_strong: 0x343b58,
+      text_dim: 0x40465b,
+    },
+  },
+  Theme {
+    id: "nord",
+    name: "Nord",
+    dark: true,
+    colors: Colors {
+      bg: 0x2e3440,
+      panel: 0x2e3440,
+      popover: 0x3b4252,
+      row_hover: 0x475c69,
+      row_selected: 0x6c99a6,
+      field: 0x3b4252,
+      border: 0x4b5262,
+      text: 0xeceff4,
+      muted: 0xd8dee9,
+      accent: 0x88c0d0,
+      accent_bg: 0x425360,
+      bubble: 0x404757,
+      bubble_own: 0x3b4854,
+      code_bg: 0x2e3440,
+      placeholder: 0x475c69,
+      mark: 0x40505d,
+      off_bg: 0x523f4a,
+      green: 0xa3be8c,
+      amber: 0xebcb8b,
+      red: 0xbf616a,
+      text_strong: 0xeceff4,
+      text_dim: 0xe2e6ee,
+    },
+  },
+  Theme {
+    id: "nord-light",
+    name: "Nord Light",
+    dark: false,
+    colors: Colors {
+      bg: 0xf6f8fa,
+      panel: 0xeceff4,
+      popover: 0xfafbfc,
+      row_hover: 0xe8edf1,
+      row_selected: 0xe0e3e8,
+      field: 0xe0e4eb,
+      border: 0xe1e4e8,
+      text: 0x444d56,
+      muted: 0x6a737d,
+      accent: 0x2188ff,
+      accent_bg: 0xbfd8f6,
+      bubble: 0xe0e4eb,
+      bubble_own: 0xd0e1f6,
+      code_bg: 0xf6f8fa,
+      placeholder: 0xdfe5e9,
+      mark: 0x9bc6f8,
+      off_bg: 0xe7c2c9,
+      green: 0x28a745,
+      amber: 0xbfa76b,
+      red: 0xd73a49,
+      text_strong: 0x444d56,
+      text_dim: 0x57606a,
+    },
+  },
+  Theme {
+    id: "solarized-dark",
+    name: "Solarized Dark",
+    dark: true,
+    colors: Colors {
+      bg: 0x073642,
+      panel: 0x002b36,
+      popover: 0x002b36,
+      row_hover: 0x123e4a,
+      row_selected: 0x13587c,
+      field: 0x123e4a,
+      border: 0x586e75,
+      text: 0x839496,
+      muted: 0x586e75,
+      accent: 0x268bd2,
+      accent_bg: 0x084058,
+      bubble: 0x073642,
+      bubble_own: 0x05384c,
+      code_bg: 0x002b36,
+      placeholder: 0x073642,
+      mark: 0x6d6316,
+      off_bg: 0x372d34,
+      green: 0x859900,
+      amber: 0xcb4b16,
+      red: 0xdc322f,
+      text_strong: 0x839496,
+      text_dim: 0x6e8186,
+    },
+  },
+  Theme {
+    id: "solarized-light",
+    name: "Solarized Light",
+    dark: false,
+    colors: Colors {
+      bg: 0xeee8d5,
+      panel: 0xfdf6e3,
+      popover: 0xfdf6e3,
+      row_hover: 0xe2dece,
+      row_selected: 0x9ec3d4,
+      field: 0xe2dece,
+      border: 0x93a1a1,
+      text: 0x657b83,
+      muted: 0x93a1a1,
+      accent: 0x268bd2,
+      accent_bg: 0xcededf,
+      bubble: 0xeee8d5,
+      bubble_own: 0xdfe7e1,
+      code_bg: 0xfdf6e3,
+      placeholder: 0xeee8d5,
+      mark: 0xd2b55b,
+      off_bg: 0xf5c5b6,
+      green: 0x859900,
+      amber: 0xcb4b16,
+      red: 0xdc322f,
+      text_strong: 0x657b83,
+      text_dim: 0x7c8e92,
+    },
+  },
+  Theme {
+    id: "rose-pine",
+    name: "Rosé Pine",
+    dark: true,
+    colors: Colors {
+      bg: 0x191724,
+      panel: 0x191724,
+      popover: 0x1f1d2e,
+      row_hover: 0x26233a,
+      row_selected: 0x524f67,
+      field: 0x232132,
+      border: 0x524f67,
+      text: 0xe0def4,
+      muted: 0x908caa,
+      accent: 0x9ccfd8,
+      accent_bg: 0x363f4c,
+      bubble: 0x252334,
+      bubble_own: 0x2b313d,
+      code_bg: 0x1f1d2e,
+      placeholder: 0x26233a,
+      mark: 0x5c4a3d,
+      off_bg: 0x4e2d40,
+      green: 0x31748f,
+      amber: 0xf6c177,
+      red: 0xeb6f92,
+      text_strong: 0xe0def4,
+      text_dim: 0xb8b5cf,
+    },
+  },
+];
+
+#[cfg(test)]
+mod tests {
+  use super::{DEFAULT_DARK, DEFAULT_LIGHT, THEMES, find};
+
+  #[test]
+  fn an_unknown_or_mismatched_theme_falls_back_to_the_default_of_its_appearance() {
+    assert_eq!(THEMES[find("gone", true)].id, DEFAULT_DARK);
+    assert_eq!(THEMES[find("gone", false)].id, DEFAULT_LIGHT);
+    assert_eq!(THEMES[find("dracula", false)].id, DEFAULT_LIGHT);
+    assert_eq!(THEMES[find("dracula", true)].id, "dracula");
+  }
+}

@@ -1,10 +1,12 @@
-//! Fixed-width, virtualized sidebar: Home plus the Direct messages / Apps / Spaces sections.
+//! Fixed-width, virtualized sidebar: Home, Mentions, and Starred, then the Direct messages / Apps / Spaces sections.
 
 use std::ops::Range;
 
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+
+use gchat_core::Shortcut;
 
 use crate::new_chat::OpenNewChat;
 use crate::store::{SidebarItem, Store, View};
@@ -29,9 +31,13 @@ impl Sidebar {
   fn rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
     let store = self.store.read(cx);
     let selected_home = store.view == View::Home;
+    let selected_shortcut = match &store.view {
+      View::Shortcut(shortcut) => Some(*shortcut),
+      View::Home | View::Conversation(_) => None,
+    };
     let selected_group = match &store.view {
       View::Conversation(id) => Some(id.clone()),
-      View::Home => None,
+      View::Home | View::Shortcut(_) => None,
     };
     let mut out = Vec::with_capacity(range.len());
     for ix in range {
@@ -48,6 +54,22 @@ impl Sidebar {
                 .on_click(move |_, _, cx| store_handle.update(cx, super::store::Store::go_home))
                 .child(icon(Icon::House, 16., TEXT))
                 .child(label("Home", false)),
+            )
+            .into_any_element()
+        },
+        SidebarItem::Shortcut(shortcut) => {
+          let shortcut = *shortcut;
+          let (glyph, name) = match shortcut {
+            Shortcut::Mentions => (Icon::AtSign, "Mentions"),
+            Shortcut::Starred => (Icon::Star, "Starred"),
+          };
+          let store_handle = self.store.clone();
+          row
+            .child(
+              item_frame(selected_shortcut == Some(shortcut))
+                .on_click(move |_, _, cx| store_handle.update(cx, |s, cx| s.open_shortcut(shortcut, cx)))
+                .child(icon(glyph, 16., TEXT))
+                .child(label(name, false)),
             )
             .into_any_element()
         },

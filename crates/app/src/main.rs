@@ -43,12 +43,14 @@ mod screen;
 mod session;
 mod settings;
 mod settings_view;
+mod shortcut;
 mod sidebar;
 mod status;
 mod status_menu;
 mod store;
 mod switcher;
 mod theme;
+mod theme_picker;
 mod ui;
 mod util;
 mod viewer;
@@ -61,8 +63,8 @@ use gpui_kit::*;
 
 use crate::images::Images;
 use crate::root::{
-  FindInChat, FindNext, FindPrevious, GoHome, Hide, HideOthers, Minimize, OpenSettings, OpenSwitcher, Quit,
-  RewriteDraft, RootView, ShowAll, TOP_BAR_HEIGHT, Zoom, menus,
+  FindInChat, FindNext, FindPrevious, GoHome, Hide, HideOthers, Minimize, OpenSettings, OpenSwitcher, OpenThemePicker,
+  Quit, RewriteDraft, RootView, ShowAll, TOP_BAR_HEIGHT, Zoom, menus,
 };
 use crate::settings::Settings;
 use crate::store::Store;
@@ -116,6 +118,7 @@ fn main() {
 
     cx.bind_keys([
       KeyBinding::new("cmd-k", OpenSwitcher, None),
+      KeyBinding::new("cmd-shift-t", OpenThemePicker, None),
       KeyBinding::new("cmd-n", crate::new_chat::OpenNewChat, None),
       KeyBinding::new("cmd-1", GoHome, None),
       KeyBinding::new("cmd-,", OpenSettings, None),

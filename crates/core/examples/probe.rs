@@ -40,7 +40,14 @@ fn main() {
   while let Ok(event) = core.events().recv_deadline(deadline) {
     let at = started.elapsed().as_millis();
     match event {
-      Event::Me(me) => println!("[{at}ms] me: name={} avatar={}", !me.name.is_empty(), me.avatar_url.is_some()),
+      Event::Me(me) => {
+        println!("[{at}ms] me: name={} avatar={}", !me.name.is_empty(), me.avatar_url.is_some());
+        if !me.id.is_empty() {
+          for shortcut in [gchat_core::Shortcut::Mentions, gchat_core::Shortcut::Starred] {
+            core.send(Command::LoadShortcut { shortcut, cursor: None });
+          }
+        }
+      },
       Event::Connection(connection) => println!("[{at}ms] connection: {connection:?}"),
       Event::World(groups) => {
         let count = |kind| groups.iter().filter(|group| group.kind == kind).count();
@@ -85,6 +92,14 @@ fn main() {
             time: hit.time,
           });
         }
+      },
+      Event::Shortcut { shortcut, hits, appended, cursor } => {
+        let newest_first = hits.iter().zip(hits.iter().skip(1)).all(|(a, b)| a.time >= b.time);
+        println!(
+          "[{at}ms] {shortcut:?}: {} messages, appended {appended}, more {}, newest first {newest_first}",
+          hits.len(),
+          cursor.is_some()
+        );
       },
       Event::History {
         group,

@@ -619,10 +619,17 @@ pub fn message(message: &proto::Message, users: &Users) -> Option<Message> {
     attachments,
     cards,
     quote,
+    starred: message
+      .message_labels
+      .iter()
+      .any(|label| label.label_type == Some(STARRED_LABEL)),
     pending: false,
     failed: false,
   })
 }
+
+/// `MessageLabel::label_type` of the user's star.
+pub const STARRED_LABEL: i32 = 1;
 
 pub fn emoji_text(emoji: &proto::Emoji) -> Option<String> {
   if let Some(unicode) = emoji.unicode.clone().filter(|unicode| !unicode.is_empty()) {

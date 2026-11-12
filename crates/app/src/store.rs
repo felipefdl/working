@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use gchat_core::fuzzy::Fuzzy;
 use gchat_core::{
-  Command, Connection, Core, Event, Group, GroupId, GroupKind, Message, Notify, Placement, SearchHit, SpanKind, User,
+  Command, Connection, Core, Event, Group, GroupId, GroupKind, Message, Notify, Placement, SearchHit, Shortcut,
+  SpanKind, User,
 };
 use gpui_kit::*;
 
@@ -15,7 +16,7 @@ use crate::images::Images;
 /// Sidebar sections, laid out as the Google Chat web app does.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Section {
-  /// Holds Home.
+  /// Holds Home, Mentions, and Starred.
   Shortcuts,
   /// A section the user made in Google Chat, such as "Shortcut".
   Custom {
@@ -65,6 +66,7 @@ pub struct Conv {
 #[derive(Clone)]
 pub enum SidebarItem {
   Home,
+  Shortcut(Shortcut),
   Header(Section),
   Conv(Arc<Conv>),
   Toggle(Section),
@@ -73,6 +75,8 @@ pub enum SidebarItem {
 #[derive(Clone, PartialEq, Eq)]
 pub enum View {
   Home,
+  /// Mentions or Starred: a message list across conversations.
+  Shortcut(Shortcut),
   Conversation(GroupId),
 }
 
@@ -88,6 +92,15 @@ pub struct History {
 pub struct Search {
   pub query: String,
   pub hits: Option<Arc<Vec<SearchHit>>>,
+}
+
+/// The messages of the shortcut on screen: `hits` is `None` until the core answers the first page.
+pub struct ShortcutList {
+  pub shortcut: Shortcut,
+  pub hits: Option<Vec<SearchHit>>,
+  /// Asks for the next, older page; `None` once every page is in.
+  cursor: Option<String>,
+  loading_more: bool,
 }
 
 const COLLAPSED_ROWS: usize = 8;
@@ -109,6 +122,8 @@ pub struct Store {
   pub query: String,
   /// The message search started by Enter in the search field, shown under the conversation matches.
   pub search: Option<Search>,
+  /// What the Mentions or Starred view shows.
+  pub shortcut: Option<ShortcutList>,
   pub unread_only: bool,
   collapsed: HashSet<Section>,
   show_all: HashSet<Section>,
@@ -134,11 +149,17 @@ impl Store {
       groups: HashMap::new(),
       all: Vec::new(),
       home: Vec::new(),
-      sidebar: vec![SidebarItem::Header(Section::Shortcuts), SidebarItem::Home],
+      sidebar: vec![
+        SidebarItem::Header(Section::Shortcuts),
+        SidebarItem::Home,
+        SidebarItem::Shortcut(Shortcut::Mentions),
+        SidebarItem::Shortcut(Shortcut::Starred),
+      ],
       view: View::Home,
       conv: None,
       query: String::new(),
       search: None,
+      shortcut: None,
       unread_only: false,
       // The web app keeps Meetings folded at the bottom.
       collapsed: HashSet::from([Section::Meetings]),
@@ -240,6 +261,18 @@ impl Store {
             && search.query == query
           {
             search.hits = Some(hits);
+          }
+        },
+        Event::Shortcut { shortcut, hits, appended, cursor } => {
+          if let Some(list) = &mut self.shortcut
+            && list.shortcut == shortcut
+          {
+            match &mut list.hits {
+              Some(held) if appended => held.extend(hits.iter().cloned()),
+              _ => list.hits = Some(hits.to_vec()),
+            }
+            list.cursor = cursor;
+            list.loading_more = false;
           }
         },
         Event::MessageUpsert { message, replaces, incoming } => {
@@ -474,6 +507,8 @@ impl Store {
     let mut items = vec![SidebarItem::Header(Section::Shortcuts)];
     if !self.collapsed.contains(&Section::Shortcuts) {
       items.push(SidebarItem::Home);
+      items.push(SidebarItem::Shortcut(Shortcut::Mentions));
+      items.push(SidebarItem::Shortcut(Shortcut::Starred));
     }
     let mut by_section: HashMap<Section, Vec<&Arc<Conv>>> = HashMap::new();
     for conv in &self.all {
@@ -597,6 +632,7 @@ impl Store {
     let (core, images, me) = (self.core.clone(), self.images.clone(), self.me.clone());
     self.conv = Some(cx.new(|cx| ConversationView::new(store, core, images, group, me, history, window, cx)));
     self.view = View::Conversation(id.clone());
+    self.shortcut = None;
     self.core.send(Command::Open(id.clone()));
     self.clear_notifications(&id);
     self.core.send(Command::MarkRead(id));
@@ -610,7 +646,43 @@ impl Store {
     self.view = View::Home;
     // Dropping the view tells the core we stopped typing.
     self.conv = None;
+    self.shortcut = None;
     cx.notify();
+  }
+
+  /// Shows Mentions or Starred, loading its newest messages again.
+  pub fn open_shortcut(&mut self, shortcut: Shortcut, cx: &mut Context<Self>) {
+    if matches!(self.view, View::Conversation(_)) {
+      self.core.send(Command::Close);
+    }
+    self.view = View::Shortcut(shortcut);
+    self.conv = None;
+    self.shortcut = Some(ShortcutList {
+      shortcut,
+      hits: None,
+      cursor: None,
+      loading_more: false,
+    });
+    self.core.send(Command::LoadShortcut { shortcut, cursor: None });
+    cx.notify();
+  }
+
+  /// Asks for the next, older page of the shortcut on screen, unless one is on its way or none is left.
+  pub fn load_more_shortcut(&mut self) {
+    let Some(list) = &mut self.shortcut else {
+      return;
+    };
+    if list.loading_more {
+      return;
+    }
+    let Some(cursor) = list.cursor.clone() else {
+      return;
+    };
+    list.loading_more = true;
+    self.core.send(Command::LoadShortcut {
+      shortcut: list.shortcut,
+      cursor: Some(cursor),
+    });
   }
 
   /// Searches messages for the text in the search field.
@@ -637,6 +709,7 @@ impl Store {
       let (core, images, me) = (self.core.clone(), self.images.clone(), self.me.clone());
       self.conv = Some(cx.new(|cx| ConversationView::new(store, core, images, group, me, None, window, cx)));
       self.view = View::Conversation(hit.group.clone());
+      self.shortcut = None;
     }
     self.core.send(Command::Jump {
       group: hit.group.clone(),

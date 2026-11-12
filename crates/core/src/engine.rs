@@ -37,7 +37,7 @@ use crate::mcp;
 use crate::model::{
   Attachment, AttachmentKind, Command, Connection, DndFor, DndSchedule, DndSchedules, Event, Group, GroupId, GroupKind,
   McpConfig, McpStatus, Message, Micros, MyStatus, Notify, PersonStatus, Placement, Presence, Quote, Reaction,
-  SearchHit, Snippet, User,
+  SearchHit, Shortcut, Snippet, User,
 };
 use crate::proto;
 
@@ -848,6 +848,18 @@ impl Engine {
   }
 
   pub(crate) async fn search_hits(&self, query: &str) -> Result<Vec<SearchHit>> {
+    Ok(self.search_page(query, None, None).await?.0)
+  }
+
+  /// One page of the web app's message search. With `mentioning`, only messages that @mention that user, newest
+  /// first (the Mentions shortcut); otherwise best matches first. Answers the hits and the cursor of the next page.
+  async fn search_page(
+    &self,
+    query: &str,
+    mentioning: Option<&str>,
+    cursor: Option<&str>,
+  ) -> Result<(Vec<SearchHit>, Option<String>)> {
+    const PAGE: usize = 20;
     let session = format!("{:032X}", rand::random::<u128>());
     let session = format!(
       "{}-{}-{}-{}-{}",
@@ -857,16 +869,19 @@ impl Engine {
       &session[16..20],
       &session[20..]
     );
+    // The mention filter names the user; sort 2 is newest first, 3 best match first.
+    let mentions = mentioning.map(|me| serde_json::json!([[[[me]]]]));
+    let sort = if mentioning.is_some() { 2 } else { 3 };
     let arguments = serde_json::json!([
       null,
-      null,
+      cursor,
       null,
       query,
       null,
       session,
-      [[], null, null, null, session, null, 0, [[[[[[1]]]]], [[[1]]]]],
+      [[], null, null, null, session, mentions, 0, [[[[[[1]]]]], [[[1]]]]],
       null,
-      [3],
+      [sort],
       [155],
       0,
       null,
@@ -875,10 +890,13 @@ impl Engine {
     let answer = self.http.page_rpc("SBNmJb", &arguments).await?;
     let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     // Results sit at index 9; each wraps a message whose fields are positional.
-    let hits: Vec<SearchHit> = answer[9]
-      .as_array()
-      .into_iter()
-      .flatten()
+    let results = answer[9].as_array().map_or(&[][..], Vec::as_slice);
+    let next = answer[0]
+      .as_str()
+      .filter(|next| !next.is_empty() && results.len() >= PAGE)
+      .map(str::to_string);
+    let hits: Vec<SearchHit> = results
+      .iter()
       .filter_map(|result| {
         let message = &result[0];
         let group = match message[2][0].as_str()?.split_once('/')? {
@@ -903,6 +921,47 @@ impl Engine {
         })
       })
       .collect();
+    Ok((hits, next))
+  }
+
+  /// One page of a shortcut's messages.
+  async fn load_shortcut(&self, shortcut: Shortcut, cursor: Option<String>) -> Result<()> {
+    let appended = cursor.is_some();
+    let (hits, cursor) = match shortcut {
+      Shortcut::Mentions => {
+        let me = self.me_id();
+        if me.is_empty() {
+          bail!("Mentions need the signed-in user, who is not known yet.");
+        }
+        self.search_page("", Some(&me), cursor.as_deref()).await?
+      },
+      Shortcut::Starred => (self.starred().await?, None),
+    };
+    self.emit(Event::Shortcut {
+      shortcut,
+      hits: Arc::new(hits),
+      appended,
+      cursor,
+    });
+    Ok(())
+  }
+
+  /// The starred messages, newest first. The web app reads them as a world section filtered by the starred
+  /// label; the protobuf schema here has no field for that filter, so the request is the web app's JSON.
+  async fn starred(&self) -> Result<Vec<SearchHit>> {
+    let header: serde_json::Value = serde_json::from_str(WEB_REQUEST_HEADER)?;
+    let section: serde_json::Value = serde_json::from_str(STARRED_SECTION)?;
+    let request = serde_json::json!([header, [section], null, [4, 2, 5, 6, 7, 3, 8], null, null, null, null, 0, [1]]);
+    let answer = self.http.api_json("paginated_world", &request).await?;
+    let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Field 8 of the answer lists the section's entries; a starred message is an entry's third field.
+    let mut hits: Vec<SearchHit> = answer[0][7]
+      .as_array()
+      .into_iter()
+      .flatten()
+      .filter_map(|entry| starred_hit(&entry[2], &state.users))
+      .collect();
+    hits.sort_by(|a, b| b.time.cmp(&a.time));
     Ok(hits)
   }
 
@@ -978,6 +1037,12 @@ impl Engine {
       Command::LoadNewer(group) => {
         tokio::spawn(async move {
           let result = engine.load_newer(group).await;
+          engine.report(result);
+        });
+      },
+      Command::LoadShortcut { shortcut, cursor } => {
+        tokio::spawn(async move {
+          let result = engine.load_shortcut(shortcut, cursor).await;
           engine.report(result);
         });
       },
@@ -1217,6 +1282,27 @@ impl Engine {
           engine.report(result.map(|_| ()));
         });
       },
+      Command::Star { group, topic_id, message_id, starred } => {
+        if self.readonly {
+          return self.emit(Event::Error("Read-only mode: the star was not changed.".into()));
+        }
+        self.apply_star(&group, &message_id, starred);
+        tokio::spawn(async move {
+          let endpoint = if starred {
+            "apply_message_label"
+          } else {
+            "remove_message_label"
+          };
+          let result = match star_request(&group, &topic_id, &message_id) {
+            Ok(request) => engine.http.api_json(endpoint, &request).await.map(|_| ()),
+            Err(error) => Err(error),
+          };
+          if result.is_err() {
+            engine.apply_star(&group, &message_id, !starred);
+          }
+          engine.report(result);
+        });
+      },
       Command::React { group, topic_id, message_id, emoji, add } => {
         if self.readonly {
           return self.emit(Event::Error("Read-only mode: the reaction was not sent.".into()));
@@ -1367,6 +1453,7 @@ impl Engine {
       cards: Vec::new(),
       quote,
       pending: true,
+      starred: false,
       failed: false,
     });
     self.upsert_message(message, None);
@@ -1602,6 +1689,29 @@ impl Engine {
       }
       self.emit(Event::GroupUpsert(group.clone()));
     }
+  }
+
+  /// Marks a held message starred or not and tells the UI.
+  fn apply_star(&self, group: &GroupId, message_id: &str, starred: bool) {
+    let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(slot) = state
+      .histories
+      .get_mut(group)
+      .and_then(|history| history.messages.iter_mut().find(|message| message.id == message_id))
+    else {
+      return;
+    };
+    if slot.starred == starred {
+      return;
+    }
+    let mut message = (**slot).clone();
+    message.starred = starred;
+    *slot = Arc::new(message);
+    self.emit(Event::MessageUpsert {
+      message: slot.clone(),
+      replaces: None,
+      incoming: false,
+    });
   }
 
   fn apply_reaction(&self, group: &GroupId, message_id: &str, emoji: &str, reactor: &str, add: bool) {
@@ -2320,9 +2430,55 @@ fn created_group(id: GroupId, member_ids: Vec<String>, me: &str, users: &convert
   }
 }
 
+/// The request header of the web app's JSON API calls, with the client capabilities it declares.
+const WEB_REQUEST_HEADER: &str = r#"[0,3,1,"en",[null,null,null,null,2,2,null,2,2,2,2,null,null,null,null,2,2,2,2,2,2,2,2,2,2,2,2,2,2,null,null,2,2,null,null,2,2,2,null,null,null,null,2,2,2,2,null,2,null,null,2,null,2,2,2,2,null,2,null,2,2,2,2,2,2,2,2,2,2,2,null,2,2,null,2,2,null,2]]"#;
+
+/// The web app's world section of starred messages: up to 100 entries filtered by the starred label.
+const STARRED_SECTION: &str = r#"[100,null,null,null,null,null,null,null,null,[[1,1],[1]],[4],null,null,null,null,[[[3,[null,null,null,null,[2,[null,null,null,null,null,null,null,"label"],[null,null,null,null,null,null,null,"100G"]]]]]]]"#;
+
+/// `apply_message_label` / `remove_message_label` for the star, in the web app's JSON: the message id (topic and
+/// conversation inside), the label, and the request header as field 100.
+fn star_request(group: &GroupId, topic_id: &str, message_id: &str) -> Result<serde_json::Value> {
+  let conversation = match group {
+    GroupId::Dm(id) => serde_json::json!([null, null, [id]]),
+    GroupId::Space(id) => serde_json::json!([[id]]),
+  };
+  let mut request = vec![serde_json::Value::Null; 100];
+  request[0] = serde_json::json!([[null, null, null, [null, topic_id, conversation]], message_id]);
+  request[1] = serde_json::json!([convert::STARRED_LABEL]);
+  request[99] = serde_json::from_str(WEB_REQUEST_HEADER)?;
+  Ok(serde_json::Value::Array(request))
+}
+
+/// A starred message of the world's starred section, as a hit. Its fields are positional: the id (topic and
+/// conversation inside), the sender, the creation time, and the text.
+fn starred_hit(message: &serde_json::Value, users: &Users) -> Option<SearchHit> {
+  let topic = &message[0][0][3];
+  let conversation = &topic[2];
+  let group = if let Some(space) = conversation[0][0].as_str() {
+    GroupId::Space(space.to_string())
+  } else {
+    GroupId::Dm(conversation[2][0].as_str()?.to_string())
+  };
+  let sender_id = message[1][0][0].as_str().unwrap_or_default().to_string();
+  let sender = users.get(&sender_id);
+  Some(SearchHit {
+    group,
+    message_id: message[0][1].as_str()?.to_string(),
+    topic_id: topic[1].as_str().unwrap_or_default().to_string(),
+    sender_name: sender.map(|user| user.name.clone()).unwrap_or_default(),
+    sender_avatar: sender.and_then(|user| user.avatar_url.clone()),
+    sender_id,
+    text: message[9].as_str().unwrap_or_default().to_string(),
+    time: message[2].as_str().and_then(|time| time.parse().ok())?,
+  })
+}
+
 #[cfg(test)]
 mod tests {
-  use super::{file_name, people_list};
+  use super::{file_name, people_list, starred_hit};
+  use crate::convert::Users;
+  use crate::model::GroupId;
   use crate::model::User;
   use std::path::Path;
 
@@ -2352,5 +2508,37 @@ mod tests {
     gone.deleted = true;
     let people = people_list(&[user("me", "Me"), user("a", "Ada"), bot, gone, user("z", "")], "me");
     assert_eq!(people.iter().map(|user| user.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+  }
+
+  #[test]
+  fn starred_entries_resolve_dm_and_space_messages() {
+    let mut users = Users::new();
+    users.insert("u1".into(), user("u1", "Ana"));
+    let dm = serde_json::json!([
+      [[null, null, null, [null, "t1", [null, null, ["d1"]]]], "m1"],
+      [["u1"]],
+      "1700000000000000",
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      "hello"
+    ]);
+    let hit = starred_hit(&dm, &users).expect("a DM message");
+    assert_eq!(hit.group, GroupId::Dm("d1".into()));
+    assert_eq!((hit.message_id.as_str(), hit.topic_id.as_str()), ("m1", "t1"));
+    assert_eq!(
+      (hit.sender_name.as_str(), hit.text.as_str(), hit.time),
+      ("Ana", "hello", 1_700_000_000_000_000)
+    );
+
+    let space = serde_json::json!([[[null, null, null, [null, "t2", [["s1"]]]], "m2"], [["u9"]], "5"]);
+    let hit = starred_hit(&space, &users).expect("a space message");
+    assert_eq!(hit.group, GroupId::Space("s1".into()));
+    assert_eq!(hit.sender_name, "");
+
+    assert!(starred_hit(&serde_json::Value::Null, &users).is_none());
   }
 }

@@ -931,6 +931,7 @@ mod tests {
           attachments: Vec::new(),
           cards: Vec::new(),
           quote: None,
+          starred: false,
           pending: false,
           failed: false,
         })
