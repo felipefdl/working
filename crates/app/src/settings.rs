@@ -247,7 +247,12 @@ impl Settings {
     }
     match serde_json::to_string_pretty(&settings) {
       Ok(text) => {
-        if let Err(error) = std::fs::write(path(), text) {
+        let path = path();
+        let written = path
+          .parent()
+          .map_or(Ok(()), std::fs::create_dir_all)
+          .and_then(|()| std::fs::write(&path, text));
+        if let Err(error) = written {
           tracing::warn!("could not save settings: {error}");
         }
       },
