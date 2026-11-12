@@ -105,7 +105,8 @@ impl ContextMenu {
       return;
     };
     self.close(window, cx);
-    run(window, cx);
+    // After this update ends: an item that opens another menu (Do not disturb's durations) updates this entity.
+    window.defer(cx, move |window, cx| run(window, cx));
   }
 }
 
