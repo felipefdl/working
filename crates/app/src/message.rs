@@ -311,7 +311,7 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
     );
   }
   for (i, card) in msg.cards.iter().enumerate() {
-    content = content.child(card_view(card, &msg.id, i));
+    content = content.child(card_view(card, msg, ctx.core, i));
   }
   if !msg.reactions.is_empty() {
     content = content.child(reactions_view(&msg.reactions, msg, ctx.core));
@@ -1189,7 +1189,8 @@ fn chip(att: &Attachment, id: SharedString, viewer_first: bool) -> AnyElement {
 }
 
 /// An app card as Google Chat draws it: a bordered box, the header first, then each section with a divider above it.
-fn card_view(card: &Card, msg_id: &str, ix: usize) -> AnyElement {
+fn card_view(card: &Card, msg: &Message, core: &Core, ix: usize) -> AnyElement {
+  let msg_id = msg.id.as_str();
   let block = |first: bool| {
     v_flex()
       .gap_1()
@@ -1243,19 +1244,30 @@ fn card_view(card: &Card, msg_id: &str, ix: usize) -> AnyElement {
           .border_1()
           .border_color(rgb(BORDER))
           .child(button.label.clone());
-        row = row.child(match &button.url {
-          Some(url) => {
+        let pressable = |pill: Stateful<Div>| {
+          pill
+            .text_color(rgb(ACCENT))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(ROW_HOVER)))
+        };
+        row = row.child(match (&button.url, &button.action) {
+          (Some(url), _) => {
             let url = url.clone();
-            pill
-              .text_color(rgb(ACCENT))
-              .cursor_pointer()
-              .hover(|style| style.bg(rgb(ROW_HOVER)))
-              .on_click(move |_, _, cx| cx.open_url(&url))
+            pressable(pill).on_click(move |_, _, cx| cx.open_url(&url))
           },
-          // An action calls the app back through Google Chat, which this client cannot send yet.
-          None => pill
-            .text_color(rgb(MUTED))
-            .tooltip(hint("Use this button in Google Chat on the web")),
+          // The app answers through Google Chat, by updating this message or posting a new one.
+          (None, Some(action)) => {
+            let command = Command::ClickCard {
+              group: msg.group.clone(),
+              topic_id: msg.topic_id.clone(),
+              message_id: msg.id.clone(),
+              card_id: card.id.clone(),
+              action: action.clone(),
+            };
+            let core = core.clone();
+            pressable(pill).on_click(move |_, _, _| core.send(command.clone()))
+          },
+          (None, None) => pill.text_color(rgb(MUTED)),
         });
       }
       out = out.child(row);

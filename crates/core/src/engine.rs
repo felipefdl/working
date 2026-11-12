@@ -35,9 +35,9 @@ use crate::convert::{self, Users};
 use crate::http::{Http, SignedOut, request_header};
 use crate::mcp;
 use crate::model::{
-  Attachment, AttachmentKind, Command, Connection, DndFor, DndSchedule, DndSchedules, Event, Group, GroupId, GroupKind,
-  McpConfig, McpStatus, Message, Micros, MyStatus, Notify, PersonStatus, Placement, Presence, Quote, Reaction,
-  SearchHit, Shortcut, Snippet, User,
+  Attachment, AttachmentKind, CardAction, Command, Connection, DndFor, DndSchedule, DndSchedules, Event, Group,
+  GroupId, GroupKind, McpConfig, McpStatus, Message, Micros, MyStatus, Notify, PersonStatus, Placement, Presence,
+  Quote, Reaction, SearchHit, Shortcut, Snippet, User,
 };
 use crate::proto;
 
@@ -1282,6 +1282,22 @@ impl Engine {
           engine.report(result.map(|_| ()));
         });
       },
+      Command::ClickCard {
+        group,
+        topic_id,
+        message_id,
+        card_id,
+        action,
+      } => {
+        if self.readonly {
+          return self.emit(Event::Error("Read-only mode: the card button was not pressed.".into()));
+        }
+        tokio::spawn(async move {
+          let request = click_card_request(&group, &topic_id, &message_id, &card_id, &action);
+          let result = engine.http.api_json("click_card", &request).await.map(|_| ());
+          engine.report(result);
+        });
+      },
       Command::Star { group, topic_id, message_id, starred } => {
         if self.readonly {
           return self.emit(Event::Error("Read-only mode: the star was not changed.".into()));
@@ -2450,6 +2466,43 @@ fn star_request(group: &GroupId, topic_id: &str, message_id: &str) -> Result<ser
   Ok(serde_json::Value::Array(request))
 }
 
+/// `click_card`, in the web app's JSON, as captured from it: the message id (topic and conversation inside), the
+/// button's form action as the card carried it, and the card id. No request header.
+fn click_card_request(
+  group: &GroupId,
+  topic_id: &str,
+  message_id: &str,
+  card_id: &str,
+  action: &CardAction,
+) -> serde_json::Value {
+  let conversation = match group {
+    GroupId::Dm(id) => serde_json::json!([null, null, [id]]),
+    GroupId::Space(id) => serde_json::json!([[id]]),
+  };
+  let parameters: Vec<serde_json::Value> = action
+    .parameters
+    .iter()
+    .map(|(key, value)| serde_json::json!([key, value]))
+    .collect();
+  serde_json::json!([
+    [[null, null, null, [null, topic_id, conversation]], message_id],
+    [
+      action.method,
+      null,
+      null,
+      parameters,
+      action.load_indicator,
+      i32::from(action.persist_values),
+      null,
+      action.interaction,
+      null,
+      i32::from(action.all_widgets_are_required)
+    ],
+    null,
+    card_id
+  ])
+}
+
 /// A starred message of the world's starred section, as a hit. Its fields are positional: the id (topic and
 /// conversation inside), the sender, the creation time, and the text.
 fn starred_hit(message: &serde_json::Value, users: &Users) -> Option<SearchHit> {
@@ -2476,11 +2529,40 @@ fn starred_hit(message: &serde_json::Value, users: &Users) -> Option<SearchHit> 
 
 #[cfg(test)]
 mod tests {
-  use super::{file_name, people_list, starred_hit};
+  use super::{click_card_request, file_name, people_list, starred_hit};
   use crate::convert::Users;
   use crate::model::GroupId;
-  use crate::model::User;
+  use crate::model::{CardAction, User};
   use std::path::Path;
+
+  /// The body the web app sent for a card button, captured with its ids replaced.
+  #[test]
+  fn click_card_request_matches_the_web_app() {
+    let action = CardAction {
+      method: "https://app.example/google-chat/events".into(),
+      parameters: vec![("action".into(), "accept".into()), ("post_id".into(), "p1".into())],
+      ..CardAction::default()
+    };
+    let request = click_card_request(&GroupId::Dm("DM1".into()), "T1", "T1", "card-1", &action);
+    let expected = serde_json::json!([
+      [[null, null, null, [null, "T1", [null, null, ["DM1"]]]], "T1"],
+      [
+        "https://app.example/google-chat/events",
+        null,
+        null,
+        [["action", "accept"], ["post_id", "p1"]],
+        0,
+        0,
+        null,
+        0,
+        null,
+        0
+      ],
+      null,
+      "card-1"
+    ]);
+    assert_eq!(request, expected);
+  }
 
   fn user(id: &str, name: &str) -> User {
     User {

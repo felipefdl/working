@@ -236,6 +236,8 @@ pub struct Quote {
 /// App card, its widgets reduced to text lines and buttons per section.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Card {
+  /// The id the app gave the card (the attachment id); a button click names it.
+  pub id: String,
   /// Card title.
   pub title: String,
   /// Card subtitle.
@@ -260,8 +262,27 @@ pub struct CardSection {
 pub struct CardButton {
   /// Label.
   pub label: String,
-  /// The link it opens. None for a button that calls the app back (an action), which this client cannot send.
+  /// The link it opens.
   pub url: Option<String>,
+  /// What it sends back to its app, for a button that calls the app instead of opening a link.
+  pub action: Option<CardAction>,
+}
+
+/// A card button's form action, as the card carries it: sent back unchanged in `Command::ClickCard`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardAction {
+  /// Method name; for HTTP apps, the URL the app receives events on.
+  pub method: String,
+  /// Key and value pairs the app attached.
+  pub parameters: Vec<(String, String)>,
+  /// Load indicator (0 spinner, 1 none).
+  pub load_indicator: i32,
+  /// Keep form values after the action.
+  pub persist_values: bool,
+  /// Interaction (0 unspecified, 1 open dialog).
+  pub interaction: i32,
+  /// Every widget must have a value.
+  pub all_widgets_are_required: bool,
 }
 
 impl Card {
@@ -648,6 +669,19 @@ pub enum Command {
   StartMeet(GroupId),
   /// Mark this conversation read.
   MarkRead(GroupId),
+  /// Press a card button that calls its app back. The app answers by updating the message or posting a new one.
+  ClickCard {
+    /// Conversation.
+    group: GroupId,
+    /// Topic the message belongs to.
+    topic_id: String,
+    /// Message that holds the card.
+    message_id: String,
+    /// `Card::id`.
+    card_id: String,
+    /// The button's action.
+    action: CardAction,
+  },
   /// Star or unstar a message, which lists it in the Starred shortcut.
   Star {
     /// Conversation.

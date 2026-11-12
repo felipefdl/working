@@ -15,8 +15,8 @@
 use std::collections::HashMap;
 
 use crate::model::{
-  Attachment, AttachmentKind, Card, CardButton, CardSection, Group, GroupId, GroupKind, Message, Notify, Placement,
-  Quote, Reaction, Snippet, Span, SpanKind, User,
+  Attachment, AttachmentKind, Card, CardAction, CardButton, CardSection, Group, GroupId, GroupKind, Message, Notify,
+  Placement, Quote, Reaction, Snippet, Span, SpanKind, User,
 };
 use crate::proto;
 
@@ -503,8 +503,30 @@ fn click_url(click: Option<&proto::JAddOnsOnClick>) -> Option<String> {
     .filter(|url| !url.is_empty())
 }
 
-fn card(item: &proto::JAddOnsCardItem) -> Card {
-  let mut card = Card::default();
+/// A button's form action, kept whole so the click sends back what the card carried.
+fn card_action(action: &proto::JAddOnsFormAction) -> Option<CardAction> {
+  let method = action.action_method_name.clone().filter(|method| !method.is_empty())?;
+  Some(CardAction {
+    method,
+    parameters: action
+      .parameters
+      .iter()
+      .map(|parameter| {
+        (
+          parameter.key.clone().unwrap_or_default(),
+          parameter.value.clone().unwrap_or_default(),
+        )
+      })
+      .collect(),
+    load_indicator: action.load_indicator.unwrap_or(0),
+    persist_values: action.persist_values.unwrap_or(false),
+    interaction: action.interaction.unwrap_or(0),
+    all_widgets_are_required: action.all_widgets_are_required.unwrap_or(false),
+  })
+}
+
+fn card(item: &proto::JAddOnsCardItem, id: &str) -> Card {
+  let mut card = Card { id: id.to_string(), ..Card::default() };
   if let Some(header) = &item.header {
     card.title = formatted(header.title.as_ref());
     card.subtitle = formatted(header.subtitle.as_ref());
@@ -553,6 +575,7 @@ fn card(item: &proto::JAddOnsCardItem) -> Card {
               content
             },
             url: Some(url),
+            action: None,
           });
         }
       }
@@ -564,10 +587,17 @@ fn card(item: &proto::JAddOnsCardItem) -> Card {
         if label.is_empty() || button.disabled.unwrap_or(false) {
           continue;
         }
-        buttons.push(CardButton {
-          label,
-          url: click_url(button.on_click.as_deref()),
-        });
+        let url = click_url(button.on_click.as_deref());
+        let action = if url.is_none() {
+          button
+            .on_click
+            .as_ref()
+            .and_then(|click| click.action.as_ref())
+            .and_then(card_action)
+        } else {
+          None
+        };
+        buttons.push(CardButton { label, url, action });
       }
     }
     out.buttons = buttons;
@@ -599,8 +629,10 @@ pub fn message(message: &proto::Message, users: &Users) -> Option<Message> {
   let cards: Vec<Card> = message
     .attachments
     .iter()
-    .filter_map(|attachment| attachment.card_add_on_data.as_ref())
-    .map(card)
+    .filter_map(|attachment| {
+      let item = attachment.card_add_on_data.as_ref()?;
+      Some(card(item, attachment.attachment_id.as_deref().unwrap_or_default()))
+    })
     .filter(|card| !card.is_empty())
     .collect();
   let quote = message.quoted_message_metadata.as_ref().map(|quoted| Quote {
