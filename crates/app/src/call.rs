@@ -16,7 +16,7 @@ use wry::WebViewBuilder;
 use crate::screen::{self, ScreenCapture, Shared};
 use crate::session;
 use crate::settings::Settings;
-use crate::theme::{ACCENT, ACCENT_BG, AMBER, BG, FIELD, GREEN, MUTED, OFF_BG, RED, TEXT, Tone, rgb};
+use crate::theme::{ACCENT, ACCENT_BG, AMBER, BG, FIELD, GREEN, HANGUP, MUTED, OFF_BG, TEXT, Tone, WHITE, rgb};
 
 use crate::ui::{Icon, icon};
 
@@ -328,6 +328,10 @@ impl CallView {
   }
 
   fn control(id: &'static str, name: Icon, background: Tone) -> Stateful<Div> {
+    Self::tinted(id, name, background, TEXT)
+  }
+
+  fn tinted(id: &'static str, name: Icon, background: Tone, foreground: Tone) -> Stateful<Div> {
     div()
       .id(id)
       .size(px(44.))
@@ -338,7 +342,7 @@ impl CallView {
       .bg(rgb(background))
       .cursor_pointer()
       .hover(|s| s.opacity(0.85))
-      .child(icon(name, 20., TEXT))
+      .child(icon(name, 20., foreground))
   }
 
   /// A microphone or camera button: neutral while on, red-tinted while off, dimmed when there is no device.
@@ -516,7 +520,7 @@ impl Render for CallView {
             .on_click(cx.listener(|this, _, _, cx| this.run("toggleHand()", cx))),
         )
         .child(
-          Self::control("leave", Icon::PhoneOff, RED)
+          Self::tinted("leave", Icon::PhoneOff, HANGUP, WHITE)
             .w(px(64.))
             .on_click(cx.listener(|this, _, _, cx| this.run("leave()", cx))),
         )

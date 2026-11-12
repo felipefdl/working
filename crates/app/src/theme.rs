@@ -112,6 +112,9 @@ pub const TEXT_STRONG: Tone = Tone(|c| c.text_strong);
 pub const TEXT_DIM: Tone = Tone(|c| c.text_dim);
 /// Drawn over pictures and video, which stay dark in every theme.
 pub const WHITE: Tone = Tone(|_| 0xffffff);
+/// The call window's hang-up button: a solid red under a white icon in every theme, as Meet's own. A theme's
+/// `red` is tuned for text and reads washed out as a fill.
+pub const HANGUP: Tone = Tone(|_| 0xc5221f);
 
 pub const SIDEBAR_WIDTH: f32 = 264.0;
 pub const MONO: &str = "Menlo";
