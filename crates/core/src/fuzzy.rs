@@ -18,8 +18,8 @@ pub struct Fuzzy {
 impl Fuzzy {
   /// Parses `query` in fzf syntax.
   pub fn new(query: &str) -> Self {
-    // A name that starts with what was typed beats one that only holds it: "fab" is Fabiano before
-    // "Vitor, Fabio".
+    // A name that starts with what was typed beats one that only holds it: "jor" is Jordan before
+    // "Brooks, Jorah".
     let mut config = Config::DEFAULT;
     config.prefer_prefix = true;
     Self {
@@ -55,49 +55,49 @@ mod tests {
 
   #[test]
   fn subsequence_and_case() {
-    let mut fuzzy = Fuzzy::new("fbn");
-    assert!(fuzzy.score("Fabiano").is_some());
-    assert!(fuzzy.score("fbn").is_some());
-    assert!(fuzzy.score("Ana").is_none());
+    let mut fuzzy = Fuzzy::new("jdn");
+    assert!(fuzzy.score("Jordan").is_some());
+    assert!(fuzzy.score("jdn").is_some());
+    assert!(fuzzy.score("Riley").is_none());
   }
 
   #[test]
   fn accents_are_ignored() {
-    let mut fuzzy = Fuzzy::new("joao");
-    assert!(fuzzy.score("João").is_some());
+    let mut fuzzy = Fuzzy::new("renee");
+    assert!(fuzzy.score("Renée").is_some());
   }
 
   #[test]
   fn words_match_in_any_order() {
-    let mut fuzzy = Fuzzy::new("lima ana");
-    assert!(fuzzy.score("Ana Lima").is_some());
-    assert!(fuzzy.score("Ana").is_none());
+    let mut fuzzy = Fuzzy::new("park jordan");
+    assert!(fuzzy.score("Jordan Park").is_some());
+    assert!(fuzzy.score("Jordan").is_none());
   }
 
   #[test]
   fn prefix_beats_a_later_hit() {
-    let mut fuzzy = Fuzzy::new("fab");
-    let ranked = fuzzy.rank(["Vitor, Fabio", "Fabiano"], |name| *name);
+    let mut fuzzy = Fuzzy::new("jor");
+    let ranked = fuzzy.rank(["Brooks, Jorah", "Jordan"], |name| *name);
     assert_eq!(
       ranked.iter().map(|(_, name)| *name).collect::<Vec<_>>(),
-      vec!["Fabiano", "Vitor, Fabio"]
+      vec!["Jordan", "Brooks, Jorah"]
     );
   }
 
   #[test]
   fn weak_hits_drop_next_to_a_real_one() {
-    let mut fuzzy = Fuzzy::new("fab eg");
-    let ranked = fuzzy.rank(["Fabiano Eger", "Front-End Team Meeting - Feb 23"], |name| *name);
-    assert_eq!(ranked.iter().map(|(_, name)| *name).collect::<Vec<_>>(), vec!["Fabiano Eger"]);
+    let mut fuzzy = Fuzzy::new("jor pa");
+    let ranked = fuzzy.rank(["Jordan Park", "Jira Sync for Design Review Group - Apr 9"], |name| *name);
+    assert_eq!(ranked.iter().map(|(_, name)| *name).collect::<Vec<_>>(), vec!["Jordan Park"]);
   }
 
   #[test]
   fn anchors_and_negation() {
-    let mut start = Fuzzy::new("^Ana");
-    assert!(start.score("Ana Lima").is_some());
-    assert!(start.score("Lima Ana").is_none());
-    let mut no = Fuzzy::new("ana !lima");
-    assert!(no.score("Ana Costa").is_some());
-    assert!(no.score("Ana Lima").is_none());
+    let mut start = Fuzzy::new("^Jordan");
+    assert!(start.score("Jordan Park").is_some());
+    assert!(start.score("Park Jordan").is_none());
+    let mut no = Fuzzy::new("jordan !park");
+    assert!(no.score("Jordan Stone").is_some());
+    assert!(no.score("Jordan Park").is_none());
   }
 }

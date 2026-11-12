@@ -33,7 +33,7 @@ use crate::model::{AttachmentKind, Group, GroupId, GroupKind, Message, Micros, N
 /// System prompt for MCP clients: how to name conversations and that reads do not mark messages read.
 pub const INSTRUCTIONS: &str = "Google Chat of the person signed in to the Working app on this Mac. \
 Catch up with inbox. Find a chat with find_conversations, read it with read_conversation, and find a word or \
-topic across every chat with search_messages. Wherever a `conversation` is asked for, a name (\"Ana Lima\"), \
+topic across every chat with search_messages. Wherever a `conversation` is asked for, a name (\"Jordan Park\"), \
 part of one, or an id (dm/…, space/…) works. Times are this Mac's local time. Reading changes nothing: \
 messages stay unread.";
 
@@ -67,7 +67,7 @@ pub fn list(allow_send: bool) -> Vec<Value> {
       "title": "Find chats",
       "description": "Find conversations (direct messages, group chats, spaces, apps) by name and get their \
     ids. The query is fuzzy: part of a name, the first letters of its words, or a person's email all work \
-    (\"fab eger\", \"prod team\"). Without a query it lists the most recently active conversations. Use it to \
+    (\"jor park\", \"prod team\"). Without a query it lists the most recently active conversations. Use it to \
     learn who and what exists. To read messages call read_conversation, which takes a name directly.",
       "inputSchema": {
         "type": "object",
@@ -355,7 +355,7 @@ const fn kind_text(kind: GroupKind) -> &'static str {
   }
 }
 
-/// A conversation as answers name it: `Ana Lima (direct message, dm/abc)`.
+/// A conversation as answers name it: `Jordan Park (direct message, dm/abc)`.
 fn label(group: &Group) -> String {
   format!("{} ({}, {})", group.name, kind_text(group.kind), id_text(&group.id))
 }
