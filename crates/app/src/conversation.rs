@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gchat_core::{Command, Core, Group, GroupKind, Message, SlashCommand, User};
-use gpui_kit::component::input::{Input, InputEvent, InputState, Paste, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, Paste, RopeExt as _, Textarea, TextareaState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -344,11 +344,8 @@ impl ConversationView {
       id.clone()
     };
     if let Some(ix) = self.rows.iter().position(|row| row.msg.id == top_level) {
-      // One row above, so the hit is not glued to the top edge.
-      self.list.scroll_to(ListOffset {
-        item_ix: ix.saturating_sub(1),
-        offset_in_item: px(0.),
-      });
+      // The hit's own row: one row above can be a tall image that pushes the hit below the fold.
+      self.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(0.) });
     }
     if message.is_thread_reply() {
       self.open_thread(&top_level, window, cx);
@@ -742,7 +739,9 @@ impl ConversationView {
         let text = message.text.clone();
         composer.update(cx, |state, cx| {
           state.set_value(text, window, cx);
-          state.focus(window, cx);
+          // A multi-line value puts the caret at the start; editing goes on from the end.
+          let end = state.text().offset_to_position(state.text().len());
+          state.set_cursor_position(end, window, cx);
         });
       },
     }
