@@ -29,6 +29,8 @@ build() {
 }
 arm64="${WORKING_ARM64_BINARY:-$(build aarch64-apple-darwin | tail -1)}"
 x86_64="${WORKING_X86_64_BINARY:-$(build x86_64-apple-darwin | tail -1)}"
+# The release job compiles nothing, so cargo never made this folder there.
+mkdir -p target/release
 lipo -create -output target/release/working-universal "$arm64" "$x86_64"
 chmod +x target/release/working-universal
 
