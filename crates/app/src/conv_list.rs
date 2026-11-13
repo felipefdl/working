@@ -205,7 +205,7 @@ impl ConvList {
             .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMeet), cx)),
         )
       })
-      .when(shown.is_none(), |actions| actions.child(sort_button("sort-list", cx)))
+      .child(sort_button("sort-list", cx))
       .child(
         header_button("new-chat", Icon::Plus, false)
           .tooltip(new_chat_tip)
