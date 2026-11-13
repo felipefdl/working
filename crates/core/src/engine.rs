@@ -35,9 +35,9 @@ use crate::convert::{self, Users};
 use crate::http::{Http, SignedOut, request_header};
 use crate::mcp;
 use crate::model::{
-  Attachment, AttachmentKind, CardAction, Chip, Command, Connection, DndFor, DndSchedule, DndSchedules, Event, Group,
-  GroupId, GroupKind, McpConfig, McpStatus, Message, Micros, MyStatus, Notify, PersonStatus, Placement, Presence,
-  Quote, Reaction, SearchHit, Shortcut, Snippet, User,
+  Attachment, AttachmentKind, CardAction, Chip, Command, Connection, DndFor, DndSchedule, DndSchedules, EditScope,
+  Event, EventDraft, Group, GroupId, GroupKind, McpConfig, McpStatus, Message, Micros, MyStatus, Notify, PersonStatus,
+  Placement, Presence, Quote, Reaction, Rsvp, SearchHit, Shortcut, Snippet, User,
 };
 use crate::proto;
 
@@ -175,6 +175,10 @@ pub(crate) struct Engine {
   mcp: tokio::sync::Mutex<Option<mcp::Running>>,
   /// What `Command::SetPresence` last asked for, repeated to the server by `presence_loop`.
   presence: Mutex<Option<Presence>>,
+  /// Google Calendar, on the same session.
+  calendar: crate::calendar::Client,
+  /// The range `Command::LoadEvents` last asked for, read again after a calendar write.
+  calendar_range: Mutex<Option<(Micros, Micros)>>,
 }
 
 /// One page of a conversation as an agent reads it: topics oldest first, each with its sort time (the cursor
@@ -217,6 +221,9 @@ async fn wait_for_session(
             pending.mcp = config;
           },
           Command::SetPresence(presence) => pending.presence = Some(presence),
+          Command::CreateMeeting => {
+            let _ = events.send(Event::MeetingCreated(Err("Sign in to start.".into())));
+          },
           _ => {},
         }
       },
@@ -288,6 +295,8 @@ async fn run(
     readonly: std::env::var("WORKING_READONLY").is_ok_and(|value| value == "1"),
     mcp: tokio::sync::Mutex::new(None),
     presence: Mutex::new(None),
+    calendar: crate::calendar::Client::new(crate::config_dir().join("cookies.json")),
+    calendar_range: Mutex::new(None),
   });
 
   tokio::spawn(serve_fetches(engine.clone(), fetches));
@@ -1280,6 +1289,12 @@ impl Engine {
           engine.report(result);
         });
       },
+      Command::CreateMeeting => {
+        if self.readonly {
+          return self.emit(Event::MeetingCreated(Err("Read-only mode: no meeting was created.".into())));
+        }
+        tokio::spawn(async move { engine.create_meeting().await });
+      },
       Command::MarkRead(group) => {
         if self.readonly {
           return;
@@ -1406,6 +1421,36 @@ impl Engine {
             .api::<_, proto::SetTypingStateResponse>("set_typing_state", &request)
             .await;
         });
+      },
+      Command::LoadCalendars => {
+        tokio::spawn(async move {
+          match engine.calendar.calendars().await {
+            Ok(calendars) => engine.emit(Event::Calendars(Arc::new(calendars))),
+            Err(error) => engine.emit(Event::CalendarFailed(format!("{error:#}"))),
+          }
+        });
+      },
+      Command::LoadEvents { start, end } => {
+        *self.calendar_range.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some((start, end));
+        tokio::spawn(async move { engine.load_events(start, end).await });
+      },
+      Command::SaveEvent(draft) => {
+        if self.readonly {
+          return self.emit(Event::CalendarWritten(Err("Read-only mode: the event was not saved.".into())));
+        }
+        tokio::spawn(async move { engine.save_event(*draft).await });
+      },
+      Command::DeleteEvent { calendar_id, event_id, scope, notify } => {
+        if self.readonly {
+          return self.emit(Event::CalendarWritten(Err("Read-only mode: the event was not deleted.".into())));
+        }
+        tokio::spawn(async move { engine.delete_event(calendar_id, event_id, scope, notify).await });
+      },
+      Command::RespondEvent { calendar_id, event_id, scope, rsvp } => {
+        if self.readonly {
+          return self.emit(Event::CalendarWritten(Err("Read-only mode: the answer was not sent.".into())));
+        }
+        tokio::spawn(async move { engine.respond_event(calendar_id, event_id, scope, rsvp).await });
       },
       Command::CreateChat { user_ids } => {
         if self.readonly {
@@ -1739,6 +1784,35 @@ impl Engine {
       self.emit(Event::MeetStarted(url));
     }
     Ok(())
+  }
+
+  /// Meet's "New meeting": a meeting of its own, in no conversation and on no calendar. Answers
+  /// `Event::MeetingCreated` whether or not it worked, so whoever waits for it can stop.
+  async fn create_meeting(&self) {
+    let result = self.request_meeting().await.map_err(|error| self.meeting_failure(&error));
+    self.emit(Event::MeetingCreated(result));
+  }
+
+  /// The web app's call button without a conversation to post the call in: the server makes the meeting and answers
+  /// with the video call it would have posted, which is never posted. The answer is the meeting's link.
+  async fn request_meeting(&self) -> Result<String> {
+    let request = proto::CreateVideoCallRequest {
+      group_id: None,
+      request_header: Some(request_header()),
+    };
+    let call: proto::CreateVideoCallResponse = self.http.api("create_video_call", &request).await?;
+    meeting_link(&call).context("the server did not return a meeting")
+  }
+
+  /// What the user reads when no meeting was made, the cause going to the log. A refused session also signs the app
+  /// out, as it does for any command.
+  fn meeting_failure(&self, error: &anyhow::Error) -> String {
+    if let Some(signed_out) = error.downcast_ref::<SignedOut>() {
+      self.emit(Event::SignedOut(signed_out.0.clone()));
+      return signed_out.0.clone();
+    }
+    tracing::warn!("the meeting was not created: {error:#}");
+    "The meeting could not be created. Try again in a moment.".into()
   }
 
   /// Stores a message and publishes it, updating the conversation's preview. `local_id` names the pending
@@ -2187,6 +2261,41 @@ impl Engine {
   }
 }
 
+/// Google Calendar: reads answer with the events, writes with `Event::CalendarWritten` and then the events again.
+impl Engine {
+  async fn load_events(&self, start: Micros, end: Micros) {
+    match self.calendar.events(start, end).await {
+      Ok(events) => self.emit(Event::CalendarEvents { start, end, events: Arc::new(events) }),
+      Err(error) => self.emit(Event::CalendarFailed(format!("{error:#}"))),
+    }
+  }
+
+  /// Tells the UI how a write went and, when it went through, reads the range on screen again.
+  async fn calendar_written(&self, result: Result<()>) {
+    let written = result.is_ok();
+    self.emit(Event::CalendarWritten(result.map_err(|error| format!("{error:#}"))));
+    let range = *self.calendar_range.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((start, end)) = range.filter(|_| written) {
+      self.load_events(start, end).await;
+    }
+  }
+
+  async fn save_event(&self, draft: EventDraft) {
+    let result = self.calendar.save(&draft).await;
+    self.calendar_written(result).await;
+  }
+
+  async fn delete_event(&self, calendar_id: String, event_id: String, scope: EditScope, notify: bool) {
+    let result = self.calendar.delete(&calendar_id, &event_id, scope, notify).await;
+    self.calendar_written(result).await;
+  }
+
+  async fn respond_event(&self, calendar_id: String, event_id: String, scope: EditScope, rsvp: Rsvp) {
+    let result = self.calendar.respond(&calendar_id, &event_id, scope, rsvp).await;
+    self.calendar_written(result).await;
+  }
+}
+
 fn proto_message_id(group: &GroupId, topic_id: &str, message_id: &str) -> proto::MessageId {
   proto::MessageId {
     parent_id: Some(proto::MessageParentId {
@@ -2197,6 +2306,13 @@ fn proto_message_id(group: &GroupId, topic_id: &str, message_id: &str) -> proto:
     }),
     message_id: Some(message_id.to_string()),
   }
+}
+
+/// The link of the meeting a video call answer holds.
+fn meeting_link(call: &proto::CreateVideoCallResponse) -> Option<String> {
+  let annotation = call.annotation.as_ref()?;
+  let space = annotation.video_call_metadata.as_ref()?.meeting_space.as_ref()?;
+  space.meeting_url.clone().filter(|url| !url.is_empty())
 }
 
 /// How often the server is told the user is still there (or still gone).
@@ -2634,10 +2750,11 @@ fn starred_hit(message: &serde_json::Value, users: &Users) -> Option<SearchHit> 
 
 #[cfg(test)]
 mod tests {
-  use super::{click_card_request, file_name, people_list, starred_hit};
+  use super::{click_card_request, file_name, meeting_link, people_list, starred_hit};
   use crate::convert::Users;
   use crate::model::GroupId;
   use crate::model::{CardAction, User};
+  use crate::proto;
   use std::path::Path;
 
   /// The body the web app sent for a card button, captured with its ids replaced.
@@ -2727,5 +2844,57 @@ mod tests {
     assert_eq!(hit.sender_name, "");
 
     assert!(starred_hit(&serde_json::Value::Null, &users).is_none());
+  }
+
+  #[test]
+  fn a_meeting_link_comes_from_the_video_call_answer() {
+    let answer = |url: Option<&str>| proto::CreateVideoCallResponse {
+      annotation: Some(proto::Annotation {
+        video_call_metadata: Some(proto::VideoCallMetadata {
+          meeting_space: Some(proto::MeetingSpace {
+            meeting_code: Some("abc-defg-hij".into()),
+            meeting_url: url.map(str::to_string),
+            ..Default::default()
+          }),
+          ..Default::default()
+        }),
+        ..Default::default()
+      }),
+    };
+    assert_eq!(
+      meeting_link(&answer(Some("https://meet.google.com/abc-defg-hij"))).as_deref(),
+      Some("https://meet.google.com/abc-defg-hij")
+    );
+    assert_eq!(meeting_link(&answer(None)), None, "a space without a URL has no link");
+    assert_eq!(meeting_link(&answer(Some(""))), None);
+    assert_eq!(
+      meeting_link(&proto::CreateVideoCallResponse::default()),
+      None,
+      "no meeting was made"
+    );
+  }
+
+  /// The shape a live call answered, with made-up values: the annotation is field 1, its video call field 12, the
+  /// meeting space field 1 of that, and the meeting URL field 3 of the space.
+  #[test]
+  fn a_meeting_link_comes_from_the_wire_answer() {
+    use prost::Message as _;
+    // A length-delimited field: its tag byte, its length (every payload here is short), then the payload.
+    let field = |tag: u8, payload: &[u8]| {
+      let mut bytes = vec![tag, u8::try_from(payload.len()).expect("a short payload")];
+      bytes.extend_from_slice(payload);
+      bytes
+    };
+    let space = [
+      field(0x0a, b"spaces/abc"),
+      field(0x12, b"abc-defg-hij"),
+      field(0x1a, b"https://meet.google.com/abc-defg-hij"),
+    ]
+    .concat();
+    // The annotation: type 11 (a video call), then the video call metadata that holds the space.
+    let annotation = [vec![0x08, 0x0b], field(0x62, &field(0x0a, &space))].concat();
+    let wire = field(0x0a, &annotation);
+    let answer = proto::CreateVideoCallResponse::decode(wire.as_slice()).expect("the answer decodes");
+    assert_eq!(meeting_link(&answer).as_deref(), Some("https://meet.google.com/abc-defg-hij"));
   }
 }

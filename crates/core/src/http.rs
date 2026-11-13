@@ -25,7 +25,7 @@ const ORIGIN: &str = "https://chat.google.com";
 const API_BASE: &str = "https://chat.google.com/u/0/api";
 /// Public web client key the Chat web app sends with every API call.
 const API_KEY: &str = "AIzaSyD7InnYR3VKdb4j2rMUEbTCIr2VyEazl6k";
-const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
+pub(crate) const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36";
 
 /// One cookie of the signed-in Google session.
 #[derive(Clone, PartialEq, Eq, Deserialize, serde::Serialize)]

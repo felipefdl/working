@@ -241,3 +241,195 @@ fn create_chat_finds_or_makes_one() {
   );
   assert!(matches!(events.last(), Some(Event::OpenChat(_))));
 }
+
+#[test]
+fn creating_a_meeting_answers_a_link_of_its_own_each_time() {
+  let (mut demo, events) = demo();
+  demo.handle(Command::CreateMeeting);
+  demo.handle(Command::CreateMeeting);
+  let links: Vec<String> = drain(&events)
+    .into_iter()
+    .map(|event| match event {
+      Event::MeetingCreated(Ok(link)) => link,
+      other => panic!("only the meetings are answered, got {other:?}"),
+    })
+    .collect();
+  assert_eq!(links.len(), 2);
+  assert!(links.iter().all(|link| link.starts_with("https://meet.google.com/demo-")));
+  assert_ne!(links[0], links[1]);
+}
+
+/// Asks for the events of the week that holds the demo's "today", and answers what came back.
+fn week_of_events(demo: &mut Demo, events: &flume::Receiver<Event>) -> Vec<crate::model::CalendarEvent> {
+  let day = 24 * 3600 * 1_000_000_i64;
+  let now = 1_800_000_000_000_000;
+  demo.handle(Command::LoadEvents { start: now - 3 * day, end: now + 4 * day });
+  let Some(Event::CalendarEvents { events: held, .. }) = drain(events).pop() else {
+    panic!("no calendar events");
+  };
+  held.to_vec()
+}
+
+#[test]
+fn the_demo_calendar_lists_calendars_and_sorted_events() {
+  let (mut demo, events) = demo();
+  demo.handle(Command::LoadCalendars);
+  let Some(Event::Calendars(calendars)) = drain(&events).pop() else {
+    panic!("no calendars");
+  };
+  assert!(calendars.first().is_some_and(|calendar| calendar.primary));
+  assert!(calendars.iter().any(|calendar| !calendar.access.can_write()));
+  let held = week_of_events(&mut demo, &events);
+  assert!(held.len() > 3, "the week around today has events");
+  assert!(held.windows(2).all(|pair| pair[0].start <= pair[1].start));
+  // Reads only reach the range asked for.
+  assert!(
+    held
+      .iter()
+      .all(|event| event.end > 1_800_000_000_000_000 - 3 * 24 * 3600 * 1_000_000)
+  );
+}
+
+#[test]
+fn saving_creates_edits_and_deletes_an_event() {
+  use crate::model::{EditScope, EventDraft};
+  let (mut demo, events) = demo();
+  let start = 1_800_000_000_000_000 + 3_600_000_000;
+  let draft = EventDraft {
+    calendar_id: "amorgan@example.com".into(),
+    title: "Roadmap review".into(),
+    start,
+    end: start + 1_800_000_000,
+    busy: true,
+    guests: vec!["jpark@example.com".into()],
+    add_meet: true,
+    ..EventDraft::default()
+  };
+  demo.handle(Command::LoadEvents {
+    start: start - 86_400_000_000,
+    end: start + 86_400_000_000,
+  });
+  drain(&events);
+  demo.handle(Command::SaveEvent(Box::new(draft)));
+  let answered = drain(&events);
+  assert!(matches!(answered.first(), Some(Event::CalendarWritten(Ok(())))));
+  let Some(Event::CalendarEvents { events: held, .. }) = answered.into_iter().last() else {
+    panic!("the range is not sent again after a write");
+  };
+  let created = held.iter().find(|event| event.title == "Roadmap review").expect("created");
+  assert!(created.meet_url.is_some());
+  assert_eq!(created.guests.len(), 2, "the user and the guest");
+
+  let mut changed = EventDraft {
+    calendar_id: created.calendar_id.clone(),
+    editing: Some((created.calendar_id.clone(), created.id.clone())),
+    scope: EditScope::This,
+    title: "Roadmap review, moved".into(),
+    start: created.start + 3_600_000_000,
+    end: created.end + 3_600_000_000,
+    busy: true,
+    ..EventDraft::default()
+  };
+  changed.guests = vec!["jpark@example.com".into()];
+  demo.handle(Command::SaveEvent(Box::new(changed)));
+  let Some(Event::CalendarEvents { events: held, .. }) = drain(&events).into_iter().last() else {
+    panic!("no events after the edit");
+  };
+  assert!(held.iter().all(|event| event.title != "Roadmap review"));
+  let moved = held
+    .iter()
+    .find(|event| event.title == "Roadmap review, moved")
+    .expect("renamed");
+  assert_eq!(moved.start, created.start + 3_600_000_000);
+
+  demo.handle(Command::DeleteEvent {
+    calendar_id: moved.calendar_id.clone(),
+    event_id: moved.id.clone(),
+    scope: EditScope::This,
+    notify: false,
+  });
+  let Some(Event::CalendarEvents { events: held, .. }) = drain(&events).into_iter().last() else {
+    panic!("no events after the deletion");
+  };
+  assert!(held.iter().all(|event| event.title != "Roadmap review, moved"));
+}
+
+#[test]
+fn a_series_edit_reaches_every_occurrence_and_a_single_one_only_itself() {
+  use crate::model::{EditScope, EventDraft};
+  let (mut demo, events) = demo();
+  let day = 24 * 3600 * 1_000_000_i64;
+  let now = 1_800_000_000_000_000;
+  demo.handle(Command::LoadEvents {
+    start: now - 30 * day,
+    end: now + 30 * day,
+  });
+  let Some(Event::CalendarEvents { events: held, .. }) = drain(&events).pop() else {
+    panic!("no events");
+  };
+  let standups: Vec<_> = held.iter().filter(|event| event.title == "Daily standup").collect();
+  assert!(standups.len() > 10, "the standup repeats on weekdays");
+  let picked = standups[3];
+  let draft = |scope| EventDraft {
+    calendar_id: picked.calendar_id.clone(),
+    editing: Some((picked.calendar_id.clone(), picked.id.clone())),
+    scope,
+    title: "Standup, retitled".into(),
+    start: picked.start,
+    end: picked.end,
+    busy: true,
+    ..EventDraft::default()
+  };
+  demo.handle(Command::SaveEvent(Box::new(draft(EditScope::This))));
+  let Some(Event::CalendarEvents { events: held, .. }) = drain(&events).into_iter().last() else {
+    panic!("no events");
+  };
+  assert_eq!(held.iter().filter(|event| event.title == "Standup, retitled").count(), 1);
+  demo.handle(Command::SaveEvent(Box::new(draft(EditScope::All))));
+  let Some(Event::CalendarEvents { events: held, .. }) = drain(&events).into_iter().last() else {
+    panic!("no events");
+  };
+  assert_eq!(held.iter().filter(|event| event.title == "Daily standup").count(), 0);
+  assert!(held.iter().filter(|event| event.title == "Standup, retitled").count() > 10);
+}
+
+#[test]
+fn answering_an_invitation_updates_the_users_response() {
+  use crate::model::{EditScope, Rsvp};
+  let (mut demo, events) = demo();
+  let day = 24 * 3600 * 1_000_000_i64;
+  let now = 1_800_000_000_000_000;
+  demo.handle(Command::LoadEvents { start: now, end: now + 14 * day });
+  let Some(Event::CalendarEvents { events: held, .. }) = drain(&events).pop() else {
+    panic!("no events");
+  };
+  let waiting = held
+    .iter()
+    .find(|event| event.my_rsvp == Some(Rsvp::NeedsAction))
+    .expect("a coming invitation waits for an answer");
+  demo.handle(Command::RespondEvent {
+    calendar_id: waiting.calendar_id.clone(),
+    event_id: waiting.id.clone(),
+    scope: EditScope::This,
+    rsvp: Rsvp::Declined,
+  });
+  let Some(Event::CalendarEvents { events: held, .. }) = drain(&events).into_iter().last() else {
+    panic!("no events");
+  };
+  let answered = held.iter().find(|event| event.id == waiting.id).expect("still listed");
+  assert_eq!(answered.my_rsvp, Some(Rsvp::Declined));
+  assert!(answered.guests.iter().any(|guest| guest.me && guest.rsvp == Rsvp::Declined));
+}
+
+#[test]
+fn a_write_to_a_gone_event_says_so() {
+  use crate::model::EditScope;
+  let (mut demo, events) = demo();
+  demo.handle(Command::DeleteEvent {
+    calendar_id: "amorgan@example.com".into(),
+    event_id: "no-such-event".into(),
+    scope: EditScope::This,
+    notify: false,
+  });
+  assert!(matches!(drain(&events).first(), Some(Event::CalendarWritten(Err(_)))));
+}

@@ -2275,6 +2275,7 @@ dependencies = [
  "reqwest 0.13.5",
  "serde",
  "serde_json",
+ "sha1_smol",
  "tokio",
  "tracing",
  "tracing-subscriber",

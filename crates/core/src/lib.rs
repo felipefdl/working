@@ -4,6 +4,7 @@
 //! [`Event`]s; nothing here touches the UI thread.
 
 mod cache;
+mod calendar;
 mod channel;
 mod convert;
 mod demo;
@@ -19,6 +20,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub use calendar::{EVENT_COLORS, boundary_date, local_midnight};
 pub use engine::device_time_zone;
 pub use http::SessionCookie;
 pub use model::*;

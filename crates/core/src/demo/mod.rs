@@ -2,6 +2,7 @@
 //! account. It never opens a network connection or the disk cache. Commands answer the way the real engine
 //! answers them, and the people in it reply to messages, type, and post now and then.
 
+mod calendar;
 mod data;
 mod image;
 
@@ -139,6 +140,7 @@ struct Demo {
   /// Counts ids, canned replies, and unprompted messages.
   serial: usize,
   ambient: usize,
+  calendar: calendar::DemoCalendar,
 }
 
 impl Demo {
@@ -148,6 +150,7 @@ impl Demo {
     } = data::world(now);
     Self {
       events,
+      calendar: calendar::DemoCalendar::new(now, &users, &me),
       me,
       users: users.into_iter().map(|user| (user.id.clone(), user)).collect(),
       groups: groups.into_iter().map(|group| (group.id.clone(), group)).collect(),
@@ -259,6 +262,10 @@ impl Demo {
         draft.attachments = vec![data::meet(&code)];
         self.send(draft, &[]);
       },
+      Command::CreateMeeting => {
+        let link = format!("https://meet.google.com/demo-meet-{}", self.next_serial());
+        self.emit(Event::MeetingCreated(Ok(link)));
+      },
       Command::Edit { group, message_id, text } => self.edit(&group, &message_id, text),
       Command::Delete { group, message_id } => self.delete(&group, &message_id),
       Command::MarkRead(group) => self.update_group(&group, |group| {
@@ -307,11 +314,44 @@ impl Demo {
       },
       Command::RefreshWorld => self.emit(Event::World(Arc::new(self.groups.values().cloned().collect()))),
       Command::Connect => self.greet(),
+      Command::LoadCalendars => self.emit(Event::Calendars(Arc::new(self.calendar.calendars.clone()))),
+      Command::LoadEvents { start, end } => {
+        self.calendar.range = Some((start, end));
+        self.emit_calendar_events();
+      },
+      Command::SaveEvent(draft) => {
+        let result = self.calendar.save(&draft);
+        self.calendar_written(result);
+      },
+      Command::DeleteEvent { event_id, scope, .. } => {
+        let result = self.calendar.delete(&event_id, scope);
+        self.calendar_written(result);
+      },
+      Command::RespondEvent { event_id, scope, rsvp, .. } => {
+        let result = self.calendar.respond(&event_id, scope, rsvp);
+        self.calendar_written(result);
+      },
       Command::SetTyping { .. } | Command::SetPresence(_) => {},
     }
   }
 
   // ---- History windows ----
+
+  fn emit_calendar_events(&self) {
+    if let Some((start, end)) = self.calendar.range {
+      let events = Arc::new(self.calendar.events(start, end));
+      self.emit(Event::CalendarEvents { start, end, events });
+    }
+  }
+
+  /// Answers a calendar write and, when it went through, sends the range on screen again, as the engine does.
+  fn calendar_written(&self, result: Result<(), String>) {
+    let written = result.is_ok();
+    self.emit(Event::CalendarWritten(result));
+    if written {
+      self.emit_calendar_events();
+    }
+  }
 
   fn messages(&self, group: &GroupId) -> &[Arc<Message>] {
     self.histories.get(group).map_or(&[], Vec::as_slice)

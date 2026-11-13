@@ -558,6 +558,239 @@ pub enum Shortcut {
   Starred,
 }
 
+/// What the signed-in user may do with a calendar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CalendarAccess {
+  /// The user's own calendar.
+  Owner,
+  /// Shared with the right to change events.
+  Writer,
+  /// Shared to read, such as a holidays calendar.
+  Reader,
+  /// Only free and busy times are shown.
+  FreeBusy,
+}
+
+impl CalendarAccess {
+  /// Whether events can be created, changed, and deleted in a calendar with this access.
+  pub const fn can_write(self) -> bool {
+    matches!(self, Self::Owner | Self::Writer)
+  }
+}
+
+/// One calendar of the account, as Google Calendar lists it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Calendar {
+  /// Calendar id; the primary calendar's is the account's email.
+  pub id: String,
+  /// Name, with the user's own name for it when they gave one.
+  pub name: String,
+  /// Color as `0xRRGGBB`, as the web app paints it.
+  pub color: u32,
+  /// What the user may do with it.
+  pub access: CalendarAccess,
+  /// The account's own calendar.
+  pub primary: bool,
+  /// Checked in Google Calendar's list, so its events show until the user hides them.
+  pub selected: bool,
+}
+
+/// A guest's answer to an invitation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rsvp {
+  /// Not answered yet.
+  NeedsAction,
+  /// Going.
+  Accepted,
+  /// Maybe.
+  Tentative,
+  /// Not going.
+  Declined,
+}
+
+/// Someone invited to an event.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Guest {
+  /// Email address.
+  pub email: String,
+  /// Display name, empty when Google Calendar has none.
+  pub name: String,
+  /// Their answer.
+  pub rsvp: Rsvp,
+  /// They organize the event.
+  pub organizer: bool,
+  /// This is the signed-in user.
+  pub me: bool,
+  /// Invited as optional.
+  pub optional: bool,
+}
+
+/// What an event is, as Google Calendar types them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EventKind {
+  /// A regular event.
+  #[default]
+  Event,
+  /// Out of office: invitations that overlap it are declined.
+  OutOfOffice,
+  /// Focus time: chat notifications are muted during it.
+  FocusTime,
+  /// Where the user works that day.
+  WorkingLocation,
+  /// A contact's birthday.
+  Birthday,
+}
+
+/// Who can see an event's details.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Visibility {
+  /// As the calendar shares its events.
+  #[default]
+  Default,
+  /// Everyone who can see the calendar sees the details.
+  Public,
+  /// Only the attendees see the details.
+  Private,
+}
+
+/// The notification before an event.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Reminder {
+  /// The calendar's default notifications.
+  #[default]
+  Default,
+  /// No notification.
+  None,
+  /// A notification this many minutes before.
+  Minutes(u32),
+}
+
+/// One occurrence of a calendar event. Recurring events come one per occurrence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+  clippy::struct_excessive_bools,
+  reason = "each flag is one fact Google Calendar reports about the event"
+)]
+pub struct CalendarEvent {
+  /// Event id; an occurrence of a recurring event has its own.
+  pub id: String,
+  /// Calendar it belongs to.
+  pub calendar_id: String,
+  /// Title, `(No title)` when it has none.
+  pub title: String,
+  /// Start. An all-day event starts at local midnight of its first day.
+  pub start: Micros,
+  /// End, exclusive. An all-day event ends at local midnight after its last day.
+  pub end: Micros,
+  /// Spans whole days, without times.
+  pub all_day: bool,
+  /// Location, as typed.
+  pub location: String,
+  /// Description as plain text.
+  pub description: String,
+  /// Google Meet link, when it has one.
+  pub meet_url: Option<String>,
+  /// The event in Google Calendar on the web.
+  pub link: String,
+  /// Its own color, as `0xRRGGBB`, when one was picked; otherwise it takes its calendar's.
+  pub color: Option<u32>,
+  /// Google Calendar's id of that color, 1 to 11.
+  pub color_id: Option<u8>,
+  /// Who is invited, organizer included. Empty for an event without guests.
+  pub guests: Vec<Guest>,
+  /// Name or email of the organizer.
+  pub organizer: String,
+  /// Id of the recurring event this is an occurrence of.
+  pub series: Option<String>,
+  /// What it is.
+  pub kind: EventKind,
+  /// Shows the user as busy.
+  pub busy: bool,
+  /// Who can see its details.
+  pub visibility: Visibility,
+  /// The notification before it.
+  pub reminder: Reminder,
+  /// The user may change it.
+  pub can_edit: bool,
+  /// The user may delete it from their calendar.
+  pub can_delete: bool,
+  /// The user's own answer, when they are a guest and not the organizer.
+  pub my_rsvp: Option<Rsvp>,
+}
+
+/// How a new event repeats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Repeat {
+  /// Once.
+  #[default]
+  Never,
+  /// Every day.
+  Daily,
+  /// Every week on the start's weekday.
+  Weekly,
+  /// Every month on the start's day of the month.
+  Monthly,
+  /// Every year on the start's date.
+  Yearly,
+  /// Monday to Friday.
+  Weekdays,
+}
+
+/// Which occurrences of a recurring event a change or a deletion applies to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum EditScope {
+  /// Only the occurrence picked.
+  #[default]
+  This,
+  /// Every occurrence.
+  All,
+}
+
+/// A new event, or the changes to one, for `Command::SaveEvent`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[expect(
+  clippy::struct_excessive_bools,
+  reason = "each flag is one switch of the event editor"
+)]
+pub struct EventDraft {
+  /// Calendar to keep it in. Moves an edited event when it is not the one it is in.
+  pub calendar_id: String,
+  /// Calendar and id of the event edited. `None` creates an event.
+  pub editing: Option<(String, String)>,
+  /// For an occurrence of a recurring event: whether the change is for it alone or for the whole series.
+  pub scope: EditScope,
+  /// What it is. Only a new event takes it; Google Calendar keeps an event's kind.
+  pub kind: EventKind,
+  /// Title.
+  pub title: String,
+  /// Start; local midnight of the first day for an all-day event.
+  pub start: Micros,
+  /// End, exclusive; local midnight after the last day for an all-day event.
+  pub end: Micros,
+  /// Spans whole days.
+  pub all_day: bool,
+  /// Location.
+  pub location: String,
+  /// Description as plain text.
+  pub description: String,
+  /// Guests' emails. Guests already invited keep their answers.
+  pub guests: Vec<String>,
+  /// Give it a Google Meet link, when it has none.
+  pub add_meet: bool,
+  /// How it repeats. `None` leaves an edited event's recurrence as it is.
+  pub repeat: Option<Repeat>,
+  /// Shows the user as busy.
+  pub busy: bool,
+  /// Who can see its details.
+  pub visibility: Visibility,
+  /// Google Calendar's color id, 1 to 11. `None` takes the calendar's color.
+  pub color_id: Option<u8>,
+  /// The notification before it.
+  pub reminder: Reminder,
+  /// Email the guests about it.
+  pub notify: bool,
+}
+
 /// Everything the core tells the UI. Lists are complete replacements unless stated otherwise.
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -606,6 +839,9 @@ pub enum Event {
   },
   /// The meeting asked for with `Command::StartMeet` was created and posted; this is its link.
   MeetStarted(String),
+  /// Answer to `Command::CreateMeeting`: the new meeting's link (`https://meet.google.com/<code>`), or why it could
+  /// not be made, already safe to show.
+  MeetingCreated(Result<String, String>),
   /// A message arrived or changed. `replaces` names the local id of the pending message it confirms.
   /// `incoming` is true once per message, when someone else's message is first seen: worth a notification.
   MessageUpsert {
@@ -662,6 +898,23 @@ pub enum Event {
   },
   /// Open this conversation: answer to `Command::CreateChat`, or an existing chat it found.
   OpenChat(GroupId),
+  /// The account's calendars, primary first: answer to `Command::LoadCalendars`. Replaces what came before.
+  Calendars(Arc<Vec<Calendar>>),
+  /// Every calendar's events that overlap `start..end`, by start: answer to `Command::LoadEvents`, and again after a
+  /// write changed them.
+  CalendarEvents {
+    /// Start of the range asked for.
+    start: Micros,
+    /// End of the range asked for.
+    end: Micros,
+    /// Events by start, all-day ones first on a day.
+    events: Arc<Vec<CalendarEvent>>,
+  },
+  /// A calendar write (save, delete, or answer) finished: `Ok` once Google Calendar has it, or why it failed, already
+  /// safe to show. The calendar asked for last follows a success.
+  CalendarWritten(Result<(), String>),
+  /// Google Calendar could not be read. Safe to show.
+  CalendarFailed(String),
   /// A command or stream step failed. The string is already safe to show.
   Error(String),
 }
@@ -736,6 +989,9 @@ pub enum Command {
   },
   /// Creates a Google Meet meeting and posts its link in the conversation, as the web app's call button does.
   StartMeet(GroupId),
+  /// Creates a Google Meet meeting of its own, in no conversation and on no calendar, as Meet's "New" does. Answers
+  /// `Event::MeetingCreated`.
+  CreateMeeting,
   /// Mark this conversation read.
   MarkRead(GroupId),
   /// Press a card button that calls its app back. The app answers by updating the message or posting a new one.
@@ -811,6 +1067,40 @@ pub enum Command {
   },
   /// The session file was written after sign-in. Load it and continue.
   Connect,
+  /// Fetch the account's calendars. Answers `Event::Calendars`.
+  LoadCalendars,
+  /// Fetch the events of every calendar that overlap `start..end`. Answers `Event::CalendarEvents`; the latest range
+  /// asked for is fetched again after each write.
+  LoadEvents {
+    /// Start of the range.
+    start: Micros,
+    /// End of the range, exclusive.
+    end: Micros,
+  },
+  /// Creates an event, or changes one. Answers `Event::CalendarWritten`.
+  SaveEvent(Box<EventDraft>),
+  /// Deletes an event, or every occurrence of its series. Answers `Event::CalendarWritten`.
+  DeleteEvent {
+    /// Calendar holding it.
+    calendar_id: String,
+    /// The event, or the occurrence picked.
+    event_id: String,
+    /// For an occurrence: it alone, or the whole series.
+    scope: EditScope,
+    /// Email the guests about it.
+    notify: bool,
+  },
+  /// Answers an invitation. Answers `Event::CalendarWritten`.
+  RespondEvent {
+    /// Calendar holding it.
+    calendar_id: String,
+    /// The event, or the occurrence picked.
+    event_id: String,
+    /// For an occurrence: it alone, or the whole series.
+    scope: EditScope,
+    /// The answer.
+    rsvp: Rsvp,
+  },
 }
 
 #[cfg(test)]

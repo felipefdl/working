@@ -37,6 +37,26 @@ fn main() {
   }
   let mut opened = false;
   let mut asked_older = false;
+  // Google Calendar: the calendars, then five weeks of events around today. `WORKING_PROBE_CALENDAR_WRITE=1`, without
+  // `WORKING_READONLY`, also creates one private event without guests, renames it, and deletes it.
+  const PROBE_TITLE: &str = "Working probe (safe to delete)";
+  const PROBE_RENAMED: &str = "Working probe, renamed (safe to delete)";
+  let calendar_write = std::env::var("WORKING_PROBE_CALENDAR_WRITE").is_ok_and(|value| value == "1");
+  let mut write_step = 0;
+  let now = i64::try_from(
+    std::time::SystemTime::now()
+      .duration_since(std::time::UNIX_EPOCH)
+      .unwrap()
+      .as_micros(),
+  )
+  .unwrap();
+  let day = 24 * 3600 * 1_000_000_i64;
+  core.send(Command::LoadCalendars);
+  // Google Meet: `WORKING_PROBE_MEET_CREATE=1`, without `WORKING_READONLY`, makes one empty meeting of its own (in no
+  // conversation, on no calendar). Only the shape of its link is printed, never the link.
+  if std::env::var("WORKING_PROBE_MEET_CREATE").is_ok_and(|value| value == "1") {
+    core.send(Command::CreateMeeting);
+  }
   while let Ok(event) = core.events().recv_deadline(deadline) {
     let at = started.elapsed().as_millis();
     match event {
@@ -179,6 +199,16 @@ fn main() {
       Event::MessageDeleted { .. } => println!("[{at}ms] message deleted"),
       Event::Typing { typing, .. } => println!("[{at}ms] typing: {typing}"),
       Event::MeetStarted(_) => println!("[{at}ms] meeting started"),
+      Event::MeetingCreated(Ok(link)) => {
+        let path = link.strip_prefix("https://meet.google.com/").unwrap_or_default();
+        println!(
+          "[{at}ms] meeting created: link {} chars, meet.google.com {}, code groups {:?}",
+          link.chars().count(),
+          link.starts_with("https://meet.google.com/"),
+          path.split('-').map(str::len).collect::<Vec<_>>()
+        );
+      },
+      Event::MeetingCreated(Err(error)) => println!("[{at}ms] meeting not created: {error}"),
       Event::SignedOut(reason) => println!("[{at}ms] signed out: {reason}"),
       Event::Mcp(status) => println!("[{at}ms] mcp: {status:?}"),
       Event::Dnd(schedules) => println!("[{at}ms] dnd: {schedules:?}"),
@@ -215,6 +245,93 @@ fn main() {
         commands.iter().all(|command| command.name.starts_with('/'))
       ),
       Event::OpenChat(id) => println!("[{at}ms] open chat: {id:?}"),
+      Event::Calendars(calendars) => {
+        let writable = calendars.iter().filter(|calendar| calendar.access.can_write()).count();
+        println!(
+          "[{at}ms] calendars: {} ({writable} writable, {} primary, {} selected)",
+          calendars.len(),
+          calendars.iter().filter(|calendar| calendar.primary).count(),
+          calendars.iter().filter(|calendar| calendar.selected).count(),
+        );
+        core.send(Command::LoadEvents {
+          start: now - 7 * day,
+          end: now + 28 * day,
+        });
+      },
+      Event::CalendarEvents { events, .. } => {
+        let sorted = events.windows(2).all(|pair| pair[0].start <= pair[1].start);
+        println!(
+          "[{at}ms] calendar events: {} (all-day {}, recurring {}, with Meet {}, with guests {}, to answer {}, editable {}), start-sorted {sorted}",
+          events.len(),
+          events.iter().filter(|event| event.all_day).count(),
+          events.iter().filter(|event| event.series.is_some()).count(),
+          events.iter().filter(|event| event.meet_url.is_some()).count(),
+          events.iter().filter(|event| !event.guests.is_empty()).count(),
+          events
+            .iter()
+            .filter(|event| event.my_rsvp == Some(gchat_core::Rsvp::NeedsAction))
+            .count(),
+          events.iter().filter(|event| event.can_edit).count(),
+        );
+        if !calendar_write {
+          continue;
+        }
+        let find = |title: &str| events.iter().find(|event| event.title == title);
+        match write_step {
+          0 => {
+            write_step = 1;
+            core.send(Command::SaveEvent(Box::new(gchat_core::EventDraft {
+              calendar_id: "primary".into(),
+              title: PROBE_TITLE.into(),
+              start: now + day,
+              end: now + day + 900_000_000,
+              visibility: gchat_core::Visibility::Private,
+              reminder: gchat_core::Reminder::None,
+              ..gchat_core::EventDraft::default()
+            })));
+          },
+          1 => {
+            let created = find(PROBE_TITLE).expect("the created event is listed");
+            println!(
+              "[{at}ms] calendar write: created, private {}, free {}",
+              created.visibility == gchat_core::Visibility::Private,
+              !created.busy
+            );
+            write_step = 2;
+            core.send(Command::SaveEvent(Box::new(gchat_core::EventDraft {
+              calendar_id: created.calendar_id.clone(),
+              editing: Some((created.calendar_id.clone(), created.id.clone())),
+              title: PROBE_RENAMED.into(),
+              start: created.start + 3_600_000_000,
+              end: created.end + 3_600_000_000,
+              visibility: created.visibility,
+              reminder: created.reminder,
+              ..gchat_core::EventDraft::default()
+            })));
+          },
+          2 => {
+            let renamed = find(PROBE_RENAMED).expect("the renamed event is listed");
+            println!(
+              "[{at}ms] calendar write: renamed and moved, old title gone {}",
+              find(PROBE_TITLE).is_none()
+            );
+            write_step = 3;
+            core.send(Command::DeleteEvent {
+              calendar_id: renamed.calendar_id.clone(),
+              event_id: renamed.id.clone(),
+              scope: gchat_core::EditScope::This,
+              notify: false,
+            });
+          },
+          3 => {
+            write_step = 4;
+            println!("[{at}ms] calendar write: deleted {}", find(PROBE_RENAMED).is_none());
+          },
+          _ => {},
+        }
+      },
+      Event::CalendarWritten(result) => println!("[{at}ms] calendar written: {result:?}"),
+      Event::CalendarFailed(error) => println!("[{at}ms] calendar failed: {error}"),
       Event::Error(error) => println!("[{at}ms] error: {error}"),
     }
   }
