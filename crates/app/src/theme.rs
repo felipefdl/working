@@ -127,7 +127,6 @@ pub const WHITE: Tone = Tone(|_| 0xffffff);
 /// `red` is tuned for text and reads washed out as a fill.
 pub const HANGUP: Tone = Tone(|_| 0xc5221f);
 
-pub const SIDEBAR_WIDTH: f32 = 264.0;
 pub const MONO: &str = "Menlo";
 
 pub static THEMES: [Theme; 28] = [

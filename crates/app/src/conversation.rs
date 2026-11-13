@@ -1555,19 +1555,22 @@ impl Render for ConversationView {
       .items_center()
       .border_b_1()
       .border_color(rgb(BORDER))
-      .child(
-        div()
-          .id("back")
-          .size(px(32.))
-          .flex()
-          .items_center()
-          .justify_center()
-          .rounded_full()
-          .cursor_pointer()
-          .hover(|s| s.bg(rgb(ROW_HOVER)))
-          .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx)))
-          .child(icon(Icon::ArrowLeft, 18., TEXT)),
-      )
+      // Messages and Rail keep the list beside the conversation: nothing to go back to.
+      .when(!cx.global::<Settings>().layout.keeps_list(), |header| {
+        header.child(
+          div()
+            .id("back")
+            .size(px(32.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(ROW_HOVER)))
+            .on_click(cx.listener(|this, _, window, cx| this.go_back(window, cx)))
+            .child(icon(Icon::ArrowLeft, 18., TEXT)),
+        )
+      })
       .child(group_avatar(&self.images, cx, &self.group, 32.))
       .child(
         div()

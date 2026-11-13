@@ -11,7 +11,15 @@ use crate::util;
 /// Lucide icons embedded as SVG so no asset bundle is needed at runtime.
 #[derive(Clone, Copy)]
 pub enum Icon {
+  ArrowDownAZ,
+  User,
+  Users,
+  PanelLeft,
+  PanelLeftDashed,
+  PanelRight,
+  PanelRightDashed,
   ArrowLeft,
+  History,
   ChevronDown,
   ChevronRight,
   ChevronUp,
@@ -163,6 +171,24 @@ impl Icon {
       ),
       Self::Bell => lucide!(
         r#"<path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/>"#
+      ),
+      Self::ArrowDownAZ => lucide!(
+        r#"<path d="m3 16 4 4 4-4"/><path d="M7 20V4"/><path d="M20 8h-5"/><path d="M15 10V6.5a2.5 2.5 0 0 1 5 0V10"/><path d="M15 14h5l-5 6h5"/>"#
+      ),
+      Self::History => lucide!(
+        r#"<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>"#
+      ),
+      Self::User => lucide!(r#"<path d="M19 21v-2a4 4 0 0 0-4-4H9a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>"#),
+      Self::PanelLeft => lucide!(r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/>"#),
+      Self::PanelLeftDashed => lucide!(
+        r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 14v1"/><path d="M9 19v2"/><path d="M9 3v2"/><path d="M9 9v1"/>"#
+      ),
+      Self::PanelRight => lucide!(r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 3v18"/>"#),
+      Self::PanelRightDashed => lucide!(
+        r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 14v1"/><path d="M15 19v2"/><path d="M15 3v2"/><path d="M15 9v1"/>"#
+      ),
+      Self::Users => lucide!(
+        r#"<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><path d="M16 3.128a4 4 0 0 1 0 7.744"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><circle cx="9" cy="7" r="4"/>"#
       ),
     }
   }

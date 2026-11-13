@@ -1,6 +1,8 @@
 //! The user's settings: kept in `~/.config/working/settings.json` and held as a GPUI global, so views that
 //! read them are redrawn when they change.
 
+use std::collections::BTreeMap;
+
 use gchat_core::{Command, Core, McpConfig, McpStatus};
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
@@ -28,6 +30,92 @@ pub enum Density {
   Comfortable,
   /// Every message on the left, under its sender.
   Compact,
+}
+
+/// How the main window is arranged, and how moving between conversations works in it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Layout {
+  /// Sidebar with Google Chat's sections, then Home or the open conversation.
+  #[default]
+  GoogleChat,
+  /// One list of every conversation with previews, filtered by chips, beside the open conversation.
+  Messages,
+  /// An icon rail of categories, the selected one's list with previews, then the open conversation.
+  Rail,
+}
+
+impl Layout {
+  pub const ALL: [Self; 3] = [Self::GoogleChat, Self::Messages, Self::Rail];
+
+  pub const fn label(self) -> &'static str {
+    match self {
+      Self::GoogleChat => "Google Chat",
+      Self::Messages => "Messages",
+      Self::Rail => "Rail",
+    }
+  }
+
+  /// Width of the layout's resizable column (the Google Chat sidebar, or the Messages or Rail list) until the user
+  /// drags it.
+  pub const fn default_width(self) -> f32 {
+    match self {
+      Self::GoogleChat => 264.,
+      Self::Messages => 340.,
+      Self::Rail => 320.,
+    }
+  }
+
+  /// A conversation list stays beside the open conversation, so opening one never leaves the list and Escape
+  /// does not go back to Home.
+  pub const fn keeps_list(self) -> bool {
+    matches!(self, Self::Messages | Self::Rail)
+  }
+}
+
+/// The left column(s) of every layout: the sidebar button's three states.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SidebarMode {
+  /// Beside the panel.
+  #[default]
+  Open,
+  /// Out of the way until the sidebar button opens it again.
+  Closed,
+  /// Out of the way; the pointer at the window's left edge floats it in over the panel, and it goes when the
+  /// pointer leaves.
+  AutoHide,
+}
+
+/// Which side of the window the left column(s) of a layout sit on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SidebarSide {
+  #[default]
+  Left,
+  Right,
+}
+
+/// Narrowest and widest a dragged column may get.
+pub const COLUMN_MIN_WIDTH: f32 = 200.;
+pub const COLUMN_MAX_WIDTH: f32 = 560.;
+
+/// How a conversation list is ordered. Pinned conversations stay on top either way.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Sort {
+  /// Newest activity first.
+  #[default]
+  Recent,
+  /// By name, A to Z.
+  Alphabetical,
+}
+
+impl Sort {
+  pub const ALL: [Self; 2] = [Self::Recent, Self::Alphabetical];
+
+  pub const fn label(self) -> &'static str {
+    match self {
+      Self::Recent => "Sort by most recent",
+      Self::Alphabetical => "Sort alphabetically",
+    }
+  }
 }
 
 /// When the user shows as online to other people.
@@ -157,7 +245,7 @@ impl RewriteTool {
   }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
   pub appearance: Appearance,
@@ -165,6 +253,16 @@ pub struct Settings {
   pub dark_theme: String,
   pub light_theme: String,
   pub density: Density,
+  pub layout: Layout,
+  pub sidebar: SidebarMode,
+  pub sidebar_side: SidebarSide,
+  /// Dragged widths of each layout's resizable column; a layout without an entry uses `Layout::default_width`.
+  pub column_widths: BTreeMap<Layout, f32>,
+  /// Order of Home and of the Messages and Rail list.
+  pub list_sort: Sort,
+  /// Order of each Google Chat sidebar section, by `Section::key`. A section without an entry uses its own
+  /// default: A to Z for people, newest first elsewhere, as the web app does.
+  pub section_sort: BTreeMap<String, Sort>,
   /// Calls never get the camera, and have no camera button.
   pub camera_off: bool,
   /// Open Google Meet in Working's call window. Off opens the link in the browser.
@@ -200,6 +298,12 @@ impl Default for Settings {
       dark_theme: theme::DEFAULT_DARK.into(),
       light_theme: theme::DEFAULT_LIGHT.into(),
       density: Density::default(),
+      layout: Layout::default(),
+      sidebar: SidebarMode::default(),
+      sidebar_side: SidebarSide::default(),
+      column_widths: BTreeMap::new(),
+      list_sort: Sort::default(),
+      section_sort: BTreeMap::new(),
       camera_off: false,
       meet_builtin: true,
       meet_auto_open: true,
@@ -240,12 +344,27 @@ impl Settings {
 
   /// Changes the settings, saves them and applies them.
   pub fn update(cx: &mut App, change: impl FnOnce(&mut Self)) {
+    if Self::preview(cx, change) {
+      Self::commit(cx);
+    }
+  }
+
+  /// Changes and applies the settings without saving them, for a change still going on (a column being dragged).
+  /// Returns whether anything changed. `commit` saves.
+  pub fn preview(cx: &mut App, change: impl FnOnce(&mut Self)) -> bool {
     let mut settings = cx.global::<Self>().clone();
     change(&mut settings);
     if &settings == cx.global::<Self>() {
-      return;
+      return false;
     }
-    match serde_json::to_string_pretty(&settings) {
+    cx.set_global(settings);
+    apply_appearance(cx);
+    true
+  }
+
+  /// Saves the settings as they are now.
+  pub fn commit(cx: &App) {
+    match serde_json::to_string_pretty(cx.global::<Self>()) {
       Ok(text) => {
         let path = path();
         let written = path
@@ -258,8 +377,16 @@ impl Settings {
       },
       Err(error) => tracing::warn!("could not save settings: {error}"),
     }
-    cx.set_global(settings);
-    apply_appearance(cx);
+  }
+
+  /// Width of a layout's resizable column: the dragged one, or its default.
+  pub fn column_width(&self, layout: Layout) -> f32 {
+    self
+      .column_widths
+      .get(&layout)
+      .copied()
+      .unwrap_or_else(|| layout.default_width())
+      .clamp(COLUMN_MIN_WIDTH, COLUMN_MAX_WIDTH)
   }
 
   /// How the MCP server should run: `None` while it is off.

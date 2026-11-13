@@ -12,6 +12,7 @@ use gpui_kit::*;
 
 use crate::conversation::ConversationView;
 use crate::images::Images;
+use crate::settings::{Layout, Settings, Sort};
 
 /// Sidebar sections, laid out as the Google Chat web app does.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -51,9 +52,26 @@ impl Section {
     }
   }
 
-  /// Unpinned rows go A to Z in people sections and newest first elsewhere, as the web app lists them.
-  const fn alphabetical(&self) -> bool {
-    matches!(self, Self::Custom { .. } | Self::Dms)
+  /// Where `Settings::section_sort` keeps this section's order.
+  pub fn key(&self) -> String {
+    match self {
+      Self::Shortcuts => "shortcuts".into(),
+      Self::Custom { id, .. } => format!("custom:{id}"),
+      Self::Dms => "dms".into(),
+      Self::Apps => "apps".into(),
+      Self::Spaces => "spaces".into(),
+      Self::Meetings => "meetings".into(),
+    }
+  }
+
+  /// Unpinned rows go A to Z in people sections and newest first elsewhere, as the web app lists them, until the
+  /// user picks another order.
+  pub const fn default_sort(&self) -> Sort {
+    if matches!(self, Self::Custom { .. } | Self::Dms) {
+      Sort::Alphabetical
+    } else {
+      Sort::Recent
+    }
   }
 }
 
@@ -70,6 +88,58 @@ pub enum SidebarItem {
   Header(Section),
   Conv(Arc<Conv>),
   Toggle(Section),
+}
+
+/// What the Messages chips and the Rail select: the conversations listed beside the open one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pane {
+  All,
+  Unread,
+  /// People, group chats, spaces, or apps, wherever the sidebar places them.
+  Kind(Kind),
+  Section(Section),
+  /// Mentions or Starred: the list shows the shortcut's messages (`Store::shortcut`) instead of conversations.
+  Shortcut(Shortcut),
+}
+
+/// What a conversation is, for the kind filters of Home, the Messages chips, and the Rail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Kind {
+  /// One-to-one chats.
+  People,
+  /// Group chats without a space.
+  Groups,
+  Spaces,
+  Apps,
+}
+
+impl Kind {
+  pub const ALL: [Self; 4] = [Self::People, Self::Groups, Self::Spaces, Self::Apps];
+
+  pub const fn of(kind: GroupKind) -> Self {
+    match kind {
+      GroupKind::Dm => Self::People,
+      GroupKind::GroupDm => Self::Groups,
+      GroupKind::Space => Self::Spaces,
+      GroupKind::App => Self::Apps,
+    }
+  }
+
+  pub const fn title(self) -> &'static str {
+    match self {
+      Self::People => "People",
+      Self::Groups => "Groups",
+      Self::Spaces => "Spaces",
+      Self::Apps => "Apps",
+    }
+  }
+}
+
+/// One Rail entry: a pane and how many of its conversations are unread.
+#[derive(Clone)]
+pub struct Tab {
+  pub pane: Pane,
+  pub unread: usize,
 }
 
 /// Steps Back can go, at most.
@@ -119,6 +189,12 @@ pub struct Store {
   pub all: Vec<Arc<Conv>>,
   /// What Home shows: `all` narrowed by the Unread toggle and, best match first, by the search text.
   pub home: Vec<Arc<Conv>>,
+  /// What the Messages and Rail list shows: `all` narrowed by `pane`, the Unread toggle, and the search text,
+  /// pinned first.
+  pub list: Vec<Arc<Conv>>,
+  pub pane: Pane,
+  /// Every Rail entry: All, Mentions, Starred, the user's own sections, each kind the account has, then Meetings.
+  pub tabs: Vec<Tab>,
   pub sidebar: Vec<SidebarItem>,
   pub view: View,
   /// Views left by navigating, newest last: what Back returns to.
@@ -134,6 +210,9 @@ pub struct Store {
   /// What the Mentions or Starred view shows.
   pub shortcut: Option<ShortcutList>,
   pub unread_only: bool,
+  /// Copies of `Settings::list_sort` and `Settings::section_sort`, taken by `sync_sort`.
+  pub list_sort: Sort,
+  section_sort: std::collections::BTreeMap<String, Sort>,
   collapsed: HashSet<Section>,
   show_all: HashSet<Section>,
   histories: HashMap<GroupId, History>,
@@ -158,6 +237,9 @@ impl Store {
       groups: HashMap::new(),
       all: Vec::new(),
       home: Vec::new(),
+      list: Vec::new(),
+      pane: Pane::All,
+      tabs: Vec::new(),
       sidebar: vec![
         SidebarItem::Header(Section::Shortcuts),
         SidebarItem::Home,
@@ -173,6 +255,8 @@ impl Store {
       search: None,
       shortcut: None,
       unread_only: false,
+      list_sort: Sort::default(),
+      section_sort: std::collections::BTreeMap::new(),
       // The web app keeps Meetings folded at the bottom.
       collapsed: HashSet::from([Section::Meetings]),
       show_all: HashSet::new(),
@@ -512,21 +596,113 @@ impl Store {
     all.sort_by(|a, b| b.g.sort_time.cmp(&a.g.sort_time).then_with(|| a.g.name.cmp(&b.g.name)));
     self.all = all;
     self.rebuild_sidebar();
-    self.rebuild_home();
+    self.rebuild_lists();
   }
 
-  pub fn rebuild_home(&mut self) {
-    let shown = self.all.iter().filter(|conv| !self.unread_only || conv.g.unread).cloned();
+  /// Home, the Messages and Rail list, and the Rail tabs.
+  fn rebuild_lists(&mut self) {
     let query = self.query.trim();
-    self.home = if query.is_empty() {
-      shown.collect()
-    } else {
-      Fuzzy::new(query)
-        .rank(shown, |conv| conv.g.name.as_str())
-        .into_iter()
-        .map(|(_, conv)| conv)
-        .collect()
+    let rank = |shown: Vec<Arc<Conv>>| -> Vec<Arc<Conv>> {
+      if query.is_empty() {
+        shown
+      } else {
+        Fuzzy::new(query)
+          .rank(shown, |conv| conv.g.name.as_str())
+          .into_iter()
+          .map(|(_, conv)| conv)
+          .collect()
+      }
     };
+    let unread_only = self.unread_only;
+    let alphabetical = query.is_empty() && self.list_sort == Sort::Alphabetical;
+    let by_name = |list: &mut Vec<Arc<Conv>>| {
+      if alphabetical {
+        list.sort_by(|a, b| name_key(a).cmp(name_key(b)));
+      }
+    };
+    let pane = &self.pane;
+    let in_pane = |conv: &Arc<Conv>| match pane {
+      Pane::All => true,
+      Pane::Unread => conv.g.unread,
+      Pane::Kind(kind) => Kind::of(conv.g.kind) == *kind,
+      Pane::Section(section) => Section::of(&conv.g) == *section,
+      Pane::Shortcut(_) => false,
+    };
+    // Home takes the Unread and kind filters; sections and shortcuts belong to the Rail.
+    let in_home = |conv: &Arc<Conv>| match pane {
+      Pane::Unread | Pane::Kind(_) => in_pane(conv),
+      Pane::All | Pane::Section(_) | Pane::Shortcut(_) => true,
+    };
+    self.home = rank(
+      self
+        .all
+        .iter()
+        .filter(|conv| (!unread_only || conv.g.unread) && in_home(conv))
+        .cloned()
+        .collect(),
+    );
+    by_name(&mut self.home);
+
+    let mut list = rank(
+      self
+        .all
+        .iter()
+        .filter(|conv| (!unread_only || conv.g.unread) && in_pane(conv))
+        .cloned()
+        .collect(),
+    );
+    by_name(&mut list);
+    // Stable: pinned first, in the chosen order within each. Search results keep best match first.
+    if query.is_empty() {
+      list.sort_by_key(|conv| !conv.g.pinned);
+    }
+    self.list = list;
+
+    let mut by_section: HashMap<Section, usize> = HashMap::new();
+    let mut by_kind: HashMap<Kind, usize> = HashMap::new();
+    for conv in &self.all {
+      let unread = usize::from(conv.g.unread);
+      *by_section.entry(Section::of(&conv.g)).or_default() += unread;
+      *by_kind.entry(Kind::of(conv.g.kind)).or_default() += unread;
+    }
+    let mut tabs = vec![
+      Tab {
+        pane: Pane::All,
+        unread: by_kind.values().sum(),
+      },
+      Tab {
+        pane: Pane::Shortcut(Shortcut::Mentions),
+        unread: 0,
+      },
+      Tab {
+        pane: Pane::Shortcut(Shortcut::Starred),
+        unread: 0,
+      },
+    ];
+    // The user's own sections, then the kinds the account has, then Meetings.
+    let sections = ordered(by_section.keys());
+    let section_tab = |section: &Section| Tab {
+      unread: by_section[section],
+      pane: Pane::Section(section.clone()),
+    };
+    tabs.extend(
+      sections
+        .iter()
+        .filter(|section| matches!(section, Section::Custom { .. }))
+        .map(section_tab),
+    );
+    tabs.extend(
+      Kind::ALL
+        .into_iter()
+        .filter_map(|kind| by_kind.get(&kind).map(|&unread| Tab { pane: Pane::Kind(kind), unread })),
+    );
+    tabs.extend(
+      sections
+        .iter()
+        .filter(|section| **section == Section::Meetings)
+        .map(section_tab),
+    );
+    self.tabs = tabs;
   }
 
   pub fn rebuild_sidebar(&mut self) {
@@ -540,15 +716,7 @@ impl Store {
     for conv in &self.all {
       by_section.entry(Section::of(&conv.g)).or_default().push(conv);
     }
-    let mut custom: Vec<Section> = by_section
-      .keys()
-      .filter(|section| matches!(section, Section::Custom { .. }))
-      .cloned()
-      .collect();
-    custom.sort_by_key(|section| section.title().to_lowercase());
-    let order = custom
-      .into_iter()
-      .chain([Section::Dms, Section::Apps, Section::Spaces, Section::Meetings]);
+    let order = ordered(by_section.keys());
     for section in order {
       // `all` is newest first, so each section starts in that order.
       let Some(members) = by_section.remove(&section) else {
@@ -561,10 +729,9 @@ impl Store {
       let (mut pinned, mut unpinned): (Vec<&Arc<Conv>>, Vec<&Arc<Conv>>) =
         members.into_iter().partition(|c| c.g.pinned);
       // "Group: Ana" sorts under A, as in the web app.
-      let key = |c: &Arc<Conv>| c.lower.trim_start_matches("group: ").to_string();
-      pinned.sort_by_key(|c| key(c));
-      if section.alphabetical() {
-        unpinned.sort_by_key(|c| key(c));
+      pinned.sort_by(|a, b| name_key(a).cmp(name_key(b)));
+      if self.section_sort(&section) == Sort::Alphabetical {
+        unpinned.sort_by(|a, b| name_key(a).cmp(name_key(b)));
       }
       items.extend(pinned.into_iter().map(|c| SidebarItem::Conv(c.clone())));
       let shown = if self.show_all.contains(&section) {
@@ -598,7 +765,7 @@ impl Store {
 
   pub fn set_unread_only(&mut self, on: bool, cx: &mut Context<Self>) {
     self.unread_only = on;
-    self.rebuild_home();
+    self.rebuild_lists();
     cx.notify();
   }
 
@@ -611,11 +778,123 @@ impl Store {
     if self.search.as_ref().is_some_and(|search| search.query != self.query.trim()) {
       self.search = None;
     }
-    self.rebuild_home();
-    if !self.query.is_empty() && self.view != View::Home {
+    self.rebuild_lists();
+    // Layouts with a list beside the conversation filter it in place; the others filter Home.
+    if !self.query.is_empty() && self.view != View::Home && !cx.global::<Settings>().layout.keeps_list() {
       self.go_home(cx);
     }
     cx.notify();
+  }
+
+  /// Picks what the Messages and Rail list shows. Mentions and Starred load their messages into the list and leave
+  /// the open conversation alone.
+  pub fn set_pane(&mut self, pane: Pane, cx: &mut Context<Self>) {
+    if pane == self.pane {
+      return;
+    }
+    self.pane = pane;
+    self.sync_pane(cx);
+    self.rebuild_lists();
+    cx.notify();
+  }
+
+  /// Loads the shortcut messages the Rail list shows when they are not the ones in `shortcut`, as after another
+  /// layout used it. Call when the pane or the layout changes.
+  pub fn sync_pane(&mut self, cx: &App) {
+    let Pane::Shortcut(shortcut) = self.pane else {
+      self.drop_shortcut(cx);
+      return;
+    };
+    if cx.global::<Settings>().layout == Layout::Rail
+      && self.shortcut.as_ref().is_none_or(|list| list.shortcut != shortcut)
+    {
+      self.load_shortcut(shortcut);
+    }
+  }
+
+  /// Forgets the shortcut messages unless something on screen shows them: the Mentions or Starred view, or the
+  /// Rail list.
+  fn drop_shortcut(&mut self, cx: &App) {
+    let in_rail = matches!(self.pane, Pane::Shortcut(_)) && cx.global::<Settings>().layout == Layout::Rail;
+    if !in_rail && !matches!(self.view, View::Shortcut(_)) {
+      self.shortcut = None;
+    }
+  }
+
+  /// Conversations in the order the layout lists them.
+  fn order(&self, layout: Layout) -> Vec<&Arc<Conv>> {
+    match layout {
+      Layout::GoogleChat => self
+        .sidebar
+        .iter()
+        .filter_map(|item| match item {
+          SidebarItem::Conv(conv) => Some(conv),
+          _ => None,
+        })
+        .collect(),
+      Layout::Messages | Layout::Rail => self.list.iter().collect(),
+    }
+  }
+
+  /// The order of a Google Chat sidebar section: the user's pick, or the section's default.
+  pub fn section_sort(&self, section: &Section) -> Sort {
+    self
+      .section_sort
+      .get(&section.key())
+      .copied()
+      .unwrap_or_else(|| section.default_sort())
+  }
+
+  /// Takes the sort orders from the settings, rebuilding the lists when they changed. Call at start and whenever
+  /// the settings change.
+  pub fn sync_sort(&mut self, cx: &mut Context<Self>) {
+    let settings = cx.global::<Settings>();
+    if settings.list_sort == self.list_sort && settings.section_sort == self.section_sort {
+      return;
+    }
+    self.list_sort = settings.list_sort;
+    self.section_sort = settings.section_sort.clone();
+    self.rebuild_sidebar();
+    self.rebuild_lists();
+    cx.notify();
+  }
+
+  /// Opens the next (or previous) conversation in the list the layout shows, after the open one. With none open,
+  /// the first (or last).
+  pub fn step_conversation(&mut self, forward: bool, window: &mut Window, cx: &mut Context<Self>) {
+    let order = self.order(cx.global::<Settings>().layout);
+    let Some(last) = order.len().checked_sub(1) else {
+      return;
+    };
+    let current = match &self.view {
+      View::Conversation(id) => order.iter().position(|conv| &conv.g.id == id),
+      View::Home | View::Shortcut(_) => None,
+    };
+    let next = match (current, forward) {
+      (Some(ix), true) => (ix + 1).min(last),
+      (Some(ix), false) => ix.saturating_sub(1),
+      (None, true) => 0,
+      (None, false) => last,
+    };
+    let id = order[next].g.id.clone();
+    self.open(id, window, cx);
+  }
+
+  /// Opens the newest unread conversation other than the open one.
+  pub fn open_next_unread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let open = match &self.view {
+      View::Conversation(id) => Some(id),
+      View::Home | View::Shortcut(_) => None,
+    };
+    let Some(id) = self
+      .all
+      .iter()
+      .find(|conv| conv.g.unread && Some(&conv.g.id) != open)
+      .map(|conv| conv.g.id.clone())
+    else {
+      return;
+    };
+    self.open(id, window, cx);
   }
 
   // Navigation.
@@ -663,7 +942,7 @@ impl Store {
     if !self.query.is_empty() {
       self.query.clear();
       self.search = None;
-      self.rebuild_home();
+      self.rebuild_lists();
     }
     self.recent.retain(|r| r != &id);
     self.recent.insert(0, id.clone());
@@ -674,7 +953,7 @@ impl Store {
     let (core, images, me) = (self.core.clone(), self.images.clone(), self.me.clone());
     self.conv = Some(cx.new(|cx| ConversationView::new(store, core, images, group, me, history, window, cx)));
     self.set_view(View::Conversation(id.clone()));
-    self.shortcut = None;
+    self.drop_shortcut(cx);
     self.core.send(Command::Open(id.clone()));
     self.clear_notifications(&id);
     self.core.send(Command::MarkRead(id));
@@ -750,7 +1029,7 @@ impl Store {
     self.set_view(View::Home);
     // Dropping the view tells the core we stopped typing.
     self.conv = None;
-    self.shortcut = None;
+    self.drop_shortcut(cx);
     cx.notify();
   }
 
@@ -761,6 +1040,12 @@ impl Store {
     }
     self.set_view(View::Shortcut(shortcut));
     self.conv = None;
+    self.load_shortcut(shortcut);
+    cx.notify();
+  }
+
+  /// Asks for the newest messages of a shortcut, replacing the ones held.
+  fn load_shortcut(&mut self, shortcut: Shortcut) {
     self.shortcut = Some(ShortcutList {
       shortcut,
       hits: None,
@@ -768,7 +1053,6 @@ impl Store {
       loading_more: false,
     });
     self.core.send(Command::LoadShortcut { shortcut, cursor: None });
-    cx.notify();
   }
 
   /// Asks for the next, older page of the shortcut on screen, unless one is on its way or none is left.
@@ -813,7 +1097,7 @@ impl Store {
       let (core, images, me) = (self.core.clone(), self.images.clone(), self.me.clone());
       self.conv = Some(cx.new(|cx| ConversationView::new(store, core, images, group, me, None, window, cx)));
       self.set_view(View::Conversation(hit.group.clone()));
-      self.shortcut = None;
+      self.drop_shortcut(cx);
     }
     self.core.send(Command::Jump {
       group: hit.group.clone(),
@@ -824,14 +1108,37 @@ impl Store {
   }
 }
 
+/// A conversation's name for A to Z order: "Group: Ana" sorts under A, as in the web app.
+fn name_key(conv: &Conv) -> &str {
+  conv.lower.trim_start_matches("group: ")
+}
+
 fn conv(group: Group) -> Conv {
   let lower = group.name.to_lowercase();
   Conv { g: group, lower }
 }
 
+/// Sections in sidebar order: the user's own A to Z, then the fixed ones. Only those in `present`.
+fn ordered<'a>(present: impl Iterator<Item = &'a Section>) -> Vec<Section> {
+  let present: Vec<&Section> = present.collect();
+  let mut order: Vec<Section> = present
+    .iter()
+    .filter(|section| matches!(section, Section::Custom { .. }))
+    .map(|section| (*section).clone())
+    .collect();
+  order.sort_by_key(|section| section.title().to_lowercase());
+  order.extend(
+    [Section::Dms, Section::Apps, Section::Spaces, Section::Meetings]
+      .into_iter()
+      .filter(|section| present.contains(&section)),
+  );
+  order
+}
+
 #[cfg(test)]
 mod tests {
   use super::Section;
+  use crate::settings::Sort;
   use gchat_core::{Group, GroupId, GroupKind, Notify, Placement};
 
   fn group(kind: GroupKind, placement: Placement) -> Group {
@@ -871,11 +1178,14 @@ mod tests {
   }
 
   #[test]
-  fn people_sections_sort_alphabetically() {
-    assert!(Section::Dms.alphabetical());
-    assert!(Section::Custom { id: "s".into(), name: "Shortcut".into() }.alphabetical());
-    assert!(!Section::Spaces.alphabetical());
-    assert!(!Section::Meetings.alphabetical());
+  fn people_sections_sort_alphabetically_by_default() {
+    assert_eq!(Section::Dms.default_sort(), Sort::Alphabetical);
+    assert_eq!(
+      Section::Custom { id: "s".into(), name: "Shortcut".into() }.default_sort(),
+      Sort::Alphabetical
+    );
+    assert_eq!(Section::Spaces.default_sort(), Sort::Recent);
+    assert_eq!(Section::Meetings.default_sort(), Sort::Recent);
     assert_eq!(Section::Dms.title(), "Direct messages");
   }
 }

@@ -13,7 +13,8 @@ use gpui_kit::*;
 use crate::notify;
 use crate::permissions::{self, Media, Status};
 use crate::settings::{
-  self, ActivityStatus, Appearance, DEFAULT_REWRITE_INSTRUCTION, Density, McpState, RewriteTool, Settings, Sound,
+  self, ActivityStatus, Appearance, DEFAULT_REWRITE_INSTRUCTION, Density, Layout, McpState, RewriteTool, Settings,
+  SidebarMode, SidebarSide, Sound,
 };
 use crate::status::{self, DndState};
 use crate::theme::{
@@ -297,12 +298,33 @@ impl SettingsView {
   }
 
   fn appearance_picker(current: Appearance) -> Div {
+    Self::segmented(
+      &[
+        ("System", Appearance::System),
+        ("Light", Appearance::Light),
+        ("Dark", Appearance::Dark),
+      ],
+      current,
+      |settings, value| settings.appearance = value,
+    )
+  }
+
+  fn side_picker(current: SidebarSide) -> Div {
+    Self::segmented(
+      &[("Left", SidebarSide::Left), ("Right", SidebarSide::Right)],
+      current,
+      |settings, value| settings.sidebar_side = value,
+    )
+  }
+
+  /// A row of short choices, one selected: picking one writes it with `set`.
+  fn segmented<T: Copy + PartialEq + 'static>(
+    choices: &[(&'static str, T)],
+    current: T,
+    set: fn(&mut Settings, T),
+  ) -> Div {
     let mut picker = h_flex().flex_shrink_0().p(px(3.)).gap_1().rounded(px(9.)).bg(control_fill());
-    for (label, value) in [
-      ("System", Appearance::System),
-      ("Light", Appearance::Light),
-      ("Dark", Appearance::Dark),
-    ] {
+    for &(label, value) in choices {
       let selected = value == current;
       picker = picker.child(
         div()
@@ -320,7 +342,7 @@ impl SettingsView {
             transparent_black().into()
           })
           .when(selected, |option| option.bg(rgb(ACCENT_BG)))
-          .on_click(move |_, _, cx| Settings::update(cx, |settings| settings.appearance = value))
+          .on_click(move |_, _, cx| Settings::update(cx, |settings| set(settings, value)))
           .child(label),
       );
     }
@@ -428,6 +450,108 @@ impl SettingsView {
           .items_center()
           .child(radio)
           .child(div().text_size(px(13.)).child(label)),
+      )
+  }
+
+  /// A layout choice: a schematic of the window arrangement over its radio button.
+  fn layout_option(value: Layout, current: Layout) -> Stateful<Div> {
+    let selected = value == current;
+    let id = match value {
+      Layout::GoogleChat => "layout-google-chat",
+      Layout::Messages => "layout-messages",
+      Layout::Rail => "layout-rail",
+    };
+    let line = |width: f32, strong: bool| {
+      div()
+        .h(px(5.))
+        .w(px(width))
+        .rounded_full()
+        .flex_shrink_0()
+        .bg(rgb(if strong { TEXT } else { MUTED }))
+        .opacity(if strong { 0.85 } else { 0.4 })
+    };
+    // One list row: an avatar dot and two text lines.
+    let row = || {
+      h_flex()
+        .gap_1()
+        .items_center()
+        .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(rgb(MUTED)).opacity(0.5))
+        .child(v_flex().gap(px(2.)).child(line(22., true)).child(line(14., false)))
+    };
+    let sidebar = || {
+      v_flex()
+        .w(px(36.))
+        .flex_shrink_0()
+        .gap_1p5()
+        .child(line(30., true))
+        .child(line(22., false))
+        .child(line(28., false))
+        .child(line(20., false))
+    };
+    let list = || {
+      v_flex()
+        .w(px(40.))
+        .flex_shrink_0()
+        .gap_1()
+        .child(row())
+        .child(row())
+        .child(row())
+    };
+    let rail = || {
+      v_flex()
+        .w(px(10.))
+        .flex_shrink_0()
+        .gap_1p5()
+        .items_center()
+        .children((0..4).map(|_| div().size(px(7.)).rounded(px(2.)).bg(rgb(MUTED)).opacity(0.5)))
+    };
+    let panel = || {
+      v_flex()
+        .flex_1()
+        .h_full()
+        .p_1p5()
+        .gap_1p5()
+        .rounded(px(4.))
+        .bg(rgb(BUBBLE))
+        .child(line(30., true))
+        .child(line(46., false))
+        .child(line(38., false))
+    };
+    let frame = h_flex()
+      .w(px(150.))
+      .h(px(92.))
+      .p_2()
+      .gap_1p5()
+      .rounded(px(10.))
+      .border_2()
+      .border_color(rgb(if selected { ACCENT } else { BORDER }))
+      .bg(rgb(BG));
+    let drawing = match value {
+      Layout::GoogleChat => frame.child(sidebar()).child(panel()),
+      Layout::Messages => frame.child(list()).child(panel()),
+      Layout::Rail => frame.child(rail()).child(list()).child(panel()),
+    };
+    let radio = div()
+      .size(px(16.))
+      .flex()
+      .items_center()
+      .justify_center()
+      .rounded_full()
+      .border_2()
+      .border_color(rgb(if selected { ACCENT } else { MUTED }))
+      .when(selected, |radio| radio.child(div().size(px(8.)).rounded_full().bg(rgb(ACCENT))));
+    v_flex()
+      .id(id)
+      .gap_2()
+      .cursor_pointer()
+      .on_click(move |_, _, cx| Settings::update(cx, |settings| settings.layout = value))
+      .child(drawing)
+      .child(
+        h_flex()
+          .gap_2()
+          .items_center()
+          .child(radio)
+          .child(div().text_size(px(13.)).child(value.label())),
       )
   }
 
@@ -539,6 +663,44 @@ impl SettingsView {
             .child(Self::density_option(Density::Comfortable, settings.density))
             .child(Self::density_option(Density::Compact, settings.density)),
         ),
+      ))
+      .child(Self::group(
+        "Layout",
+        Self::card()
+          // Rows of two: a wrapping row is measured one line tall inside the scrolling pane, which cut the
+          // later lines and the switches below them off.
+          .child(
+            v_flex().gap_4().py_4().children(Layout::ALL.chunks(2).map(|pair| {
+              h_flex()
+                .gap_6()
+                .children(pair.iter().map(|value| Self::layout_option(*value, settings.layout)))
+            })),
+          )
+          .child(
+            Self::row(
+              "Auto-hide sidebar",
+              "Keep the sidebar closed until the pointer reaches the window's edge. Right-clicking the top bar's \
+               sidebar button does the same.",
+              false,
+            )
+            .child(Self::toggle("sidebar-autohide", settings.sidebar == SidebarMode::AutoHide).on_click(|_, _, cx| {
+              Settings::update(cx, |settings| {
+                settings.sidebar = if settings.sidebar == SidebarMode::AutoHide {
+                  SidebarMode::Open
+                } else {
+                  SidebarMode::AutoHide
+                };
+              });
+            })),
+          )
+          .child(
+            Self::row(
+              "Sidebar position",
+              "Which side of the window the sidebar, or the list, sits on. Drag its inner edge to resize it.",
+              false,
+            )
+            .child(Self::side_picker(settings.sidebar_side)),
+          ),
       ))
   }
 

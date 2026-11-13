@@ -29,6 +29,7 @@
 
 mod call;
 mod completion;
+mod conv_list;
 mod conversation;
 mod emoji_picker;
 mod home;
@@ -38,6 +39,7 @@ mod message;
 mod new_chat;
 mod notify;
 mod permissions;
+mod rail;
 mod rewrite;
 mod root;
 mod screen;
@@ -61,12 +63,14 @@ mod welcome;
 use gchat_core::Core;
 use gpui_kit::assets::Assets;
 use gpui_kit::component::TitleBar;
+use gpui_kit::component::input::Escape;
 use gpui_kit::*;
 
 use crate::images::Images;
 use crate::root::{
-  FindInChat, FindNext, FindPrevious, GoBack, GoForward, GoHome, Hide, HideOthers, Minimize, OpenSettings,
-  OpenSwitcher, OpenThemePicker, Quit, RewriteDraft, RootView, ShowAll, TOP_BAR_HEIGHT, Zoom, menus,
+  FindInChat, FindNext, FindPrevious, GoBack, GoForward, GoHome, Hide, HideOthers, Minimize, NextConversation,
+  NextUnread, OpenSettings, OpenSwitcher, OpenThemePicker, PreviousConversation, Quit, RewriteDraft, RootView, ShowAll,
+  TOP_BAR_HEIGHT, ToggleSidebar, Zoom, menus,
 };
 use crate::settings::Settings;
 use crate::store::Store;
@@ -129,6 +133,23 @@ fn main() {
       KeyBinding::new("cmd-]", GoForward, None),
       KeyBinding::new("cmd-[", GoBack, Some("Input")),
       KeyBinding::new("cmd-]", GoForward, Some("Input")),
+      // Between conversations, in the order the layout lists them. The Go menu shows the first key of each.
+      KeyBinding::new("alt-cmd-down", NextConversation, None),
+      KeyBinding::new("alt-cmd-up", PreviousConversation, None),
+      KeyBinding::new("ctrl-tab", NextConversation, None),
+      KeyBinding::new("ctrl-shift-tab", PreviousConversation, None),
+      KeyBinding::new("shift-alt-cmd-down", NextUnread, None),
+      KeyBinding::new("ctrl-cmd-s", ToggleSidebar, None),
+      // The kit's text field takes alt-cmd-up and alt-cmd-down to add a cursor: binding them again in its "Input"
+      // context, after `init`, takes them back, and the other conversation keys work in a composer too.
+      KeyBinding::new("alt-cmd-down", NextConversation, Some("Input")),
+      KeyBinding::new("alt-cmd-up", PreviousConversation, Some("Input")),
+      KeyBinding::new("ctrl-tab", NextConversation, Some("Input")),
+      KeyBinding::new("ctrl-shift-tab", PreviousConversation, Some("Input")),
+      KeyBinding::new("shift-alt-cmd-down", NextUnread, Some("Input")),
+      // The auto-hide sidebar's overlay is open (the root takes the "Overlay" context): Escape closes it even when
+      // no text field has the keyboard.
+      KeyBinding::new("escape", Escape, Some("Overlay")),
       KeyBinding::new("cmd-,", OpenSettings, None),
       KeyBinding::new("cmd-shift-r", RewriteDraft, None),
       KeyBinding::new("cmd-f", FindInChat, None),

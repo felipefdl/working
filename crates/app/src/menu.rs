@@ -5,7 +5,9 @@ use std::rc::Rc;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::theme::{BORDER, POPOVER, ROW_HOVER, TEXT, rgb};
+use crate::settings::Sort;
+use crate::theme::{ACCENT, BORDER, POPOVER, ROW_HOVER, TEXT, rgb};
+use crate::ui::{Icon, icon};
 
 const WIDTH: f32 = 200.0;
 const ITEM_HEIGHT: f32 = 30.0;
@@ -15,12 +17,49 @@ const CELL: f32 = 36.0;
 pub struct MenuItem {
   label: SharedString,
   run: Rc<dyn Fn(&mut Window, &mut App)>,
+  icon: Option<Icon>,
+  checked: bool,
 }
 
 impl MenuItem {
   pub fn new(label: impl Into<SharedString>, run: impl Fn(&mut Window, &mut App) + 'static) -> Self {
-    Self { label: label.into(), run: Rc::new(run) }
+    Self {
+      label: label.into(),
+      run: Rc::new(run),
+      icon: None,
+      checked: false,
+    }
   }
+
+  /// A leading icon.
+  pub const fn icon(mut self, icon: Icon) -> Self {
+    self.icon = Some(icon);
+    self
+  }
+
+  /// A trailing check: this choice is the one in use.
+  pub const fn checked(mut self, checked: bool) -> Self {
+    self.checked = checked;
+    self
+  }
+}
+
+/// The two choices of a list's sort menu, the one in use checked. `set` receives the pick.
+pub fn sort_items(current: Sort, set: impl Fn(Sort, &mut App) + 'static) -> Vec<MenuItem> {
+  let set = Rc::new(set);
+  Sort::ALL
+    .into_iter()
+    .map(|sort| {
+      let set = set.clone();
+      let glyph = match sort {
+        Sort::Recent => Icon::History,
+        Sort::Alphabetical => Icon::ArrowDownAZ,
+      };
+      MenuItem::new(sort.label(), move |_, cx| set(sort, cx))
+        .icon(glyph)
+        .checked(sort == current)
+    })
+    .collect()
 }
 
 struct Shown {
@@ -149,12 +188,23 @@ impl Render for ContextMenu {
         .text_color(rgb(TEXT))
         .cursor_pointer()
         .hover(|s| s.bg(rgb(ROW_HOVER)))
-        .on_click(cx.listener(move |this, _, window, cx| this.pick(ix, window, cx)))
-        .child(item.label.clone());
+        .on_click(cx.listener(move |this, _, window, cx| this.pick(ix, window, cx)));
       panel = panel.child(if shown.strip {
-        cell.size(px(CELL)).justify_center().text_size(px(19.))
+        cell
+          .size(px(CELL))
+          .justify_center()
+          .text_size(px(19.))
+          .child(item.label.clone())
       } else {
-        cell.h(px(ITEM_HEIGHT)).mx_1().px_3().text_size(px(13.))
+        cell
+          .h(px(ITEM_HEIGHT))
+          .mx_1()
+          .px_3()
+          .gap_2()
+          .text_size(px(13.))
+          .when_some(item.icon, |cell, glyph| cell.child(icon(glyph, 16., TEXT)))
+          .child(div().flex_1().child(item.label.clone()))
+          .when(item.checked, |cell| cell.child(icon(Icon::Check, 16., ACCENT)))
       });
     }
 
