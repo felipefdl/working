@@ -85,6 +85,8 @@ struct Context {
   engine: Arc<Engine>,
   token: String,
   allow_send: bool,
+  /// What agents read since the last send; every client shares it, as the server keeps no sessions.
+  reads: tools::Reads,
 }
 
 /// The running server.
@@ -107,6 +109,7 @@ pub(crate) async fn serve(engine: Arc<Engine>, config: McpConfig) -> std::io::Re
     engine,
     token: config.token,
     allow_send: config.allow_send,
+    reads: tools::Reads::default(),
   });
   let router = Router::new().fallback(handle).with_state(context);
   let (stop, stopped) = oneshot::channel::<()>();
@@ -354,7 +357,7 @@ async fn dispatch(context: &Context, method: &str, params: &Value) -> Result<Val
       let name = params["name"].as_str().unwrap_or_default();
       let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
       let unknown = || Refusal::new(StatusCode::OK, INVALID_PARAMS, format!("Unknown tool: {name}"));
-      tools::call(&context.engine, context.allow_send, name, arguments)
+      tools::call(&context.engine, &context.reads, context.allow_send, name, arguments)
         .await
         .ok_or_else(unknown)
     },

@@ -10,4 +10,4 @@
 - The `API_KEY` in `http.rs` is the public Chat web app key. Keep it. Attachment downloads omit `Origin` and `Referer`: with them, Google answers 204.
 - Timestamps are `Micros` (microseconds since Unix epoch), as Chat reports them.
 - Cache writes go through the atomic temp-file rename in `cache.rs`.
-- MCP listens on loopback only. The secret is `~/.config/working/mcp-token`. Tools stay few and named for a person request; a `conversation` argument accepts a name or an id. `WORKING_READONLY=1` still refuses sends even when `allow_send` is true.
+- MCP listens on loopback only. The secret is `~/.config/working/mcp-token`. Tools stay few and named for a person request; a `conversation` argument accepts a name or an id. `WORKING_READONLY=1` still refuses sends even when `allow_send` is true. `send_message` goes only to a conversation read with `read_conversation` since the last send (`Reads`, shared by every client because the server keeps no sessions).

@@ -66,7 +66,7 @@ Open the app and sign in with Google on the welcome screen. Settings, the sessio
 
 ## MCP server
 
-Turn it on in Settings. It listens on `http://127.0.0.1:3021/mcp` and needs the token in `~/.config/working/mcp-token`. Agents can list and search conversations and read messages. Sending is a separate switch.
+Turn it on in Settings. It listens on `http://127.0.0.1:3021/mcp` and needs the token in `~/.config/working/mcp-token`. Agents can list and search conversations, read messages, and see which conversations wait on your reply, so "answer back with that" finds the right person. Sending is a separate switch, and an agent has to read a conversation before it sends there.
 
 ## Build from source
 

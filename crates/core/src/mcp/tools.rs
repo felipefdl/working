@@ -16,9 +16,10 @@
 )]
 
 use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use serde::de::{DeserializeOwned, Error as _};
@@ -28,17 +29,48 @@ use tokio::task::JoinSet;
 
 use crate::engine::{Engine, Page};
 use crate::fuzzy::Fuzzy;
-use crate::model::{AttachmentKind, Group, GroupId, GroupKind, Message, Micros, Notify};
+use crate::model::{AttachmentKind, Group, GroupId, GroupKind, Message, Micros, Notify, SpanKind};
 
 /// System prompt for MCP clients: how to name conversations and that reads do not mark messages read.
 pub const INSTRUCTIONS: &str = "Google Chat of the person signed in to the Working app on this Mac. \
-Catch up with inbox. Find a chat with find_conversations, read it with read_conversation, and find a word or \
+Catch up with inbox. To answer someone the user did not name, start with recent_activity. Find a chat with find_conversations, read it with read_conversation, and find a word or \
 topic across every chat with search_messages. Wherever a `conversation` is asked for, a name (\"Jordan Park\"), \
 part of one, or an id (dm/…, space/…) works. Times are this Mac's local time. Reading changes nothing: \
 messages stay unread.";
 
 /// Longest answer of a tool, in bytes: about 12,000 tokens.
 const MAX_ANSWER: usize = 48_000;
+
+const MINUTE: Micros = 60_000_000;
+/// How far back `recent_activity` looks.
+const RECENT: Micros = 24 * 60 * MINUTE;
+/// A space counts the people who wrote this recently as talking.
+const TALKING: Micros = 2 * 60 * MINUTE;
+/// Conversations `recent_activity` loads, most recently active first.
+const SCANNED: usize = 25;
+/// Messages `recent_activity` shows of each conversation or thread.
+const SHOWN_EACH: usize = 6;
+/// One-line spaces `recent_activity` lists at most.
+const STAMPS: usize = 8;
+
+/// Conversations read with `read_conversation` since the last send. `send_message` writes only to one of them, so
+/// the model has the conversation in front of it when it writes the message.
+#[derive(Default)]
+pub struct Reads(Mutex<HashSet<GroupId>>);
+
+impl Reads {
+  fn mark(&self, group: &GroupId) {
+    self.0.lock().unwrap_or_else(PoisonError::into_inner).insert(group.clone());
+  }
+
+  fn has(&self, group: &GroupId) -> bool {
+    self.0.lock().unwrap_or_else(PoisonError::into_inner).contains(group)
+  }
+
+  fn clear(&self) {
+    self.0.lock().unwrap_or_else(PoisonError::into_inner).clear();
+  }
+}
 
 /// Tool descriptors. `send_message` is included only when `allow_send` is true.
 pub fn list(allow_send: bool) -> Vec<Value> {
@@ -57,6 +89,30 @@ pub fn list(allow_send: bool) -> Vec<Value> {
           "limit": { "type": "integer", "description": "Most conversations to show. Default 10, at most 25." },
           "messages_each": { "type": "integer", "description": "Most messages to show per conversation. Default 5, at most 20." },
           "include_quiet": { "type": "boolean", "description": "Also show unread conversations that are muted or notify for mentions only. Default false." }
+        },
+        "additionalProperties": false
+      },
+      "annotations": read_only,
+    }),
+    json!({
+      "name": "recent_activity",
+      "title": "Where the user is active",
+      "description": "Where the user is active in Google Chat in the last 24 hours: every conversation waiting on \
+    a reply from them (a direct message or group chat whose last message is someone else's, or a mention in a space \
+    they have not answered), then the ones they recently wrote or reacted in, each with its last few messages and \
+    the id and thread send_message takes. Busy spaces that do not involve the user are one line each, without \
+    messages. Call this first when the user says to reply, answer, or tell someone without naming the conversation \
+    (\"answer back with that\", \"send them the numbers\", \"tell them yes\"), and act as if you were in the chat with \
+    them: send to the conversation whose question the request answers, not the newest one, without asking. Ask only \
+    when the request fits more than one conversation. Then read that conversation with read_conversation and write \
+    the reply to fit it. Write the message in the language and tone that conversation already has with that person, \
+    whatever language the user wrote to you in, and pick up where it left off, the way a person in the middle of \
+    that chat would. Keep the user's meaning and add nothing they did not say: never add facts, numbers, or \
+    promises the user did not give.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "limit": { "type": "integer", "description": "Most conversations and threads to show in full. Default 10, at most 25." }
         },
         "additionalProperties": false
       },
@@ -87,15 +143,16 @@ pub fn list(allow_send: bool) -> Vec<Value> {
       "description": "Read the messages of one conversation, oldest first, ending at the latest message. \
     Replies in a thread are indented under the message they answer, and each top-level message ends with #id \
     (what send_message takes as `thread`). To go further back, pass the `before` value given at the end of the \
-    previous answer. To see what surrounds a search result, pass its `around` value. To find a word or topic, \
-    call search_messages instead of paging back.",
+    previous answer. To see what surrounds a search result, pass its `around` value. To read only one thread of a \
+    space, pass its `thread`. To find a word or topic, call search_messages instead of paging back.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "conversation": { "type": "string", "description": "The conversation's id (dm/… or space/…) or name. Part of a name works when it points at one conversation." },
           "limit": { "type": "integer", "description": "About how many messages. Default 30, at most 100." },
           "before": { "type": "string", "description": "Read the messages before this point: the value a previous answer gave, or a local date or time such as 2026-11-01 or 2026-11-01T14:30." },
-          "around": { "type": "string", "description": "Read the messages around this point: the value a search_messages result gave." }
+          "around": { "type": "string", "description": "Read the messages around this point: the value a search_messages result gave." },
+          "thread": { "type": "string", "description": "Read only this thread of a space: the #id that ends its top-level message, or the thread recent_activity gives. Read the thread you are about to answer." }
         },
         "required": ["conversation"],
         "additionalProperties": false
@@ -130,7 +187,8 @@ pub fn list(allow_send: bool) -> Vec<Value> {
       "description": "Send a message as the user to one conversation, with text, files from this Mac, or both. \
 It is posted for real and the people there see it at once: send only what the user asked for. `conversation` \
 has to be an id or a full name; with anything less nothing is sent and the matching conversations are listed. \
-With `thread` the message is a reply inside that thread of a space; without it, it goes to the main conversation.",
+With `thread` the message is a reply inside that thread of a space; without it, it goes to the main conversation. \
+Read the conversation with read_conversation first: a send to a conversation not read since the last send is refused.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -149,13 +207,20 @@ With `thread` the message is a reply inside that thread of a space; without it, 
 }
 
 /// Runs a tool. `None` when there is no tool of that name.
-pub async fn call(engine: &Arc<Engine>, allow_send: bool, name: &str, arguments: Value) -> Option<Value> {
+pub async fn call(
+  engine: &Arc<Engine>,
+  reads: &Reads,
+  allow_send: bool,
+  name: &str,
+  arguments: Value,
+) -> Option<Value> {
   let outcome = match name {
     "inbox" => inbox(engine, arguments).await,
+    "recent_activity" => recent_activity(engine, arguments).await,
     "find_conversations" => find_conversations(engine, arguments),
-    "read_conversation" => read_conversation(engine, arguments).await,
+    "read_conversation" => read_conversation(engine, reads, arguments).await,
     "search_messages" => search_messages(engine, arguments).await,
-    "send_message" if allow_send => send_message(engine, arguments).await,
+    "send_message" if allow_send => send_message(engine, reads, arguments).await,
     "send_message" => Err(
       "Sending is turned off. The user can allow it in Working: Settings, Agents, \"Let agents send messages\".".into(),
     ),
@@ -232,6 +297,13 @@ struct InboxArgs {
   include_quiet: bool,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityArgs {
+  #[serde(default, deserialize_with = "loose_count")]
+  limit: Option<usize>,
+}
+
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum Kind {
@@ -266,6 +338,8 @@ struct ReadArgs {
   before: Option<String>,
   #[serde(default, deserialize_with = "loose_text")]
   around: Option<String>,
+  #[serde(default, deserialize_with = "loose_text")]
+  thread: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -663,6 +737,287 @@ async fn inbox(engine: &Arc<Engine>, arguments: Value) -> Result<String, String>
   Ok(keep_end(out))
 }
 
+/// A conversation, or a thread of a space, that `recent_activity` shows in full.
+struct Involved<'a> {
+  group: &'a Group,
+  /// The thread to answer in; `None` for the main conversation.
+  thread: Option<String>,
+  /// Someone waits on a reply from the user.
+  waiting: bool,
+  /// When it began waiting, or when the user last wrote or reacted.
+  time: Micros,
+  /// Why it is shown: `Riley Brooks wrote 4 min ago`.
+  why: String,
+  messages: Vec<&'a Arc<Message>>,
+}
+
+/// How long ago, the way a person says it.
+fn ago(time: Micros, now: Micros) -> String {
+  match (now - time) / MINUTE {
+    ..1 => "just now".into(),
+    minutes @ ..60 => format!("{minutes} min ago"),
+    minutes @ ..1440 => format!("{} h ago", minutes / 60),
+    _ => format!("on {}", stamp(time)),
+  }
+}
+
+fn sender(message: &Message) -> &str {
+  if message.sender_name.is_empty() {
+    "Someone"
+  } else {
+    &message.sender_name
+  }
+}
+
+fn mentions(message: &Message, me: &str) -> bool {
+  message.spans.iter().any(|span| match &span.kind {
+    SpanKind::Mention(user) => user == me,
+    SpanKind::MentionAll => true,
+    _ => false,
+  })
+}
+
+fn reacted(message: &Message) -> bool {
+  message.reactions.iter().any(|reaction| reaction.mine)
+}
+
+/// The first message of a thread and its latest replies, up to `SHOWN_EACH`.
+fn thread_view<'a>(messages: &[&'a Arc<Message>]) -> Vec<&'a Arc<Message>> {
+  match messages {
+    [] => Vec::new(),
+    [first, rest @ ..] => {
+      let tail = &rest[rest.len().saturating_sub(SHOWN_EACH - 1)..];
+      std::iter::once(*first).chain(tail.iter().copied()).collect()
+    },
+  }
+}
+
+/// What in one conversation involves the user since `since`. A direct message or group chat waits on them when
+/// its last message is someone else's that they did not react to. A space waits on them per thread: a mention
+/// of them (or of everyone) with no reply or reaction of theirs after it. The rest of a space only counts in the
+/// threads they wrote or reacted in; with none, the space is only a one-line stamp.
+fn involvement<'a>(group: &'a Group, topics: &'a [Topic], me: &str, since: Micros, now: Micros) -> Vec<Involved<'a>> {
+  let topics: Vec<Vec<&Arc<Message>>> = topics
+    .iter()
+    .map(|(_, messages)| messages.iter().filter(|message| !message.system).collect::<Vec<_>>())
+    .filter(|messages| !messages.is_empty())
+    .collect();
+  let mine = |message: &Message| message.sender_id == me;
+  if group.kind != GroupKind::Space {
+    let messages: Vec<&Arc<Message>> = topics.iter().flatten().copied().collect();
+    let Some(last) = messages.last().filter(|last| last.time >= since) else {
+      return Vec::new();
+    };
+    let thread = last.is_thread_reply().then(|| last.topic_id.clone());
+    let shown = messages[messages.len().saturating_sub(SHOWN_EACH)..].to_vec();
+    if !mine(last) && !reacted(last) {
+      let why = format!("{} wrote {}, no reply from you", sender(last), ago(last.time, now));
+      return vec![Involved {
+        group,
+        thread,
+        waiting: true,
+        time: last.time,
+        why,
+        messages: shown,
+      }];
+    }
+    let why = if mine(last) {
+      format!("you wrote {}", ago(last.time, now))
+    } else {
+      format!("you reacted to the last message, {}", ago(last.time, now))
+    };
+    return vec![Involved {
+      group,
+      thread,
+      waiting: false,
+      time: last.time,
+      why,
+      messages: shown,
+    }];
+  }
+  let mut found = Vec::new();
+  for messages in &topics {
+    let Some(first) = messages.first() else {
+      continue;
+    };
+    let thread = Some(if first.topic_id.is_empty() {
+      first.id.clone()
+    } else {
+      first.topic_id.clone()
+    });
+    let call = messages
+      .iter()
+      .rposition(|message| message.time >= since && !mine(message) && mentions(message, me));
+    let answered =
+      call.is_some_and(|at| reacted(messages[at]) || messages[at + 1..].iter().any(|message| mine(message)));
+    if let Some(at) = call.filter(|_| !answered) {
+      let message = messages[at];
+      let why = format!(
+        "{} mentioned you {}, no reply from you",
+        sender(message),
+        ago(message.time, now)
+      );
+      found.push(Involved {
+        group,
+        thread,
+        waiting: true,
+        time: message.time,
+        why,
+        messages: thread_view(messages),
+      });
+      continue;
+    }
+    let last_mine = messages
+      .iter()
+      .rev()
+      .find(|message| message.time >= since && (mine(message) || reacted(message)));
+    if let Some(message) = last_mine {
+      let did = if mine(message) {
+        "you wrote"
+      } else {
+        "you reacted"
+      };
+      let why = format!("{did} {}", ago(message.time, now));
+      found.push(Involved {
+        group,
+        thread,
+        waiting: false,
+        time: message.time,
+        why,
+        messages: thread_view(messages),
+      });
+    }
+  }
+  found
+}
+
+/// A space that does not involve the user, in one line: `general (space/abc) — last activity 3 min ago, 4 people talking`.
+fn stamp_line(group: &Group, topics: &[Topic], me: &str, now: Micros) -> String {
+  let talking: HashSet<&str> = topics
+    .iter()
+    .flat_map(|(_, messages)| messages)
+    .filter(|message| !message.system && message.sender_id != me && message.time >= now - TALKING)
+    .map(|message| message.sender_id.as_str())
+    .collect();
+  let mut line = format!("{} — last activity {}", label(group), ago(group.sort_time, now));
+  match talking.len() {
+    0 => {},
+    1 => line.push_str(", 1 person talking"),
+    count => {
+      let _ = write!(line, ", {count} people talking");
+    },
+  }
+  line
+}
+
+async fn recent_activity(engine: &Arc<Engine>, arguments: Value) -> Result<String, String> {
+  let args: ActivityArgs = parse(arguments)?;
+  let limit = args.limit.unwrap_or(10).clamp(1, 25);
+  let me = engine.me().map(|me| me.id).unwrap_or_default();
+  let now = Local::now().timestamp_micros();
+  let since = now - RECENT;
+
+  let groups: Vec<Group> = directory(engine)
+    .into_iter()
+    .map(|(group, _)| group)
+    .filter(|group| group.kind != GroupKind::App && group.sort_time >= since)
+    .take(SCANNED)
+    .collect();
+  if groups.is_empty() {
+    return Ok(format!("{} Nothing happened in Google Chat in the last 24 hours.", now_line()));
+  }
+  let mut loads = JoinSet::new();
+  for (index, group) in groups.iter().enumerate() {
+    let (engine, id) = (engine.clone(), group.id.clone());
+    loads.spawn(async move { (index, engine.topics(&id, Page::Latest).await) });
+  }
+  let mut pages: HashMap<usize, Vec<Topic>> = HashMap::new();
+  let mut failed = Vec::new();
+  while let Some(loaded) = loads.join_next().await {
+    match loaded {
+      Ok((index, Ok(page))) => {
+        pages.insert(index, page.topics);
+      },
+      Ok((index, Err(error))) => failed.push((index, offline(error))),
+      Err(_) => {},
+    }
+  }
+
+  let mut involved = Vec::new();
+  let mut stamps = Vec::new();
+  for (index, group) in groups.iter().enumerate() {
+    let Some(topics) = pages.get(&index) else {
+      continue;
+    };
+    let found = involvement(group, topics, &me, since, now);
+    if found.is_empty() {
+      if group.kind == GroupKind::Space && !group.muted {
+        stamps.push(stamp_line(group, topics, &me, now));
+      }
+    } else {
+      involved.extend(found);
+    }
+  }
+  involved.sort_by_key(|entry| (!entry.waiting, Reverse(entry.time)));
+  let waiting = involved.iter().filter(|entry| entry.waiting).count();
+
+  let mut out = format!("{}\n", now_line());
+  match waiting {
+    0 => out.push_str("Nothing waits on a reply from the user.\n"),
+    1 => out.push_str("1 conversation waits on a reply from the user.\n"),
+    count => {
+      let _ = writeln!(
+        out,
+        "{count} conversations wait on a reply from the user. Send to the one whose question the user's request \
+         answers, whatever its age. If it answers more than one, do not send: ask which one, or all of them."
+      );
+    },
+  }
+  let shown = involved.len().min(limit);
+  for (index, entry) in involved.iter().take(limit).enumerate() {
+    if out.len() > MAX_ANSWER {
+      let _ = writeln!(
+        out,
+        "\n({} more left out to keep this short: pass a lower `limit`.)",
+        shown - index
+      );
+      break;
+    }
+    if index == 0 && entry.waiting {
+      out.push_str("\n## Waiting on you\n");
+    }
+    if !entry.waiting && involved.get(index.wrapping_sub(1)).is_none_or(|previous| previous.waiting) {
+      out.push_str("\n## You took part\n");
+    }
+    let send = match &entry.thread {
+      Some(thread) => format!("send with thread {thread}"),
+      None => "send without thread".to_string(),
+    };
+    let _ = write!(
+      out,
+      "### {} — {} ({send})\n{}",
+      label(entry.group),
+      entry.why,
+      transcript(entry.messages.iter().copied(), &me, None)
+    );
+  }
+  if involved.len() > limit {
+    let _ = writeln!(out, "\n({} more not shown: pass a higher `limit`.)", involved.len() - limit);
+  }
+  if !stamps.is_empty() {
+    out.push_str("\n## Other activity (not involving the user)\n");
+    for stamp in stamps.iter().take(STAMPS) {
+      let _ = writeln!(out, "{stamp}");
+    }
+  }
+  for (index, error) in failed {
+    if let Some(group) = groups.get(index) {
+      let _ = writeln!(out, "({}: {error})", label(group));
+    }
+  }
+  Ok(out)
+}
+
 fn find_conversations(engine: &Arc<Engine>, arguments: Value) -> Result<String, String> {
   let args: FindArgs = parse(arguments)?;
   let limit = args.limit.unwrap_or(15).clamp(1, 50);
@@ -713,11 +1068,24 @@ fn find_conversations(engine: &Arc<Engine>, arguments: Value) -> Result<String, 
   Ok(out)
 }
 
-async fn read_conversation(engine: &Arc<Engine>, arguments: Value) -> Result<String, String> {
+async fn read_conversation(engine: &Arc<Engine>, reads: &Reads, arguments: Value) -> Result<String, String> {
   let args: ReadArgs = parse(arguments)?;
   let group = resolve(&directory(engine), &args.conversation, false)?;
   let limit = args.limit.unwrap_or(30).clamp(1, 100);
   let me = engine.me().map(|me| me.id).unwrap_or_default();
+  let thread = args
+    .thread
+    .as_deref()
+    .map(|thread| thread.trim_start_matches('#'))
+    .filter(|thread| !thread.is_empty());
+  if let Some(thread) = thread {
+    if args.before.is_some() || args.around.is_some() {
+      return Err("`thread` reads one whole thread: leave out `before` and `around`.".into());
+    }
+    let answer = read_thread(engine, &group, thread, &me).await?;
+    reads.mark(&group.id);
+    return Ok(answer);
+  }
 
   let mut around = None;
   let (topics, reached_start, reached_end) = match (&args.around, &args.before) {
@@ -759,6 +1127,7 @@ async fn read_conversation(engine: &Arc<Engine>, arguments: Value) -> Result<Str
     },
   };
 
+  reads.mark(&group.id);
   let messages: Vec<&Arc<Message>> = topics.iter().flat_map(|(_, messages)| messages).collect();
   if messages.is_empty() {
     return Ok(format!(
@@ -794,6 +1163,36 @@ async fn read_conversation(engine: &Arc<Engine>, arguments: Value) -> Result<Str
     );
   }
   Ok(keep_end(out))
+}
+
+/// One thread of a conversation, found among its latest pages.
+async fn read_thread(engine: &Arc<Engine>, group: &Group, thread: &str, me: &str) -> Result<String, String> {
+  let in_thread = |messages: &Vec<Arc<Message>>| {
+    messages
+      .first()
+      .is_some_and(|first| first.id == thread || first.topic_id == thread)
+  };
+  let mut page = engine.topics(&group.id, Page::Latest).await.map_err(offline)?;
+  // The thread is usually recent: look a few pages back at most.
+  for _ in 0..4 {
+    if let Some((_, messages)) = page.topics.iter().find(|(_, messages)| in_thread(messages)) {
+      return Ok(format!(
+        "{}, thread #{thread}. {} messages, oldest first. {}\n{}",
+        label(group),
+        messages.len(),
+        now_line(),
+        transcript(messages.iter(), me, None)
+      ));
+    }
+    let Some(oldest) = page.topics.first().map(|(time, _)| *time).filter(|_| !page.reached_start) else {
+      break;
+    };
+    page = engine.topics(&group.id, Page::Before(oldest)).await.map_err(offline)?;
+  }
+  Err(format!(
+    "No thread #{thread} among the recent messages of {}. Call read_conversation without `thread` to see the conversation.",
+    label(group)
+  ))
 }
 
 async fn search_messages(engine: &Arc<Engine>, arguments: Value) -> Result<String, String> {
@@ -863,7 +1262,7 @@ async fn search_messages(engine: &Arc<Engine>, arguments: Value) -> Result<Strin
   Ok(out)
 }
 
-async fn send_message(engine: &Arc<Engine>, arguments: Value) -> Result<String, String> {
+async fn send_message(engine: &Arc<Engine>, reads: &Reads, arguments: Value) -> Result<String, String> {
   let args: SendArgs = parse(arguments)?;
   let text = args.text.trim();
   if text.is_empty() && args.files.is_empty() {
@@ -885,6 +1284,12 @@ async fn send_message(engine: &Arc<Engine>, arguments: Value) -> Result<String, 
   }
   let group =
     resolve(&directory(engine), &args.conversation, true).map_err(|why| format!("Nothing was sent. {why}"))?;
+  if !reads.has(&group.id) {
+    return Err(format!(
+      "Nothing was sent. Read {} with read_conversation first, then write the message to fit it.",
+      label(&group)
+    ));
+  }
   let thread = args
     .thread
     .as_deref()
@@ -899,6 +1304,7 @@ async fn send_message(engine: &Arc<Engine>, arguments: Value) -> Result<String, 
     .send_now(&group.id, thread, text, files)
     .await
     .map_err(|error| format!("Nothing was sent: {error:#}."))?;
+  reads.clear();
   Ok(format!(
     "Sent to {}{}{attached}.",
     label(&group),
@@ -912,8 +1318,10 @@ async fn send_message(engine: &Arc<Engine>, arguments: Value) -> Result<String, 
 
 #[cfg(test)]
 mod tests {
-  use super::{InboxArgs, clip, cursor, id_text, keep_newest, keep_oldest, list, parse, parse_id};
-  use crate::model::{GroupId, Message};
+  use super::{
+    InboxArgs, MINUTE, ago, clip, cursor, id_text, involvement, keep_newest, keep_oldest, list, parse, parse_id,
+  };
+  use crate::model::{Group, GroupId, GroupKind, Message, Micros, Notify, Placement, Reaction, Span, SpanKind};
   use serde_json::json;
   use std::sync::Arc;
 
@@ -944,6 +1352,116 @@ mod tests {
       })
       .collect();
     (time, messages)
+  }
+
+  const ME: &str = "me";
+  const NOW: Micros = 1_000_000 * MINUTE;
+  const SINCE: Micros = NOW - 24 * 60 * MINUTE;
+
+  fn group(kind: GroupKind) -> Group {
+    Group {
+      id: GroupId::Space("s".into()),
+      kind,
+      name: "Field team".into(),
+      avatar_url: None,
+      emoji: None,
+      member_ids: Vec::new(),
+      member_avatars: Vec::new(),
+      sort_time: NOW,
+      last_read_time: NOW,
+      unread: false,
+      pinned: false,
+      muted: false,
+      notify: Notify::All,
+      snippet: None,
+      placement: Placement::ByKind,
+    }
+  }
+
+  /// A message `minutes` before now, in thread `topic` (its own id starts the thread).
+  fn said(id: &str, topic_id: &str, sender: &str, minutes: i64) -> Message {
+    Message {
+      id: id.into(),
+      topic_id: topic_id.into(),
+      sender_id: sender.into(),
+      sender_name: if sender == ME {
+        "Me".into()
+      } else {
+        "Jordan Park".into()
+      },
+      time: NOW - minutes * MINUTE,
+      ..topic(0, 1).1[0].as_ref().clone()
+    }
+  }
+
+  fn mentioning(mut message: Message) -> Message {
+    message.text = "@Me can you check?".into();
+    message.spans = vec![Span {
+      range: 0..3,
+      kind: SpanKind::Mention(ME.into()),
+    }];
+    message
+  }
+
+  fn thread(messages: Vec<Message>) -> (Micros, Vec<Arc<Message>>) {
+    (
+      messages.last().map_or(0, |message| message.time),
+      messages.into_iter().map(Arc::new).collect(),
+    )
+  }
+
+  #[test]
+  fn a_direct_message_waits_until_the_user_answers_or_reacts() {
+    let dm = group(GroupKind::Dm);
+    let asked = vec![thread(vec![said("a", "a", ME, 30)]), thread(vec![said("b", "b", "jp", 4)])];
+    let found = involvement(&dm, &asked, ME, SINCE, NOW);
+    assert!(found[0].waiting);
+    assert_eq!(found[0].why, "Jordan Park wrote 4 min ago, no reply from you");
+    assert_eq!(found[0].thread, None);
+
+    let mut thumbs = said("b", "b", "jp", 4);
+    thumbs.reactions = vec![Reaction {
+      emoji: "👍".into(), count: 1, mine: true
+    }];
+    let reacted = [thread(vec![thumbs])];
+    let found = involvement(&dm, &reacted, ME, SINCE, NOW);
+    assert!(!found[0].waiting);
+  }
+
+  #[test]
+  fn a_space_waits_only_on_an_unanswered_mention() {
+    let space = group(GroupKind::Space);
+    let topics = vec![
+      thread(vec![said("t1", "t1", "jp", 50), mentioning(said("r1", "t1", "jp", 6))]),
+      thread(vec![
+        said("t2", "t2", "jp", 40),
+        mentioning(said("r2", "t2", "jp", 30)),
+        said("r3", "t2", ME, 20),
+      ]),
+      thread(vec![said("t3", "t3", "jp", 3), said("r4", "t3", "rb", 2)]),
+    ];
+    let found = involvement(&space, &topics, ME, SINCE, NOW);
+    assert_eq!(found.len(), 2, "the chatter in t3 is only a stamp");
+    assert!(found[0].waiting);
+    assert_eq!(found[0].thread.as_deref(), Some("t1"));
+    assert!(!found[1].waiting, "the user answered in t2");
+    assert_eq!(found[1].why, "you wrote 20 min ago");
+  }
+
+  #[test]
+  fn a_space_without_the_user_is_not_involved() {
+    let space = group(GroupKind::Space);
+    let topics = vec![thread(vec![said("t1", "t1", "jp", 5), said("r1", "t1", "rb", 1)])];
+    assert!(involvement(&space, &topics, ME, SINCE, NOW).is_empty());
+    let old = vec![thread(vec![mentioning(said("t2", "t2", "jp", 25 * 60))])];
+    assert!(involvement(&space, &old, ME, SINCE, NOW).is_empty(), "older than a day");
+  }
+
+  #[test]
+  fn ago_reads_like_a_person() {
+    assert_eq!(ago(NOW - 30_000_000, NOW), "just now");
+    assert_eq!(ago(NOW - 4 * MINUTE, NOW), "4 min ago");
+    assert_eq!(ago(NOW - 130 * MINUTE, NOW), "2 h ago");
   }
 
   #[test]
