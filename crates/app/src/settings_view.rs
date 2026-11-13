@@ -78,7 +78,7 @@ impl Section {
 enum Access {
   /// One address with the token in it.
   Link,
-  /// The shell command that adds the server to Claude Code.
+  /// The shell command that adds the server to Claude Code for every project of the user.
   ClaudeCode,
   Token,
 }
@@ -90,7 +90,9 @@ impl Access {
     Ok(match self {
       Self::Link => format!("{endpoint}/{token}"),
       Self::ClaudeCode => {
-        format!("claude mcp add --transport http working {endpoint} --header \"Authorization: Bearer {token}\"")
+        format!(
+          "claude mcp add --scope user --transport http working {endpoint} --header \"Authorization: Bearer {token}\""
+        )
       },
       Self::Token => token,
     })
@@ -1261,12 +1263,12 @@ impl SettingsView {
         .child(copy(Access::Link, "copy-link", "Copy link", cx)),
       )
       .child(
-        Self::row("Claude Code", "The command that adds this server to Claude Code.", false).child(copy(
-          Access::ClaudeCode,
-          "copy-claude",
-          "Copy command",
-          cx,
-        )),
+        Self::row(
+          "Claude Code",
+          "The command that adds this server to Claude Code, in every project.",
+          false,
+        )
+        .child(copy(Access::ClaudeCode, "copy-claude", "Copy command", cx)),
       )
       .child(
         Self::row(
