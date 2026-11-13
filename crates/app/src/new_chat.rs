@@ -1,9 +1,10 @@
 //! New chat: pick people, open their DM, or create a group DM when that set does not exist.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use gchat_core::fuzzy::Fuzzy;
-use gchat_core::{Command, GroupId, User};
+use gchat_core::{Command, GroupId, GroupKind, User};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -36,6 +37,32 @@ pub struct NewChat {
 
 impl EventEmitter<NewChatEvent> for NewChat {}
 
+/// The people to offer for `query`, best match first, without those `skip` leaves out. With no query, the people the
+/// user has a one-to-one chat with come first, then the rest by name.
+pub fn match_people(store: &Store, query: &str, skip: impl Fn(&User) -> bool) -> Vec<Arc<User>> {
+  let mut people: Vec<Arc<User>> = store.people.iter().filter(|user| !skip(user)).cloned().map(Arc::new).collect();
+  if query.is_empty() {
+    let dms: HashSet<&str> = store
+      .all
+      .iter()
+      .filter(|conv| conv.g.kind == GroupKind::Dm)
+      .flat_map(|conv| conv.g.member_ids.iter().map(String::as_str))
+      .collect();
+    people.sort_by_key(|user| (!dms.contains(user.id.as_str()), user.name.to_lowercase()));
+    return people;
+  }
+  let mut fuzzy = Fuzzy::new(query);
+  let mut hits: Vec<(u32, Arc<User>)> = people
+    .into_iter()
+    .filter_map(|user| {
+      let score = fuzzy.score(&user.name).into_iter().chain(fuzzy.score(&user.email)).max();
+      score.map(|score| (score, user))
+    })
+    .collect();
+  hits.sort_by(|a, b| b.0.cmp(&a.0));
+  hits.into_iter().map(|(_, user)| user).collect()
+}
+
 impl NewChat {
   pub fn new(store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
     let input = cx.new(|cx| InputState::new(window, cx).placeholder("Add 1 or more people"));
@@ -63,37 +90,8 @@ impl NewChat {
 
   fn refresh(&mut self, cx: &mut Context<Self>) {
     let store = self.store.read(cx);
-    let picked: std::collections::HashSet<&str> = self.selected.iter().map(|user| user.id.as_str()).collect();
-    let people: Vec<Arc<User>> = store
-      .people
-      .iter()
-      .filter(|user| !picked.contains(user.id.as_str()))
-      .cloned()
-      .map(Arc::new)
-      .collect();
-    let query = self.query(cx);
-    self.results = if query.is_empty() {
-      let dms: std::collections::HashSet<&str> = store
-        .all
-        .iter()
-        .filter(|conv| conv.g.kind == gchat_core::GroupKind::Dm)
-        .flat_map(|conv| conv.g.member_ids.iter().map(String::as_str))
-        .collect();
-      let mut people = people;
-      people.sort_by_key(|user| (!dms.contains(user.id.as_str()), user.name.to_lowercase()));
-      people
-    } else {
-      let mut fuzzy = Fuzzy::new(&query);
-      let mut hits: Vec<(u32, Arc<User>)> = people
-        .into_iter()
-        .filter_map(|user| {
-          let score = fuzzy.score(&user.name).into_iter().chain(fuzzy.score(&user.email)).max();
-          score.map(|score| (score, user))
-        })
-        .collect();
-      hits.sort_by(|a, b| b.0.cmp(&a.0));
-      hits.into_iter().map(|(_, user)| user).collect()
-    };
+    let picked: HashSet<&str> = self.selected.iter().map(|user| user.id.as_str()).collect();
+    self.results = match_people(store, &self.query(cx), |user| picked.contains(user.id.as_str()));
     if self.selected_row >= self.results.len() {
       self.selected_row = self.results.len().saturating_sub(1);
     }

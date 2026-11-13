@@ -1,5 +1,6 @@
 //! Window root: title bar with search and status, the layout's columns, content panel, and overlays.
 
+use chrono::NaiveDate;
 use gchat_core::{Connection, Core};
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
@@ -11,9 +12,11 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::calendar::{CalendarView, OpenCalendar};
 use crate::conv_list::ConvList;
 use crate::emoji_picker::{EmojiHandle, EmojiPicker};
 use crate::home::HomeView;
+use crate::meet::{MeetEvent, MeetView, OpenMeet};
 use crate::menu::{ContextMenu, MenuHandle};
 use crate::new_chat::{NewChat, NewChatEvent, OpenNewChat};
 use crate::rail::{RAIL_WIDTH, Rail};
@@ -128,6 +131,8 @@ pub fn menus() -> Vec<Menu> {
         MenuItem::action("Forward", GoForward),
         MenuItem::separator(),
         MenuItem::action("Home", GoHome),
+        MenuItem::action("Calendar", OpenCalendar),
+        MenuItem::action("Meet", OpenMeet),
         MenuItem::action("New Chat…", OpenNewChat),
         MenuItem::action("Quick Switcher…", OpenSwitcher),
         MenuItem::separator(),
@@ -151,6 +156,8 @@ pub struct RootView {
   rail: Entity<Rail>,
   home: Entity<HomeView>,
   shortcuts: Entity<ShortcutView>,
+  calendar: Entity<CalendarView>,
+  meet: Entity<MeetView>,
   search: Entity<InputState>,
   focus: FocusHandle,
   /// The top-bar mark, for the dark look and for the light one.
@@ -185,9 +192,11 @@ impl RootView {
     let conv_list = cx.new(|_| ConvList::new(store.clone()));
     let rail = cx.new(|_| Rail::new(store.clone()));
     let layout = cx.global::<settings::Settings>().layout;
-    store.update(cx, super::store::Store::sync_sort);
+    store.update(cx, super::store::Store::sync_settings);
     let home = cx.new(|_| HomeView::new(store.clone()));
     let shortcuts = cx.new(|_| ShortcutView::new(store.clone()));
+    let calendar = cx.new(|cx| CalendarView::new(store.clone(), window, cx));
+    let meet = cx.new(|cx| MeetView::new(store.clone(), window, cx));
     let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search chat"));
     let focus = cx.focus_handle();
     window.focus(&focus, cx);
@@ -232,11 +241,16 @@ impl RootView {
           this.close_overlay_state();
           this.store.update(cx, |store, cx| store.sync_pane(cx));
         }
-        this.store.update(cx, super::store::Store::sync_sort);
+        this.store.update(cx, super::store::Store::sync_settings);
         this.sync_overlay(cx);
         cx.notify();
       }),
       cx.observe_global::<status::Mine>(|_, cx| cx.notify()),
+      // Meet's "Schedule in Google Calendar" opens the calendar's editor.
+      cx.subscribe_in(&meet, window, |this, _, event: &MeetEvent, window, cx| {
+        let MeetEvent::Schedule(day) = event;
+        this.schedule_meeting(*day, window, cx);
+      }),
     ];
 
     // One task drains the core: everything available, then a single state update.
@@ -290,6 +304,8 @@ impl RootView {
       search,
       focus,
       shortcuts,
+      calendar,
+      meet,
       logo,
       viewer,
       menu,
@@ -409,12 +425,65 @@ impl RootView {
     cx.notify();
   }
 
-  /// Gives the keyboard back once an overlay closes: to the open conversation's composer, or to the window.
+  /// Gives the keyboard back once an overlay closes: to the open conversation's composer, to the calendar or Meet, or
+  /// to the window.
   fn refocus(&self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.store.read(cx).view == View::Calendar {
+      self.focus_calendar(window, cx);
+      return;
+    }
+    if self.store.read(cx).view == View::Meet {
+      self.focus_meet(window, cx);
+      return;
+    }
     match self.store.read(cx).conv.clone() {
       Some(conv) => conv.update(cx, |conv, cx| conv.focus_composer(window, cx)),
       None => window.focus(&self.focus, cx),
     }
+  }
+
+  /// Shows Google Calendar and gives it the keyboard, for its one-letter keys.
+  fn open_calendar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if !self.can_navigate(window, cx) {
+      return;
+    }
+    self.switcher = None;
+    self.new_chat = None;
+    self.close_overlay_state();
+    self.store.update(cx, super::store::Store::open_calendar);
+    self.focus_calendar(window, cx);
+  }
+
+  fn focus_calendar(&self, window: &mut Window, cx: &mut Context<Self>) {
+    let focus = self.calendar.read(cx).focus_handle();
+    window.focus(&focus, cx);
+  }
+
+  /// Meet's "Schedule in Google Calendar": shows the calendar on `day`, with the editor open on a new event that has
+  /// Google Meet.
+  fn schedule_meeting(&mut self, day: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
+    self.open_calendar(window, cx);
+    // A modal over the window refuses the navigation: the calendar is not on screen then.
+    if self.store.read(cx).view == View::Calendar {
+      self.calendar.update(cx, |calendar, cx| calendar.new_meeting(day, window, cx));
+    }
+  }
+
+  /// Shows Meet and gives it the keyboard, for its `/` key.
+  fn open_meet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if !self.can_navigate(window, cx) {
+      return;
+    }
+    self.switcher = None;
+    self.new_chat = None;
+    self.close_overlay_state();
+    self.store.update(cx, super::store::Store::open_meet);
+    self.focus_meet(window, cx);
+  }
+
+  fn focus_meet(&self, window: &mut Window, cx: &mut Context<Self>) {
+    let focus = self.meet.read(cx).focus_handle(cx);
+    window.focus(&focus, cx);
   }
 
   fn sidebar_mode(cx: &App) -> SidebarMode {
@@ -621,6 +690,8 @@ impl RootView {
       cx.notify();
     } else if self.menu.read(cx).is_open() {
       self.menu.update(cx, |menu, cx| menu.close(window, cx));
+    } else if self.calendar.update(cx, |calendar, cx| calendar.dismiss(window, cx)) {
+      // The event editor or card closed.
     } else if self.viewer.read(cx).is_open() {
       self.viewer.update(cx, |viewer, cx| viewer.close(window, cx));
     } else if self.new_chat.is_some() {
@@ -631,6 +702,8 @@ impl RootView {
       self.close_theme_picker(window, cx);
     } else if self.overlay.is_some() {
       self.close_overlay(window, cx);
+    } else if self.meet.update(cx, |meet, cx| meet.dismiss(window, cx)) {
+      // The link card closed, or a text field of Meet gave the keyboard back.
     } else if !self.store.read(cx).query.is_empty() {
       self.search.update(cx, |state, cx| state.set_value("", window, cx));
       self.store.update(cx, |store, cx| store.set_query(String::new(), cx));
@@ -650,14 +723,18 @@ impl RootView {
   }
 
   /// A modal overlay has the keyboard: conversation hotkeys stay out of its way.
-  const fn modal_open(&self) -> bool {
-    self.settings.is_some() || self.switcher.is_some() || self.theme_picker.is_some() || self.new_chat.is_some()
+  fn modal_open(&self, cx: &App) -> bool {
+    self.settings.is_some()
+      || self.switcher.is_some()
+      || self.theme_picker.is_some()
+      || self.new_chat.is_some()
+      || self.calendar.read(cx).has_modal()
   }
 
   /// Whether a navigation hotkey goes through: a modal over the window keeps it out, and the media viewer closes
   /// first, since it covers the view.
   fn can_navigate(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-    if self.modal_open() {
+    if self.modal_open(cx) {
       return false;
     }
     if self.viewer.read(cx).is_open() {
@@ -679,8 +756,11 @@ impl RootView {
         store.go_forward(window, cx);
       }
     });
-    if self.store.read(cx).view == View::Home || matches!(self.store.read(cx).view, View::Shortcut(_)) {
-      window.focus(&self.focus, cx);
+    match self.store.read(cx).view {
+      View::Home | View::Shortcut(_) => window.focus(&self.focus, cx),
+      View::Calendar => self.focus_calendar(window, cx),
+      View::Meet => self.focus_meet(window, cx),
+      View::Conversation(_) => {},
     }
   }
 
@@ -857,6 +937,8 @@ impl Render for RootView {
     let signed_out = store.signed_out.clone();
     let at_home = store.view == View::Home;
     let on_shortcut = matches!(store.view, View::Shortcut(_));
+    let on_calendar = store.view == View::Calendar;
+    let on_meet = store.view == View::Meet;
     let open_conv = match (&store.view, &store.conv) {
       (View::Conversation(_), Some(conv)) => Some(conv.clone()),
       _ => None,
@@ -879,10 +961,26 @@ impl Render for RootView {
       let focus = self.focus.clone();
       window.defer(cx, move |window, cx| window.focus(&focus, cx));
     }
+    if on_calendar && window.focused(cx).is_none() {
+      let calendar = self.calendar.clone();
+      window.defer(cx, move |window, cx| {
+        let focus = calendar.read(cx).focus_handle();
+        window.focus(&focus, cx);
+      });
+    }
+    if on_meet && window.focused(cx).is_none() {
+      let meet = self.meet.clone();
+      window.defer(cx, move |window, cx| {
+        let focus = meet.read(cx).focus_handle(cx);
+        window.focus(&focus, cx);
+      });
+    }
 
     let content: AnyElement = match open_conv {
       Some(conv) => conv.into_any_element(),
       None if on_shortcut => self.shortcuts.clone().into_any_element(),
+      None if on_calendar => self.calendar.clone().into_any_element(),
+      None if on_meet => self.meet.clone().into_any_element(),
       None => self.home.clone().into_any_element(),
     };
 
@@ -992,6 +1090,8 @@ impl Render for RootView {
       .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
       .on_action(cx.listener(|this, _: &OpenNotificationSettings, window, cx| this.open_settings_at(true, window, cx)))
       .on_action(cx.listener(|this, _: &GoHome, window, cx| this.go_home(window, cx)))
+      .on_action(cx.listener(|this, _: &OpenCalendar, window, cx| this.open_calendar(window, cx)))
+      .on_action(cx.listener(|this, _: &OpenMeet, window, cx| this.open_meet(window, cx)))
       .on_action(cx.listener(|this, _: &GoBack, window, cx| this.step(true, window, cx)))
       .on_action(cx.listener(|this, _: &GoForward, window, cx| this.step(false, window, cx)))
       .on_action(cx.listener(|this, _: &NextConversation, window, cx| this.step_conversation(true, window, cx)))
@@ -1000,7 +1100,7 @@ impl Render for RootView {
       .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
       .on_action(cx.listener(|this, _: &OpenNewChat, window, cx| this.open_new_chat(window, cx)))
       .on_action(cx.listener(|this, _: &RewriteDraft, window, cx| {
-        if this.modal_open() {
+        if this.modal_open(cx) {
           return;
         }
         let Some(conv) = this.store.read(cx).conv.clone() else {
@@ -1009,7 +1109,7 @@ impl Render for RootView {
         conv.update(cx, |conv, cx| conv.rewrite_hotkey(window, cx));
       }))
       .on_action(cx.listener(|this, _: &FindInChat, window, cx| {
-        if this.modal_open() {
+        if this.modal_open(cx) {
           return;
         }
         if let Some(conv) = this.store.read(cx).conv.clone() {
@@ -1059,6 +1159,7 @@ impl Render for RootView {
       .children(self.theme_picker.as_ref().map(|(picker, _)| picker.clone()))
       .children(self.new_chat.as_ref().map(|(view, _)| view.clone()))
       .children(self.settings.as_ref().map(|(view, _)| view.clone()))
+      .children(self.calendar.read(cx).overlays())
       .child(self.viewer.clone())
       .child(self.composer.clone())
       .child(self.menu.clone())

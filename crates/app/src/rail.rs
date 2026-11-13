@@ -1,5 +1,5 @@
 //! The Rail layout's icon column: one button per pane (Home, Mentions, Starred, then each section and kind) with its
-//! unread count, and New chat at the bottom.
+//! unread count, and Calendar, Meet, and New chat at the bottom.
 
 use gchat_core::Shortcut;
 use gpui_kit::component::tooltip::Tooltip;
@@ -7,9 +7,12 @@ use gpui_kit::component::v_flex;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::conv_list::{new_chat_tip, pane_title};
+use crate::calendar::OpenCalendar;
+use crate::conv_list::{calendar_tip, meet_tip, new_chat_tip, pane_title};
+use crate::meet::OpenMeet;
 use crate::new_chat::OpenNewChat;
-use crate::store::{Kind, Pane, Section, Store, Tab};
+use crate::settings::Settings;
+use crate::store::{Kind, Pane, Section, Store, Tab, View};
 use crate::theme::{ACCENT, BG, FIELD, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, TEXT_STRONG, Tone, rgb};
 use crate::ui::{Icon, icon};
 use crate::util;
@@ -148,8 +151,38 @@ fn tab_button(handle: &Entity<Store>, ix: usize, tab: &Tab, selected: bool) -> S
     )
 }
 
+/// A button under the panes for a view of its own, Calendar or Meet: it changes what the panel shows, not which
+/// conversations are listed.
+fn view_button(id: &'static str, glyph: Icon, name: &'static str, selected: bool) -> Stateful<Div> {
+  let color = if selected { TEXT_STRONG } else { MUTED };
+  v_flex()
+    .id(id)
+    .w(px(TAB_WIDTH))
+    .py_1p5()
+    .flex_shrink_0()
+    .items_center()
+    .gap_1()
+    .rounded(px(10.))
+    .cursor_pointer()
+    .when(selected, |button| button.bg(rgb(ROW_SELECTED)))
+    .when(!selected, |button| button.hover(|s| s.bg(rgb(ROW_HOVER))))
+    .child(
+      div()
+        .size(px(24.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(icon(glyph, 20., color)),
+    )
+    .child(div().text_size(px(11.)).text_color(rgb(color)).child(name))
+}
+
 impl Render for Rail {
   fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    let (show_calendar, show_meet) = {
+      let settings = cx.global::<Settings>();
+      (settings.show_calendar, settings.show_meet)
+    };
     let store = self.store.read(cx);
     let tabs = store
       .tabs
@@ -175,6 +208,20 @@ impl Render for Rail {
           .overflow_y_scroll()
           .children(tabs),
       )
+      .when(show_calendar, |rail| {
+        rail.child(
+          view_button("rail-calendar", Icon::Calendar, "Calendar", store.view == View::Calendar)
+            .tooltip(calendar_tip)
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenCalendar), cx)),
+        )
+      })
+      .when(show_meet, |rail| {
+        rail.child(
+          view_button("rail-meet", Icon::Video, "Meet", store.view == View::Meet)
+            .tooltip(meet_tip)
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMeet), cx)),
+        )
+      })
       .child(
         div()
           .id("rail-new-chat")

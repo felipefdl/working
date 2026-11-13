@@ -704,6 +704,54 @@ impl SettingsView {
             .child(Self::side_picker(settings.sidebar_side)),
           ),
       ))
+      .child(Self::group(
+        "View buttons",
+        Self::card()
+          .child(
+            Self::row(
+              "Show Mentions",
+              "The Mentions button in the sidebar, the Chats header, or the rail.",
+              true,
+            )
+            .child(
+              Self::toggle("show-mentions", settings.show_mentions)
+                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_mentions = !settings.show_mentions)),
+            ),
+          )
+          .child(
+            Self::row(
+              "Show Starred",
+              "The Starred button in the sidebar, the Chats header, or the rail.",
+              false,
+            )
+            .child(
+              Self::toggle("show-starred", settings.show_starred)
+                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_starred = !settings.show_starred)),
+            ),
+          )
+          .child(
+            Self::row(
+              "Show Calendar",
+              "The Calendar button in the sidebar, the Chats header, or the rail. ⌘ 2 and the Go menu still open it.",
+              false,
+            )
+            .child(
+              Self::toggle("show-calendar", settings.show_calendar)
+                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_calendar = !settings.show_calendar)),
+            ),
+          )
+          .child(
+            Self::row(
+              "Show Meet",
+              "The Meet button in the sidebar, the Chats header, or the rail. ⌘ 3 and the Go menu still open it.",
+              false,
+            )
+            .child(
+              Self::toggle("show-meet", settings.show_meet)
+                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_meet = !settings.show_meet)),
+            ),
+          ),
+      ))
   }
 
   fn calls(settings: Settings) -> Div {

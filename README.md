@@ -41,7 +41,9 @@ Pick the layout that fits how you work, switch any time in Settings, and every l
 
 ## Features
 
-- **Every conversation in one place.** DMs, group DMs, spaces, and apps in a sidebar, with Mentions and Starred views that gather messages from every chat.
+- **Every conversation in one place.** DMs, group DMs, spaces, and apps in a sidebar, with Mentions and Starred views that gather messages from every chat. Settings can hide the Mentions, Starred, Calendar, and Meet buttons in any layout; the views still open from their keys and the Go menu.
+- **Your calendar beside your chats.** `Cmd+2` opens Google Calendar in the same window: Day, 4 days, Week, Month, Year, and Schedule views, a quick event card with Join Meet, going or not, and an editor for new events, guests, repeats, and colors. Its button sits in the sidebar, the Chats header, or the Rail, depending on the layout, and a switch in Settings hides it (`Cmd+2` and the Go menu still work).
+- **Meet beside your chats.** `Cmd+3` opens Google Meet in the same window: join with a code, a link, or a nickname, start or plan a meeting from New, see the day's meetings that have a Meet link, and call someone from your contacts. Its button sits in the sidebar, the Chats header, or the Rail, depending on the layout, and a switch in Settings hides it (`Cmd+3` and the Go menu still work).
 - **Fast to open, fast to switch.** A disk cache paints the last state on launch. `Cmd+K` jumps to any conversation with fuzzy search, and Enter in the search bar searches message text.
 - **Pick a layout.** Google Chat's sidebar, a Messages-style list with previews, or a Rail of categories beside the list, each sortable by most recent or A to Z. The sidebar button opens or closes the sidebar, and a right-click auto-hides it: closed until the pointer reaches the window's edge. The sidebar can sit on either side and resizes by its edge. `Option+Cmd+Down` and `Option+Cmd+Up` step through conversations, `Shift+Option+Cmd+Down` jumps to the newest unread one\.
 - **Full conversations.** Formatted text, threads, replies, quotes, edits, reactions with a full emoji picker, cards, and attachments.

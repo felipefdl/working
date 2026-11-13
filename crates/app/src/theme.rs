@@ -99,6 +99,19 @@ pub fn switch_off() -> Rgba {
   Rgba { a: 0.5, ..rgb(MUTED) }
 }
 
+/// A color that comes as data rather than from the theme: a calendar's or an event's own, as `0xRRGGBB`.
+pub fn data_color(color: u32) -> Rgba {
+  gpui_kit::rgb(color)
+}
+
+/// The text color that reads on `color`: near-black on a light color, white on a dark one.
+pub fn ink_on(color: u32) -> Rgba {
+  let channel = |shift: u32| f32::from(u8::try_from((color >> shift) & 0xff).unwrap_or(u8::MAX)) / 255.;
+  // Perceived brightness, with the usual weights of red, green, and blue.
+  let brightness = 0.114_f32.mul_add(channel(0), 0.299_f32.mul_add(channel(16), 0.587 * channel(8)));
+  gpui_kit::rgb(if brightness > 0.6 { 0x202124 } else { 0xffffff })
+}
+
 pub const BG: Tone = Tone(|c| c.bg);
 pub const PANEL: Tone = Tone(|c| c.panel);
 pub const POPOVER: Tone = Tone(|c| c.popover);

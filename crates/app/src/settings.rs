@@ -256,6 +256,14 @@ pub struct Settings {
   pub layout: Layout,
   pub sidebar: SidebarMode,
   pub sidebar_side: SidebarSide,
+  /// The Mentions button of every layout. Off removes only the button: the view still opens from anywhere else.
+  pub show_mentions: bool,
+  /// The Starred button of every layout. Off removes only the button: the view still opens from anywhere else.
+  pub show_starred: bool,
+  /// The Calendar button of every layout. Off removes only the button: `Cmd+2` and the Go menu still open the view.
+  pub show_calendar: bool,
+  /// The Meet button of every layout. Off removes only the button: `Cmd+3` and the Go menu still open the view.
+  pub show_meet: bool,
   /// Dragged widths of each layout's resizable column; a layout without an entry uses `Layout::default_width`.
   pub column_widths: BTreeMap<Layout, f32>,
   /// Order of Home and of the Messages and Rail list.
@@ -289,6 +297,15 @@ pub struct Settings {
   /// Every message is rewritten before it sends. Right-clicking the composer's rewrite button flips it.
   #[serde(default)]
   pub rewrite_always: bool,
+  /// The Calendar view last used.
+  #[serde(default)]
+  pub calendar_mode: crate::calendar_layout::Mode,
+  /// The Calendar view's side panel (the small month and the list of calendars) is closed.
+  #[serde(default)]
+  pub calendar_panel_closed: bool,
+  /// Ids of the calendars unchecked in that list: their events are not shown.
+  #[serde(default)]
+  pub calendar_hidden: Vec<String>,
 }
 
 impl Default for Settings {
@@ -301,6 +318,10 @@ impl Default for Settings {
       layout: Layout::default(),
       sidebar: SidebarMode::default(),
       sidebar_side: SidebarSide::default(),
+      show_mentions: true,
+      show_starred: true,
+      show_calendar: true,
+      show_meet: true,
       column_widths: BTreeMap::new(),
       list_sort: Sort::default(),
       section_sort: BTreeMap::new(),
@@ -318,6 +339,9 @@ impl Default for Settings {
       rewrite: RewriteTool::Off,
       rewrite_instruction: DEFAULT_REWRITE_INSTRUCTION.into(),
       rewrite_always: false,
+      calendar_mode: crate::calendar_layout::Mode::default(),
+      calendar_panel_closed: false,
+      calendar_hidden: Vec::new(),
     }
   }
 }
@@ -533,6 +557,10 @@ mod tests {
     let settings = Settings::default();
     assert!(settings.meet_builtin);
     assert!(settings.meet_auto_open);
+    assert!(settings.show_calendar);
+    assert!(settings.show_mentions);
+    assert!(settings.show_starred);
+    assert!(settings.show_meet);
   }
 
   #[test]
@@ -540,6 +568,10 @@ mod tests {
     let settings: Settings = serde_json::from_str("{}").expect("empty object uses Default");
     assert!(settings.meet_builtin);
     assert!(settings.meet_auto_open);
+    assert!(settings.show_calendar);
+    assert!(settings.show_mentions);
+    assert!(settings.show_starred);
+    assert!(settings.show_meet);
   }
 
   #[test]
@@ -553,6 +585,23 @@ mod tests {
     let loaded: Settings = serde_json::from_str(&text).expect("deserialize");
     assert!(!loaded.meet_builtin);
     assert!(!loaded.meet_auto_open);
+  }
+
+  #[test]
+  fn view_buttons_off_roundtrip() {
+    let settings = Settings {
+      show_mentions: false,
+      show_starred: false,
+      show_calendar: false,
+      show_meet: false,
+      ..Settings::default()
+    };
+    let text = serde_json::to_string(&settings).expect("serialize");
+    let loaded: Settings = serde_json::from_str(&text).expect("deserialize");
+    assert!(!loaded.show_calendar);
+    assert!(!loaded.show_mentions);
+    assert!(!loaded.show_starred);
+    assert!(!loaded.show_meet);
   }
 
   #[test]

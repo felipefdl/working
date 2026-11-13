@@ -59,6 +59,15 @@ pub enum Icon {
   Sparkles,
   AtSign,
   Star,
+  Calendar,
+  ChevronLeft,
+  Clock,
+  MapPin,
+  Text,
+  Repeat,
+  Trash,
+  List,
+  Link,
 }
 
 macro_rules! lucide {
@@ -187,8 +196,29 @@ impl Icon {
       Self::PanelRightDashed => lucide!(
         r#"<rect width="18" height="18" x="3" y="3" rx="2"/><path d="M15 14v1"/><path d="M15 19v2"/><path d="M15 3v2"/><path d="M15 9v1"/>"#
       ),
+      Self::Calendar => lucide!(
+        r#"<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/>"#
+      ),
+      Self::ChevronLeft => lucide!(r#"<path d="m15 18-6-6 6-6"/>"#),
+      Self::Clock => lucide!(r#"<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>"#),
+      Self::MapPin => lucide!(
+        r#"<path d="M20 10c0 4.993-5.539 10.193-7.399 11.799a1 1 0 0 1-1.202 0C9.539 20.193 4 14.993 4 10a8 8 0 0 1 16 0"/><circle cx="12" cy="10" r="3"/>"#
+      ),
+      Self::Text => lucide!(r#"<path d="M15 12H3"/><path d="M17 18H3"/><path d="M21 6H3"/>"#),
+      Self::Repeat => lucide!(
+        r#"<path d="m17 2 4 4-4 4"/><path d="M3 11v-1a4 4 0 0 1 4-4h14"/><path d="m7 22-4-4 4-4"/><path d="M21 13v1a4 4 0 0 1-4 4H3"/>"#
+      ),
+      Self::Trash => lucide!(
+        r#"<path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>"#
+      ),
+      Self::List => lucide!(
+        r#"<path d="M3 12h.01"/><path d="M3 18h.01"/><path d="M3 6h.01"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M8 6h13"/>"#
+      ),
       Self::Users => lucide!(
         r#"<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><path d="M16 3.128a4 4 0 0 1 0 7.744"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><circle cx="9" cy="7" r="4"/>"#
+      ),
+      Self::Link => lucide!(
+        r#"<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>"#
       ),
     }
   }

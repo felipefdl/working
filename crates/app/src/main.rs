@@ -27,13 +27,21 @@
   reason = "GPUI view signatures, theme hex colors, and layout math"
 )]
 
+mod calendar;
+mod calendar_grid;
+mod calendar_layout;
 mod call;
 mod completion;
 mod conv_list;
 mod conversation;
 mod emoji_picker;
+mod event_card;
+mod event_editor;
 mod home;
 mod images;
+mod meet;
+mod meet_body;
+mod meet_logic;
 mod menu;
 mod message;
 mod new_chat;
@@ -127,6 +135,8 @@ fn main() {
       KeyBinding::new("cmd-shift-t", OpenThemePicker, None),
       KeyBinding::new("cmd-n", crate::new_chat::OpenNewChat, None),
       KeyBinding::new("cmd-1", GoHome, None),
+      KeyBinding::new("cmd-2", crate::calendar::OpenCalendar, None),
+      KeyBinding::new("cmd-3", crate::meet::OpenMeet, None),
       // Safari's pair. The kit's text field binds the same keys to outdent and indent, which a chat composer has
       // no use for: binding them again in its "Input" context, after `init`, takes them back.
       KeyBinding::new("cmd-[", GoBack, None),
@@ -150,6 +160,8 @@ fn main() {
       // The auto-hide sidebar's overlay is open (the root takes the "Overlay" context): Escape closes it even when
       // no text field has the keyboard.
       KeyBinding::new("escape", Escape, Some("Overlay")),
+      // The event editor closes on Escape from any of its controls, not only its text fields.
+      KeyBinding::new("escape", Escape, Some("EventEditor")),
       KeyBinding::new("cmd-,", OpenSettings, None),
       KeyBinding::new("cmd-shift-r", RewriteDraft, None),
       KeyBinding::new("cmd-f", FindInChat, None),

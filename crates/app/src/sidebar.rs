@@ -1,4 +1,5 @@
-//! Fixed-width, virtualized sidebar: Home, Mentions, and Starred, then the Direct messages / Apps / Spaces sections.
+//! Fixed-width, virtualized sidebar: Home, Mentions, Starred, Calendar, and Meet, then the Direct messages / Apps /
+//! Spaces sections.
 
 use std::ops::Range;
 use std::rc::Rc;
@@ -9,6 +10,9 @@ use gpui_kit::*;
 
 use gchat_core::Shortcut;
 
+use crate::calendar::OpenCalendar;
+use crate::conv_list::{calendar_tip, meet_tip};
+use crate::meet::OpenMeet;
 use crate::menu;
 use crate::new_chat::OpenNewChat;
 use crate::settings::{Layout, Settings};
@@ -36,11 +40,13 @@ impl Sidebar {
     let selected_home = store.view == View::Home;
     let selected_shortcut = match &store.view {
       View::Shortcut(shortcut) => Some(*shortcut),
-      View::Home | View::Conversation(_) => None,
+      View::Home | View::Calendar | View::Meet | View::Conversation(_) => None,
     };
+    let selected_calendar = store.view == View::Calendar;
+    let selected_meet = store.view == View::Meet;
     let selected_group = match &store.view {
       View::Conversation(id) => Some(id.clone()),
-      View::Home | View::Shortcut(_) => None,
+      View::Home | View::Shortcut(_) | View::Calendar | View::Meet => None,
     };
     let mut out = Vec::with_capacity(range.len());
     for ix in range {
@@ -76,6 +82,24 @@ impl Sidebar {
             )
             .into_any_element()
         },
+        SidebarItem::Calendar => row
+          .child(
+            item_frame(selected_calendar)
+              .tooltip(calendar_tip)
+              .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenCalendar), cx))
+              .child(icon(Icon::Calendar, 16., TEXT))
+              .child(label("Calendar", false)),
+          )
+          .into_any_element(),
+        SidebarItem::Meet => row
+          .child(
+            item_frame(selected_meet)
+              .tooltip(meet_tip)
+              .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMeet), cx))
+              .child(icon(Icon::Video, 16., TEXT))
+              .child(label("Meet", false)),
+          )
+          .into_any_element(),
         SidebarItem::Header(section) => {
           let section = section.clone();
           let title = section.title().to_string();

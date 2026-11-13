@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use gchat_core::fuzzy::Fuzzy;
 use gchat_core::{
-  Command, Connection, Core, Event, Group, GroupId, GroupKind, Message, Notify, Placement, SearchHit, Shortcut,
-  SpanKind, User,
+  AttachmentKind, Calendar, CalendarEvent, Command, Connection, Core, Event, Group, GroupId, GroupKind, Message,
+  Micros, Notify, Placement, SearchHit, Shortcut, SpanKind, User,
 };
 use gpui_kit::*;
 
@@ -85,6 +85,10 @@ pub struct Conv {
 pub enum SidebarItem {
   Home,
   Shortcut(Shortcut),
+  /// Google Calendar, under the shortcuts.
+  Calendar,
+  /// Google Meet, under Calendar.
+  Meet,
   Header(Section),
   Conv(Arc<Conv>),
   Toggle(Section),
@@ -150,7 +154,100 @@ pub enum View {
   Home,
   /// Mentions or Starred: a message list across conversations.
   Shortcut(Shortcut),
+  /// Google Calendar.
+  Calendar,
+  /// Google Meet.
+  Meet,
   Conversation(GroupId),
+}
+
+/// Google Calendar as the core last answered it, for the Calendar view.
+#[derive(Default)]
+pub struct CalendarData {
+  pub calendars: Arc<Vec<Calendar>>,
+  /// The events of `range`, once `loaded`; until then, those of the range before it.
+  pub events: Arc<Vec<CalendarEvent>>,
+  /// The time last asked for.
+  pub range: Option<(Micros, Micros)>,
+  /// `events` answers `range`.
+  pub loaded: bool,
+  /// Why Google Calendar could not be read, until a read works.
+  pub error: Option<String>,
+  /// A save, a deletion, or an answer is on its way.
+  pub writing: bool,
+  /// How the last write went, until the view takes it.
+  written: Option<Result<(), String>>,
+}
+
+/// What a meeting being made is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Creating {
+  /// A link to keep: the Meet view shows it in a card.
+  ForLater,
+  /// A meeting to join at once: its call opens when the link arrives.
+  Instant,
+}
+
+/// How far a call started from the Calls tab has got.
+enum CallStage {
+  /// The chat with this person, by user id, is being made.
+  Chat(String),
+  /// The meeting is being posted in this chat.
+  Meeting(GroupId),
+}
+
+/// A call being started from the Calls tab of the Meet view.
+pub struct Calling {
+  /// Who is being called.
+  pub name: String,
+  stage: CallStage,
+}
+
+impl Calling {
+  /// A call to `name`, whose user id is `person`: in `chat` when they have one, else in the chat made for the call.
+  fn new(name: String, person: String, chat: Option<GroupId>) -> Self {
+    let stage = chat.map_or_else(|| CallStage::Chat(person), CallStage::Meeting);
+    Self { name, stage }
+  }
+
+  /// Takes the chat the core opened (`OpenChat`) when it is the one made for this call, a chat with that person
+  /// alone, and answers whether it was. The meeting is posted in it from then on.
+  fn take_chat(&mut self, chat: &GroupId, members: &[String]) -> bool {
+    let CallStage::Chat(person) = &self.stage else {
+      return false;
+    };
+    if members != [person.as_str()] {
+      return false;
+    }
+    self.stage = CallStage::Meeting(chat.clone());
+    true
+  }
+
+  /// Whether a message of `group` says the meeting is posted: the call is in that chat, and the message has a meeting
+  /// card.
+  fn is_posted(&self, group: &GroupId, has_card: bool) -> bool {
+    has_card && matches!(&self.stage, CallStage::Meeting(chat) if chat == group)
+  }
+}
+
+/// What the Meet view holds: the events of the day it shows, the meeting being made, and the call being started.
+#[derive(Default)]
+pub struct MeetData {
+  /// The time last asked for: the day on screen. It is kept apart from the Calendar's range, so each view's answers
+  /// are told by its own range and neither takes the other's.
+  pub range: Option<(Micros, Micros)>,
+  /// The events of `range`, once `loaded`; until then, those of the range before it.
+  pub events: Arc<Vec<CalendarEvent>>,
+  /// `events` answers `range`.
+  pub loaded: bool,
+  /// A meeting is being made, and what for, until the core answers.
+  pub creating: Option<Creating>,
+  /// A call is being started, until its meeting is posted or the core says why not.
+  pub calling: Option<Calling>,
+  /// Why the last meeting or call could not be made, until the next try.
+  pub error: Option<String>,
+  /// The link of a meeting made for later, until the view takes it.
+  made: Option<String>,
 }
 
 #[derive(Clone)]
@@ -210,9 +307,14 @@ pub struct Store {
   /// What the Mentions or Starred view shows.
   pub shortcut: Option<ShortcutList>,
   pub unread_only: bool,
-  /// Copies of `Settings::list_sort` and `Settings::section_sort`, taken by `sync_sort`.
+  /// Copies of `Settings::list_sort`, `Settings::section_sort`, and the `show_*` switches of the Mentions, Starred,
+  /// Calendar, and Meet buttons, taken by `sync_settings`.
   pub list_sort: Sort,
   section_sort: std::collections::BTreeMap<String, Sort>,
+  show_mentions: bool,
+  show_starred: bool,
+  show_calendar: bool,
+  show_meet: bool,
   collapsed: HashSet<Section>,
   show_all: HashSet<Section>,
   histories: HashMap<GroupId, History>,
@@ -224,6 +326,8 @@ pub struct Store {
   notified: HashMap<GroupId, Vec<String>>,
   /// People the user can start a chat with, name order.
   pub people: Vec<User>,
+  pub calendar: CalendarData,
+  pub meet: MeetData,
 }
 
 impl Store {
@@ -245,6 +349,8 @@ impl Store {
         SidebarItem::Home,
         SidebarItem::Shortcut(Shortcut::Mentions),
         SidebarItem::Shortcut(Shortcut::Starred),
+        SidebarItem::Calendar,
+        SidebarItem::Meet,
       ],
       view: View::Home,
       back: Vec::new(),
@@ -257,6 +363,10 @@ impl Store {
       unread_only: false,
       list_sort: Sort::default(),
       section_sort: std::collections::BTreeMap::new(),
+      show_mentions: true,
+      show_starred: true,
+      show_calendar: true,
+      show_meet: true,
       // The web app keeps Meetings folded at the bottom.
       collapsed: HashSet::from([Section::Meetings]),
       show_all: HashSet::new(),
@@ -265,6 +375,8 @@ impl Store {
       badge: 0,
       notified: HashMap::new(),
       people: Vec::new(),
+      calendar: CalendarData::default(),
+      meet: MeetData::default(),
     }
   }
 
@@ -372,6 +484,7 @@ impl Store {
           }
         },
         Event::MessageUpsert { message, replaces, incoming } => {
+          self.call_posted(&message);
           if incoming {
             self.notify_incoming(&message, window, cx);
           }
@@ -407,9 +520,15 @@ impl Store {
             view.update(cx, |view, cx| view.set_typing(user_id, user_name, typing, cx));
           }
         },
-        Event::SignedOut(reason) => self.signed_out = Some(reason),
+        Event::SignedOut(reason) => {
+          self.signed_out = Some(reason);
+          // What was asked for before is not answered now.
+          self.meet.creating = None;
+          self.meet.calling = None;
+        },
         // The call button posts the link. Auto-open then joins it (built-in window or browser).
         Event::MeetStarted(url) => {
+          self.meet.calling = None;
           if cx.global::<crate::settings::Settings>().meet_auto_open {
             crate::call::open(&url, cx);
           }
@@ -442,8 +561,50 @@ impl Store {
             view.update(cx, |view, cx| view.set_slash_commands(commands, cx));
           }
         },
-        Event::OpenChat(id) => self.open(id, window, cx),
-        Event::Error(message) => tracing::warn!("core error: {message}"),
+        Event::OpenChat(id) => {
+          if self.is_call_chat(&id) {
+            self.core.send(Command::StartMeet(id));
+          } else {
+            self.open(id, window, cx);
+          }
+        },
+        Event::Calendars(calendars) => self.calendar.calendars = calendars,
+        Event::CalendarEvents { start, end, events } => {
+          // Each view keeps the range it asked for last. An answer for a range neither is on any more is dropped.
+          let range = Some((start, end));
+          if self.meet.range == range {
+            self.meet.events = events.clone();
+            self.meet.loaded = true;
+            self.calendar.error = None;
+          }
+          if self.calendar.range == range {
+            self.calendar.events = events;
+            self.calendar.loaded = true;
+            self.calendar.error = None;
+          }
+        },
+        Event::CalendarWritten(result) => {
+          self.calendar.writing = false;
+          self.calendar.written = Some(result);
+        },
+        Event::CalendarFailed(message) => {
+          tracing::warn!("calendar: {message}");
+          self.calendar.error = Some(message);
+        },
+        Event::MeetingCreated(result) => match (result, self.meet.creating.take()) {
+          (Ok(url), Some(Creating::Instant)) => crate::call::open(&url, cx),
+          (Ok(url), Some(Creating::ForLater)) => self.meet.made = Some(url),
+          (Err(message), _) => self.meet.error = Some(message),
+          // An answer nobody asked for.
+          (Ok(_), None) => {},
+        },
+        Event::Error(message) => {
+          tracing::warn!("core error: {message}");
+          // The call that was being started failed: the Meet view says why.
+          if self.meet.calling.take().is_some() {
+            self.meet.error = Some(message);
+          }
+        },
       }
     }
     if groups_dirty {
@@ -665,20 +826,18 @@ impl Store {
       *by_section.entry(Section::of(&conv.g)).or_default() += unread;
       *by_kind.entry(Kind::of(conv.g.kind)).or_default() += unread;
     }
-    let mut tabs = vec![
-      Tab {
-        pane: Pane::All,
-        unread: by_kind.values().sum(),
-      },
-      Tab {
-        pane: Pane::Shortcut(Shortcut::Mentions),
-        unread: 0,
-      },
-      Tab {
-        pane: Pane::Shortcut(Shortcut::Starred),
-        unread: 0,
-      },
-    ];
+    let mut tabs = vec![Tab {
+      pane: Pane::All,
+      unread: by_kind.values().sum(),
+    }];
+    for (shown, shortcut) in [(self.show_mentions, Shortcut::Mentions), (self.show_starred, Shortcut::Starred)] {
+      if shown {
+        tabs.push(Tab {
+          pane: Pane::Shortcut(shortcut),
+          unread: 0,
+        });
+      }
+    }
     // The user's own sections, then the kinds the account has, then Meetings.
     let sections = ordered(by_section.keys());
     let section_tab = |section: &Section| Tab {
@@ -709,8 +868,18 @@ impl Store {
     let mut items = vec![SidebarItem::Header(Section::Shortcuts)];
     if !self.collapsed.contains(&Section::Shortcuts) {
       items.push(SidebarItem::Home);
-      items.push(SidebarItem::Shortcut(Shortcut::Mentions));
-      items.push(SidebarItem::Shortcut(Shortcut::Starred));
+      if self.show_mentions {
+        items.push(SidebarItem::Shortcut(Shortcut::Mentions));
+      }
+      if self.show_starred {
+        items.push(SidebarItem::Shortcut(Shortcut::Starred));
+      }
+      if self.show_calendar {
+        items.push(SidebarItem::Calendar);
+      }
+      if self.show_meet {
+        items.push(SidebarItem::Meet);
+      }
     }
     let mut by_section: HashMap<Section, Vec<&Arc<Conv>>> = HashMap::new();
     for conv in &self.all {
@@ -845,15 +1014,25 @@ impl Store {
       .unwrap_or_else(|| section.default_sort())
   }
 
-  /// Takes the sort orders from the settings, rebuilding the lists when they changed. Call at start and whenever
-  /// the settings change.
-  pub fn sync_sort(&mut self, cx: &mut Context<Self>) {
+  /// Takes the sort orders and the Mentions, Starred, Calendar, and Meet buttons from the settings, rebuilding the
+  /// lists when they changed. Call at start and whenever the settings change.
+  pub fn sync_settings(&mut self, cx: &mut Context<Self>) {
     let settings = cx.global::<Settings>();
-    if settings.list_sort == self.list_sort && settings.section_sort == self.section_sort {
+    if settings.list_sort == self.list_sort
+      && settings.section_sort == self.section_sort
+      && settings.show_mentions == self.show_mentions
+      && settings.show_starred == self.show_starred
+      && settings.show_calendar == self.show_calendar
+      && settings.show_meet == self.show_meet
+    {
       return;
     }
     self.list_sort = settings.list_sort;
     self.section_sort = settings.section_sort.clone();
+    self.show_mentions = settings.show_mentions;
+    self.show_starred = settings.show_starred;
+    self.show_calendar = settings.show_calendar;
+    self.show_meet = settings.show_meet;
     self.rebuild_sidebar();
     self.rebuild_lists();
     cx.notify();
@@ -868,7 +1047,7 @@ impl Store {
     };
     let current = match &self.view {
       View::Conversation(id) => order.iter().position(|conv| &conv.g.id == id),
-      View::Home | View::Shortcut(_) => None,
+      View::Home | View::Shortcut(_) | View::Calendar | View::Meet => None,
     };
     let next = match (current, forward) {
       (Some(ix), true) => (ix + 1).min(last),
@@ -884,7 +1063,7 @@ impl Store {
   pub fn open_next_unread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let open = match &self.view {
       View::Conversation(id) => Some(id),
-      View::Home | View::Shortcut(_) => None,
+      View::Home | View::Shortcut(_) | View::Calendar | View::Meet => None,
     };
     let Some(id) = self
       .all
@@ -1003,7 +1182,7 @@ impl Store {
     while let Some(view) = stack.pop() {
       let shown = match &view {
         View::Conversation(id) => self.groups.contains_key(id),
-        View::Home | View::Shortcut(_) => true,
+        View::Home | View::Shortcut(_) | View::Calendar | View::Meet => true,
       };
       if shown && view != self.view {
         return Some(view);
@@ -1017,6 +1196,8 @@ impl Store {
     match view {
       View::Home => self.go_home(cx),
       View::Shortcut(shortcut) => self.open_shortcut(shortcut, cx),
+      View::Calendar => self.open_calendar(cx),
+      View::Meet => self.open_meet(cx),
       View::Conversation(id) => self.open(id, window, cx),
     }
     self.moving = false;
@@ -1042,6 +1223,128 @@ impl Store {
     self.conv = None;
     self.load_shortcut(shortcut);
     cx.notify();
+  }
+
+  /// Shows Google Calendar. The view asks for the time it shows.
+  pub fn open_calendar(&mut self, cx: &mut Context<Self>) {
+    if matches!(self.view, View::Conversation(_)) {
+      self.core.send(Command::Close);
+    }
+    self.set_view(View::Calendar);
+    self.conv = None;
+    self.drop_shortcut(cx);
+    cx.notify();
+  }
+
+  /// Shows Meet. The view asks for the day it shows.
+  pub fn open_meet(&mut self, cx: &mut Context<Self>) {
+    if matches!(self.view, View::Conversation(_)) {
+      self.core.send(Command::Close);
+    }
+    self.set_view(View::Meet);
+    self.conv = None;
+    self.drop_shortcut(cx);
+    self.meet.error = None;
+    cx.notify();
+  }
+
+  /// Asks for the events of `start..end`, and for the calendars when none are held. The events on screen stay until
+  /// the answer comes.
+  pub fn load_calendar(&mut self, start: Micros, end: Micros, cx: &mut Context<Self>) {
+    if self.calendar.calendars.is_empty() {
+      self.core.send(Command::LoadCalendars);
+    }
+    if self.calendar.range != Some((start, end)) {
+      self.calendar.range = Some((start, end));
+      self.calendar.loaded = false;
+    }
+    self.core.send(Command::LoadEvents { start, end });
+    cx.notify();
+  }
+
+  /// Sends a calendar write (`SaveEvent`, `DeleteEvent`, `RespondEvent`). The core answers `CalendarWritten`, and
+  /// then the events again.
+  pub fn write_calendar(&mut self, command: Command, cx: &mut Context<Self>) {
+    self.calendar.writing = true;
+    self.calendar.written = None;
+    self.core.send(command);
+    cx.notify();
+  }
+
+  /// How the last calendar write went, once.
+  pub const fn take_calendar_write(&mut self) -> Option<Result<(), String>> {
+    self.calendar.written.take()
+  }
+
+  /// Asks for the events of `start..end` for the Meet view, and for the calendars when none are held: the editor that
+  /// "Schedule in Google Calendar" opens needs them. The events on screen stay until the answer comes.
+  pub fn load_meet(&mut self, start: Micros, end: Micros, cx: &mut Context<Self>) {
+    if self.calendar.calendars.is_empty() {
+      self.core.send(Command::LoadCalendars);
+    }
+    if self.meet.range != Some((start, end)) {
+      self.meet.range = Some((start, end));
+      self.meet.loaded = false;
+    }
+    self.core.send(Command::LoadEvents { start, end });
+    cx.notify();
+  }
+
+  /// Asks the core for a meeting of its own. `MeetingCreated` answers, and `intent` says what becomes of the link.
+  pub fn create_meeting(&mut self, intent: Creating, cx: &mut Context<Self>) {
+    if self.meet.creating.is_some() {
+      return;
+    }
+    self.meet.creating = Some(intent);
+    self.meet.error = None;
+    self.core.send(Command::CreateMeeting);
+    cx.notify();
+  }
+
+  /// The link of the meeting made for later, once.
+  pub const fn take_meeting(&mut self) -> Option<String> {
+    self.meet.made.take()
+  }
+
+  /// Starts a call with a person: the core posts a meeting in their chat, and `MeetStarted` opens it. Without a chat
+  /// yet, the core makes one first and `OpenChat` carries the call on from there, without opening that chat.
+  pub fn call_person(&mut self, person: &User, cx: &mut Context<Self>) {
+    if self.meet.calling.is_some() {
+      return;
+    }
+    let chat = self.existing_chat(std::slice::from_ref(&person.id));
+    self.meet.error = None;
+    self.meet.calling = Some(Calling::new(person.name.clone(), person.id.clone(), chat.clone()));
+    match chat {
+      Some(id) => self.core.send(Command::StartMeet(id)),
+      None => self.core.send(Command::CreateChat { user_ids: vec![person.id.clone()] }),
+    }
+    cx.notify();
+  }
+
+  /// Whether `chat` is the one made for the call being started: the meeting is posted in it, and it is not opened.
+  fn is_call_chat(&mut self, chat: &GroupId) -> bool {
+    let (Some(call), Some(conv)) = (&mut self.meet.calling, self.groups.get(chat)) else {
+      return false;
+    };
+    call.take_chat(chat, &conv.g.member_ids)
+  }
+
+  /// A meeting card in the chat of the call being started says the meeting is posted: nothing is waited for. The core
+  /// answers `MeetStarted` after it, but an answer that never comes must not leave the call waiting.
+  fn call_posted(&mut self, message: &Message) {
+    let card = message
+      .attachments
+      .iter()
+      .any(|attachment| attachment.kind == AttachmentKind::Meet);
+    if self
+      .meet
+      .calling
+      .as_ref()
+      .is_some_and(|call| call.is_posted(&message.group, card))
+    {
+      self.meet.calling = None;
+    }
   }
 
   /// Asks for the newest messages of a shortcut, replacing the ones held.
@@ -1137,7 +1440,7 @@ fn ordered<'a>(present: impl Iterator<Item = &'a Section>) -> Vec<Section> {
 
 #[cfg(test)]
 mod tests {
-  use super::Section;
+  use super::{Calling, Section};
   use crate::settings::Sort;
   use gchat_core::{Group, GroupId, GroupKind, Notify, Placement};
 
@@ -1187,5 +1490,36 @@ mod tests {
     assert_eq!(Section::Spaces.default_sort(), Sort::Recent);
     assert_eq!(Section::Meetings.default_sort(), Sort::Recent);
     assert_eq!(Section::Dms.title(), "Direct messages");
+  }
+
+  fn dm(id: &str) -> GroupId {
+    GroupId::Dm(id.into())
+  }
+
+  fn members(ids: &[&str]) -> Vec<String> {
+    ids.iter().map(|id| (*id).to_string()).collect()
+  }
+
+  #[test]
+  fn a_call_in_a_chat_is_posted_when_its_meeting_card_shows_there() {
+    let call = Calling::new("Jordan Park".into(), "jpark".into(), Some(dm("jpark-chat")));
+    assert!(call.is_posted(&dm("jpark-chat"), true));
+    assert!(!call.is_posted(&dm("jpark-chat"), false));
+    assert!(!call.is_posted(&dm("rbrooks-chat"), true));
+  }
+
+  #[test]
+  fn a_call_without_a_chat_waits_for_the_chat_made_with_that_person_alone() {
+    let mut call = Calling::new("Jordan Park".into(), "jpark".into(), None);
+    // Nothing is posted until there is a chat to post it in.
+    assert!(!call.is_posted(&dm("jpark-chat"), true));
+    // The chat of someone else, and a chat that has them and others, are not the one.
+    assert!(!call.take_chat(&dm("rbrooks-chat"), &members(&["rbrooks"])));
+    assert!(!call.take_chat(&dm("group-chat"), &members(&["jpark", "rbrooks"])));
+    assert!(call.take_chat(&dm("jpark-chat"), &members(&["jpark"])));
+    assert!(call.is_posted(&dm("jpark-chat"), true));
+    // The call has its chat: it takes no other.
+    assert!(!call.take_chat(&dm("jpark-other"), &members(&["jpark"])));
+    assert!(!call.is_posted(&dm("jpark-other"), true));
   }
 }

@@ -9,7 +9,9 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::calendar::OpenCalendar;
 use crate::home::{ROW_HEIGHT, RowMarks, conv_row, hit_row, unread_toggle};
+use crate::meet::OpenMeet;
 use crate::menu;
 use crate::new_chat::OpenNewChat;
 use crate::settings::{Layout, Settings};
@@ -99,7 +101,7 @@ impl ConvList {
   fn follow_open(&mut self, store: &Store) {
     let open = match &store.view {
       View::Conversation(id) => Some(id),
-      View::Home | View::Shortcut(_) => None,
+      View::Home | View::Shortcut(_) | View::Calendar | View::Meet => None,
     };
     if open == self.followed.as_ref() {
       return;
@@ -132,7 +134,7 @@ impl ConvList {
   fn conversation_rows(&self, range: Range<usize>, store: &Store, cx: &App) -> Vec<AnyElement> {
     let open = match &store.view {
       View::Conversation(id) => Some(id),
-      View::Home | View::Shortcut(_) => None,
+      View::Home | View::Shortcut(_) | View::Calendar | View::Meet => None,
     };
     let mut out = Vec::with_capacity(range.len());
     for ix in range {
@@ -160,11 +162,11 @@ impl ConvList {
     out
   }
 
-  /// Messages: the title with buttons for Mentions, Starred, and New chat, then the filter chips.
+  /// Messages: the title with buttons for Mentions, Starred, Calendar, Meet, and New chat, then the filter chips.
   fn messages_header(&self, store: &Store, cx: &Context<Self>) -> Div {
     let shown = match &store.view {
       View::Shortcut(shortcut) => Some(*shortcut),
-      View::Home | View::Conversation(_) => None,
+      View::Home | View::Calendar | View::Meet | View::Conversation(_) => None,
     };
     let shortcut_button = |id: &'static str, glyph: Icon, name: &'static str, shortcut: Shortcut| {
       let handle = self.store.clone();
@@ -172,10 +174,37 @@ impl ConvList {
         .tooltip(hint(name))
         .on_click(move |_, _, cx| handle.update(cx, |s, cx| s.open_shortcut(shortcut, cx)))
     };
+    let (show_mentions, show_starred, show_calendar, show_meet) = {
+      let settings = cx.global::<Settings>();
+      (
+        settings.show_mentions,
+        settings.show_starred,
+        settings.show_calendar,
+        settings.show_meet,
+      )
+    };
     let actions = h_flex()
       .gap_1()
-      .child(shortcut_button("mentions", Icon::AtSign, "Mentions", Shortcut::Mentions))
-      .child(shortcut_button("starred", Icon::Star, "Starred", Shortcut::Starred))
+      .when(show_mentions, |actions| {
+        actions.child(shortcut_button("mentions", Icon::AtSign, "Mentions", Shortcut::Mentions))
+      })
+      .when(show_starred, |actions| {
+        actions.child(shortcut_button("starred", Icon::Star, "Starred", Shortcut::Starred))
+      })
+      .when(show_calendar, |actions| {
+        actions.child(
+          header_button("calendar", Icon::Calendar, store.view == View::Calendar)
+            .tooltip(calendar_tip)
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenCalendar), cx)),
+        )
+      })
+      .when(show_meet, |actions| {
+        actions.child(
+          header_button("meet", Icon::Video, store.view == View::Meet)
+            .tooltip(meet_tip)
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMeet), cx)),
+        )
+      })
       .when(shown.is_none(), |actions| actions.child(sort_button("sort-list", cx)))
       .child(
         header_button("new-chat", Icon::Plus, false)
@@ -270,8 +299,18 @@ pub fn new_chat_tip(window: &mut Window, cx: &mut App) -> AnyView {
   Tooltip::new("New chat").action(&OpenNewChat, None).build(window, cx)
 }
 
+/// The tooltip of a Calendar button: its name and keyboard shortcut.
+pub fn calendar_tip(window: &mut Window, cx: &mut App) -> AnyView {
+  Tooltip::new("Calendar").action(&OpenCalendar, None).build(window, cx)
+}
+
+/// The tooltip of a Meet button: its name and keyboard shortcut.
+pub fn meet_tip(window: &mut Window, cx: &mut App) -> AnyView {
+  Tooltip::new("Meet").action(&OpenMeet, None).build(window, cx)
+}
+
 /// A tooltip naming a button.
-fn hint(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView {
+pub fn hint(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView {
   move |window, cx| Tooltip::new(text).build(window, cx)
 }
 

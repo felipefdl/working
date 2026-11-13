@@ -67,6 +67,8 @@ struct Shown {
   items: Vec<MenuItem>,
   /// Items side by side as square cells (an emoji picker) instead of a list.
   strip: bool,
+  /// How wide a list is. A strip is as wide as its items.
+  width: f32,
   previous_focus: Option<FocusHandle>,
 }
 
@@ -82,14 +84,19 @@ impl Global for MenuHandle {}
 
 /// Opens the context menu at `at` (window coordinates).
 pub fn show(at: Point<Pixels>, items: Vec<MenuItem>, window: &mut Window, cx: &mut App) {
+  show_sized(at, WIDTH, items, window, cx);
+}
+
+/// Opens the context menu at `at`, `width` wide: for labels that do not fit the usual width.
+pub fn show_sized(at: Point<Pixels>, width: f32, items: Vec<MenuItem>, window: &mut Window, cx: &mut App) {
   let menu = cx.global::<MenuHandle>().0.clone();
-  menu.update(cx, |menu, cx| menu.open(at, items, false, window, cx));
+  menu.update(cx, |menu, cx| menu.open(at, items, false, width, window, cx));
 }
 
 /// Opens a strip of short choices (emoji) at `at`.
 pub fn show_strip(at: Point<Pixels>, items: Vec<MenuItem>, window: &mut Window, cx: &mut App) {
   let menu = cx.global::<MenuHandle>().0.clone();
-  menu.update(cx, |menu, cx| menu.open(at, items, true, window, cx));
+  menu.update(cx, |menu, cx| menu.open(at, items, true, WIDTH, window, cx));
 }
 
 impl ContextMenu {
@@ -106,6 +113,7 @@ impl ContextMenu {
     at: Point<Pixels>,
     items: Vec<MenuItem>,
     strip: bool,
+    width: f32,
     window: &mut Window,
     cx: &mut Context<Self>,
   ) {
@@ -116,7 +124,7 @@ impl ContextMenu {
       Some(shown) => shown.previous_focus,
       None => window.focused(cx),
     };
-    self.shown = Some(Shown { at, items, strip, previous_focus });
+    self.shown = Some(Shown { at, items, strip, width, previous_focus });
     window.focus(&self.focus, cx);
     // Again once the click is over: a left mouse press moves focus to what was pressed after this runs.
     let focus = self.focus.clone();
@@ -159,7 +167,7 @@ impl Render for ContextMenu {
     let (width, height) = if shown.strip {
       (count.mul_add(CELL, 8.), CELL + 8.)
     } else {
-      (WIDTH, count.mul_add(ITEM_HEIGHT, 8.))
+      (shown.width, count.mul_add(ITEM_HEIGHT, 8.))
     };
     let left = shown.at.x.min(window_size.width - px(width + 8.)).max(px(8.));
     let top = shown.at.y.min(window_size.height - px(height + 8.)).max(px(8.));
@@ -170,7 +178,7 @@ impl Render for ContextMenu {
       .top(top)
       .flex()
       .when(shown.strip, gpui_kit::Styled::px_1)
-      .when(!shown.strip, |panel| panel.flex_col().w(px(WIDTH)))
+      .when(!shown.strip, |panel| panel.flex_col().w(px(shown.width)))
       .py_1()
       .rounded(px(10.))
       .bg(rgb(POPOVER))
