@@ -5,6 +5,7 @@ use std::time::Duration;
 use gchat_core::{Command, Core, DndSchedule, DndSchedules, McpStatus};
 use gpui_kit::component::IndexPath;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -126,11 +127,14 @@ pub struct SettingsView {
   _reset_disarm: Option<Task<()>>,
   dark_theme: Entity<SelectState<Vec<ThemeChoice>>>,
   light_theme: Entity<SelectState<Vec<ThemeChoice>>>,
+  font: Entity<SelectState<SearchableVec<FontChoice>>>,
+  mono_font: Entity<SelectState<SearchableVec<FontChoice>>>,
   _copied_reset: Option<Task<()>>,
   _refresh: Task<()>,
   _globals: [Subscription; 3],
   _rewrite_sub: Subscription,
   _theme_subs: [Subscription; 2],
+  _font_subs: [Subscription; 2],
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -186,6 +190,23 @@ impl SettingsView {
         Settings::update(cx, |settings| settings.pick_theme(index));
       })
     });
+    let font = Self::font_select(false, window, cx);
+    let mono_font = Self::font_select(true, window, cx);
+    let font_subs = [(&font, false), (&mono_font, true)].map(|(select, mono)| {
+      cx.subscribe(select, move |_, _, event: &SelectEvent<SearchableVec<FontChoice>>, cx| {
+        let SelectEvent::Confirm(Some(family)) = event else {
+          return;
+        };
+        let family = family.clone();
+        Settings::update(cx, |settings| {
+          if mono {
+            settings.mono_font = family;
+          } else {
+            settings.font = family;
+          }
+        });
+      })
+    });
     Self {
       core,
       section: Section::Appearance,
@@ -197,6 +218,8 @@ impl SettingsView {
       _reset_disarm: None,
       dark_theme,
       light_theme,
+      font,
+      mono_font,
       _copied_reset: None,
       _refresh: refresh,
       _globals: [
@@ -207,6 +230,7 @@ impl SettingsView {
       ],
       _rewrite_sub: rewrite_sub,
       _theme_subs: theme_subs,
+      _font_subs: font_subs,
     }
   }
 
@@ -289,9 +313,13 @@ impl SettingsView {
       )
   }
 
-  /// A theme select at a fixed width. The select fills its parent, so without the wrapper it would take the row
+  /// A select at a fixed width. The select fills its parent, so without the wrapper it would take the row
   /// and squeeze the title into a one-letter column.
-  fn theme_field(select: Select<Vec<ThemeChoice>>) -> Div {
+  fn select_field<D>(select: Select<D>) -> Div
+  where
+    D: SearchableListDelegate + 'static,
+    <D::Item as SearchableListItem>::Value: PartialEq + Clone,
+  {
     div().w(px(220.)).flex_shrink_0().child(select.w_full().menu_max_h(px(320.)))
   }
 
@@ -638,6 +666,51 @@ impl SettingsView {
     }
   }
 
+  /// The interface fonts, or the system monospaced font, with the saved family selected. A saved family that is no
+  /// longer installed shows System, as the windows draw it.
+  fn font_select(
+    mono: bool,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) -> Entity<SelectState<SearchableVec<FontChoice>>> {
+    let settings = cx.global::<Settings>();
+    let shown = if mono {
+      settings.shown_mono_font(cx)
+    } else {
+      settings.shown_font(cx)
+    };
+    let choices = FontChoice::all(cx);
+    let selected = choices
+      .iter()
+      .position(|choice| choice.family.as_deref() == shown.as_deref())
+      .map(IndexPath::new);
+    cx.new(|cx| SelectState::new(SearchableVec::new(choices), selected, window, cx).searchable(true))
+  }
+
+  fn fonts(&self) -> Div {
+    let field = |select: &Entity<SelectState<SearchableVec<FontChoice>>>, id: &'static str| {
+      Self::select_field(
+        Select::new(select)
+          .id(id)
+          .search_placeholder("Search fonts")
+          .menu_width(px(260.)),
+      )
+    };
+    Self::group(
+      "Fonts",
+      Self::card()
+        .child(Self::row("Font", "System is the macOS system font.", true).child(field(&self.font, "font")))
+        .child(
+          Self::row(
+            "Monospace font",
+            "Code in messages. System is the macOS monospaced font.",
+            false,
+          )
+          .child(field(&self.mono_font, "mono-font")),
+        ),
+    )
+  }
+
   fn appearance(&self, settings: Settings) -> Div {
     v_flex()
       .gap_5()
@@ -650,13 +723,14 @@ impl SettingsView {
           )
           .child(
             Self::row("Dark theme", "⌘⇧T previews every theme before you pick.", false)
-              .child(Self::theme_field(Select::new(&self.dark_theme).id("dark-theme"))),
+              .child(Self::select_field(Select::new(&self.dark_theme).id("dark-theme"))),
           )
           .child(
             Self::row("Light theme", "Shown when the color mode is light.", false)
-              .child(Self::theme_field(Select::new(&self.light_theme).id("light-theme"))),
+              .child(Self::select_field(Select::new(&self.light_theme).id("light-theme"))),
           ),
       ))
+      .child(self.fonts())
       .child(Self::group(
         "Density",
         Self::card().py_4().child(
@@ -1455,5 +1529,36 @@ impl SelectItem for ThemeChoice {
 
   fn value(&self) -> &usize {
     &self.index
+  }
+}
+
+/// One family in a font select; `None` is System. Titles show in the interface font: no preview of each family.
+#[derive(Clone)]
+struct FontChoice {
+  family: Option<String>,
+}
+
+impl FontChoice {
+  /// System, then every installed family.
+  fn all(cx: &App) -> Vec<Self> {
+    std::iter::once(None)
+      .chain(settings::installed_fonts(cx).iter().cloned().map(Some))
+      .map(|family| Self { family })
+      .collect()
+  }
+}
+
+impl SelectItem for FontChoice {
+  type Value = Option<String>;
+
+  fn title(&self) -> SharedString {
+    self
+      .family
+      .as_ref()
+      .map_or_else(|| "System".into(), |family| family.clone().into())
+  }
+
+  fn value(&self) -> &Option<String> {
+    &self.family
   }
 }

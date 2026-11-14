@@ -2,6 +2,7 @@
 //! read them are redrawn when they change.
 
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 
 use gchat_core::{Command, Core, McpConfig, McpStatus};
 use gpui_kit::component::{Theme, ThemeMode};
@@ -252,6 +253,11 @@ pub struct Settings {
   /// Theme ids in `theme::THEMES`, one for each appearance.
   pub dark_theme: String,
   pub light_theme: String,
+  /// The interface font, by family name. Absent is the macOS system font. A family that is no longer installed
+  /// reads as absent.
+  pub font: Option<String>,
+  /// The font of code spans and code blocks, by family name. Absent is the macOS system monospaced font.
+  pub mono_font: Option<String>,
   pub density: Density,
   pub layout: Layout,
   pub sidebar: SidebarMode,
@@ -297,6 +303,10 @@ pub struct Settings {
   /// Every message is rewritten before it sends. Right-clicking the composer's rewrite button flips it.
   #[serde(default)]
   pub rewrite_always: bool,
+  /// The formatting bar above the text of every composer, which the toggle at the composer's right shows and hides. The
+  /// formatting keys work whether it is shown or not.
+  #[serde(default)]
+  pub show_format_bar: bool,
   /// The Calendar view last used.
   #[serde(default)]
   pub calendar_mode: crate::calendar_layout::Mode,
@@ -314,6 +324,8 @@ impl Default for Settings {
       appearance: Appearance::default(),
       dark_theme: theme::DEFAULT_DARK.into(),
       light_theme: theme::DEFAULT_LIGHT.into(),
+      font: None,
+      mono_font: None,
       density: Density::default(),
       layout: Layout::default(),
       sidebar: SidebarMode::default(),
@@ -339,6 +351,7 @@ impl Default for Settings {
       rewrite: RewriteTool::Off,
       rewrite_instruction: DEFAULT_REWRITE_INSTRUCTION.into(),
       rewrite_always: false,
+      show_format_bar: false,
       calendar_mode: crate::calendar_layout::Mode::default(),
       calendar_panel_closed: false,
       calendar_hidden: Vec::new(),
@@ -440,6 +453,16 @@ impl Settings {
     }
   }
 
+  /// The interface family windows draw with: the saved one when it is installed, else the system font.
+  pub fn shown_font(&self, cx: &App) -> Option<SharedString> {
+    installed_family(self.font.as_deref(), installed_fonts(cx))
+  }
+
+  /// The monospace family windows draw with: the saved one when it is installed, else the system monospaced font.
+  pub fn shown_mono_font(&self, cx: &App) -> Option<SharedString> {
+    installed_family(self.mono_font.as_deref(), installed_fonts(cx))
+  }
+
   /// Index in `THEMES` of the theme windows show now.
   pub fn shown_theme(&self, cx: &App) -> usize {
     if self.light(cx) {
@@ -470,6 +493,23 @@ impl Settings {
   }
 }
 
+/// The font families installed on the Mac, sorted, listed once: asking Core Text costs around a hundred milliseconds
+/// and the answer does not change while the app runs.
+pub fn installed_fonts(cx: &App) -> &'static [String] {
+  static NAMES: OnceLock<Vec<String>> = OnceLock::new();
+  NAMES.get_or_init(|| cx.text_system().all_font_names())
+}
+
+/// `saved` when `installed` has it. GPUI panics on the first line it lays out in a family it cannot find, so a
+/// font that was uninstalled since it was saved reads as System (`None`).
+fn installed_family(saved: Option<&str>, installed: &[String]) -> Option<SharedString> {
+  let saved = saved?;
+  installed
+    .binary_search_by(|name| name.as_str().cmp(saved))
+    .is_ok()
+    .then(|| SharedString::from(saved.to_string()))
+}
+
 /// Starts the MCP server when the settings ask for it, and restarts or stops it whenever they (or its token)
 /// change.
 pub fn keep_mcp(core: Core, cx: &mut App) {
@@ -496,7 +536,7 @@ pub fn replace_mcp_token(cx: &mut App) {
   cx.set_global(settings);
 }
 
-/// Puts the theme of the chosen appearance (or the system's) on every window.
+/// Puts the theme of the chosen appearance (or the system's) and the chosen fonts on every window.
 pub fn apply_appearance(cx: &mut App) {
   let index = cx.global::<Settings>().shown_theme(cx);
   show_theme(index, cx);
@@ -505,6 +545,9 @@ pub fn apply_appearance(cx: &mut App) {
 /// Puts the theme at `index` in `THEMES` on every window, without saving it: the theme picker previews with it.
 pub fn show_theme(index: usize, cx: &mut App) {
   theme::set(index);
+  let settings = cx.global::<Settings>();
+  let (sans, mono) = (settings.shown_font(cx), settings.shown_mono_font(cx));
+  theme::set_fonts(sans, mono);
   Theme::change(
     if theme::is_light() {
       ThemeMode::Light
@@ -530,13 +573,16 @@ pub fn show_theme(index: usize, cx: &mut App) {
     kit.list_active = rgb(ROW_SELECTED).into();
     kit.accent = rgb(ROW_SELECTED).into();
     kit.accent_foreground = rgb(TEXT).into();
+    // Inputs, menus and the composer draw with the kit's families, not the window root's.
+    kit.font_family = theme::sans();
+    kit.mono_font_family = theme::mono();
   });
   cx.refresh_windows();
 }
 
 #[cfg(test)]
 mod tests {
-  use super::{Appearance, Settings, Sound};
+  use super::{Appearance, Settings, Sound, installed_family};
   use crate::theme::find;
 
   #[test]
@@ -605,6 +651,24 @@ mod tests {
   }
 
   #[test]
+  fn the_format_bar_is_hidden_until_it_is_shown() {
+    assert!(!Settings::default().show_format_bar);
+    let settings: Settings = serde_json::from_str("{}").expect("empty object uses Default");
+    assert!(!settings.show_format_bar);
+  }
+
+  #[test]
+  fn the_format_bar_roundtrip() {
+    let settings = Settings {
+      show_format_bar: true,
+      ..Settings::default()
+    };
+    let text = serde_json::to_string(&settings).expect("serialize");
+    let loaded: Settings = serde_json::from_str(&text).expect("deserialize");
+    assert!(loaded.show_format_bar);
+  }
+
+  #[test]
   fn a_pick_keeps_the_theme_for_its_own_appearance() {
     let mut settings = Settings::default();
     settings.pick_theme(find("dracula", true));
@@ -624,5 +688,30 @@ mod tests {
     assert_eq!(settings.appearance, Appearance::Light);
     assert_eq!(settings.light_theme, "github-light");
     assert_eq!(settings.dark_theme, crate::theme::DEFAULT_DARK);
+  }
+
+  #[test]
+  fn fonts_default_to_system_and_roundtrip() {
+    let settings: Settings = serde_json::from_str("{}").expect("empty object uses Default");
+    assert_eq!(settings.font, None);
+    assert_eq!(settings.mono_font, None);
+    let settings = Settings {
+      font: Some("Helvetica Neue".into()),
+      mono_font: Some("Courier New".into()),
+      ..Settings::default()
+    };
+    let text = serde_json::to_string(&settings).expect("serialize");
+    let loaded: Settings = serde_json::from_str(&text).expect("deserialize");
+    assert_eq!(loaded.font.as_deref(), Some("Helvetica Neue"));
+    assert_eq!(loaded.mono_font.as_deref(), Some("Courier New"));
+  }
+
+  #[test]
+  fn a_font_that_is_not_installed_reads_as_system() {
+    let installed = ["Courier New".to_string(), "Helvetica Neue".to_string(), "Menlo".to_string()];
+    assert_eq!(installed_family(Some("Menlo"), &installed).as_deref(), Some("Menlo"));
+    assert_eq!(installed_family(Some("Comic Neue"), &installed), None);
+    assert_eq!(installed_family(Some(""), &installed), None);
+    assert_eq!(installed_family(None, &installed), None);
   }
 }

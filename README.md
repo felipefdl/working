@@ -47,12 +47,15 @@ Pick the layout that fits how you work, switch any time in Settings, and every l
 - **Fast to open, fast to switch.** A disk cache paints the last state on launch. `Cmd+K` jumps to any conversation with fuzzy search, and Enter in the search bar searches message text.
 - **Pick a layout.** Google Chat's sidebar, a Messages-style list with previews, or a Rail of categories beside the list, each sortable by most recent or A to Z. The sidebar button opens or closes the sidebar, and a right-click auto-hides it: closed until the pointer reaches the window's edge. The sidebar can sit on either side and resizes by its edge. `Option+Cmd+Down` and `Option+Cmd+Up` step through conversations, `Shift+Option+Cmd+Down` jumps to the newest unread one\.
 - **Full conversations.** Formatted text, threads, replies, quotes, edits, reactions with a full emoji picker, cards, and attachments.
+- **Read receipts.** Where Google Chat has them on, the small round avatar of each person who has read a conversation sits beside the last message they read, and moves as they read on. People on the same message overlap (four at most, then a count), hovering names them, and threads show them too.
+- **Format as you write.** Bold, italic, strikethrough, bulleted lists, code, and code blocks, from a bar above the text (the underlined A at the composer's right shows or hides it) or from `Cmd+B`, `Cmd+I`, `Shift+Cmd+X`, and `Shift+Cmd+8`, which work with the bar hidden too. The draft keeps Google Chat's own markers (`*bold*`, `_italic_`, `~strike~`), so typing them by hand formats the same way.
 - **Media viewer.** Images open in a zoomable viewer; video, audio, PDF, and text files open inside the app.
 - **Google Meet in its own window.** Join calls with camera, microphone, and screen sharing, in a window that looks like the rest of the app.
 - **Notifications that respect your time.** System notifications with a choice of sounds, an unread count on the Dock icon, and the do-not-disturb schedules your Google account already keeps.
 - **Presence on your terms.** Show as active automatically, only during working hours, or always online or away, and set a custom status.
 - **Rewrite a draft.** `Cmd+Shift+R` rewrites the message you are writing through the Claude Code or Codex CLI you already have installed, with its tools turned off.
 - **28 color themes.** Pick one for light mode and one for dark mode, and Working follows the system.
+- **Your fonts.** Settings picks the interface font and the monospace font for code from the families installed on your Mac; System keeps the macOS system fonts. Both apply at once.
 - **Local MCP server.** Optional. Lets AI agents on your Mac read and search your chats, and send as you if you allow it. It listens on localhost only and requires a token.
 - **Updates itself.** New versions install in the background. A **Restart** card appears when one is ready.
 

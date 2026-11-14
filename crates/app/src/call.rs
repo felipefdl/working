@@ -16,7 +16,7 @@ use wry::WebViewBuilder;
 use crate::screen::{self, End, Frame, Share};
 use crate::session;
 use crate::settings::Settings;
-use crate::theme::{ACCENT, ACCENT_BG, BG, FIELD, GREEN, HANGUP, MUTED, OFF_BG, TEXT, Tone, WHITE, rgb};
+use crate::theme::{self, ACCENT, ACCENT_BG, BG, FIELD, GREEN, HANGUP, MUTED, OFF_BG, TEXT, Tone, WHITE, rgb};
 
 use crate::ui::{Icon, icon};
 
@@ -474,6 +474,7 @@ impl Render for CallView {
     v_flex()
       .size_full()
       .bg(rgb(BG))
+      .font_family(theme::sans())
       .child(bar)
       .child(div().flex_1().min_h_0().w_full().child(self.web.clone()))
       .children(controls)

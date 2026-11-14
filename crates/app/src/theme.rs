@@ -8,9 +8,10 @@
 //! until they stand apart, as Working's own do. Text that reads below 7:1 on its surfaces (4.5:1 for muted) keeps its
 //! hue and moves in lightness until it clears that: Solarized's body text and GitHub Dark Dimmed's menu rows.
 
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use gpui_kit::Rgba;
+use gpui_kit::{Rgba, SharedString};
 
 /// The colors of one theme.
 pub struct Colors {
@@ -140,7 +141,33 @@ pub const WHITE: Tone = Tone(|_| 0xffffff);
 /// `red` is tuned for text and reads washed out as a fill.
 pub const HANGUP: Tone = Tone(|_| 0xc5221f);
 
-pub const MONO: &str = "Menlo";
+/// The interface font when the user has not picked one: GPUI's name for the macOS system font, which it already uses
+/// where no family is set.
+pub const SYSTEM_FONT: &str = ".SystemUIFont";
+
+/// The monospace font when the user has not picked one: the macOS system monospaced font (SF Mono), which Core Text
+/// reaches under this name whether or not the SF Mono family is installed in Font Book.
+pub const SYSTEM_MONO: &str = ".AppleSystemUIFontMonospaced";
+
+/// The families the user picked in Settings, `None` for System. Set with the theme, see `settings::show_theme`.
+static FONTS: RwLock<(Option<SharedString>, Option<SharedString>)> = RwLock::new((None, None));
+
+/// Keeps the interface and monospace families, `None` meaning System. Windows need a refresh afterwards.
+pub fn set_fonts(sans: Option<SharedString>, mono: Option<SharedString>) {
+  *FONTS.write().unwrap_or_else(std::sync::PoisonError::into_inner) = (sans, mono);
+}
+
+/// The family of the interface text.
+pub fn sans() -> SharedString {
+  let fonts = FONTS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+  fonts.0.clone().unwrap_or_else(|| SYSTEM_FONT.into())
+}
+
+/// The family of code spans and code blocks.
+pub fn mono() -> SharedString {
+  let fonts = FONTS.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+  fonts.1.clone().unwrap_or_else(|| SYSTEM_MONO.into())
+}
 
 pub static THEMES: [Theme; 28] = [
   Theme {
