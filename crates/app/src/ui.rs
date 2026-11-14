@@ -68,6 +68,13 @@ pub enum Icon {
   Trash,
   List,
   Link,
+  Bold,
+  Italic,
+  Strikethrough,
+  Code,
+  SquareCode,
+  /// An A with a line under it: the formatting toggle of the composer.
+  Baseline,
 }
 
 macro_rules! lucide {
@@ -220,6 +227,20 @@ impl Icon {
       Self::Link => lucide!(
         r#"<path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>"#
       ),
+      Self::Bold => {
+        lucide!(r#"<path d="M6 12h9a4 4 0 0 1 0 8H7a1 1 0 0 1-1-1V5a1 1 0 0 1 1-1h7a4 4 0 0 1 0 8"/>"#)
+      },
+      Self::Italic => lucide!(
+        r#"<line x1="19" x2="10" y1="4" y2="4"/><line x1="14" x2="5" y1="20" y2="20"/><line x1="15" x2="9" y1="4" y2="20"/>"#
+      ),
+      Self::Strikethrough => lucide!(
+        r#"<path d="M16 4H9a3 3 0 0 0-2.83 4"/><path d="M14 12a4 4 0 0 1 0 8H6"/><line x1="4" x2="20" y1="12" y2="12"/>"#
+      ),
+      Self::Code => lucide!(r#"<path d="m16 18 6-6-6-6"/><path d="m8 6-6 6 6 6"/>"#),
+      Self::SquareCode => lucide!(
+        r#"<path d="m10 9-3 3 3 3"/><path d="m14 15 3-3-3-3"/><rect x="3" y="3" width="18" height="18" rx="2"/>"#
+      ),
+      Self::Baseline => lucide!(r#"<path d="M4 20h16"/><path d="m6 16 6-12 6 12"/><path d="M8 12h8"/>"#),
     }
   }
 }

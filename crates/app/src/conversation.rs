@@ -7,7 +7,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gchat_core::{Command, Core, Group, GroupKind, Message, SlashCommand, User};
+use gchat_core::{Command, Core, Group, GroupKind, Message, ReadReceipt, SlashCommand, User};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Paste, RopeExt as _, Textarea, TextareaState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
@@ -15,8 +15,10 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::completion::{self, Menu, Trigger};
+use crate::conv_list::hint;
+use crate::format_logic::Format;
 use crate::images::Images;
-use crate::message::{self, Act, Actor, MsgCtx, Opener, Row};
+use crate::message::{self, Act, Actor, MsgCtx, Opener, Readers, Row};
 use crate::settings::{Density, RewriteTool, Settings};
 use crate::store::{History, Store};
 use crate::theme::{ACCENT, ACCENT_BG, BORDER, FIELD, MUTED, PLACEHOLDER, POPOVER, ROW_HOVER, ROW_SELECTED, TEXT, rgb};
@@ -24,6 +26,61 @@ use crate::ui::{Icon, group_avatar, icon};
 
 const TYPING_IDLE: Duration = Duration::from_secs(5);
 const TYPING_EXPIRY: Duration = Duration::from_secs(8);
+
+actions!(working, [FormatBold, FormatItalic, FormatStrikethrough, FormatBulletedList]);
+
+/// One button of the formatting bar.
+struct FormatButton {
+  format: Format,
+  glyph: Icon,
+  id: &'static str,
+  /// What its tooltip says: the name, and the key when it has one.
+  tip: &'static str,
+}
+
+/// The formatting bar's buttons, in groups with a divider between them: styles, the list, and code.
+const FORMAT_BAR: [&[FormatButton]; 3] = [
+  &[
+    FormatButton {
+      format: Format::Bold,
+      glyph: Icon::Bold,
+      id: "format-bold",
+      tip: "Bold (⌘B)",
+    },
+    FormatButton {
+      format: Format::Italic,
+      glyph: Icon::Italic,
+      id: "format-italic",
+      tip: "Italic (⌘I)",
+    },
+    FormatButton {
+      format: Format::Strikethrough,
+      glyph: Icon::Strikethrough,
+      id: "format-strikethrough",
+      tip: "Strikethrough (⇧⌘X)",
+    },
+  ],
+  &[FormatButton {
+    format: Format::Bullets,
+    glyph: Icon::List,
+    id: "format-bullets",
+    tip: "Bulleted list (⇧⌘8)",
+  }],
+  &[
+    FormatButton {
+      format: Format::Code,
+      glyph: Icon::Code,
+      id: "format-code",
+      tip: "Code",
+    },
+    FormatButton {
+      format: Format::CodeBlock,
+      glyph: Icon::SquareCode,
+      id: "format-code-block",
+      tip: "Code block",
+    },
+  ],
+];
 
 /// Older-history paging state, shared with the list's scroll handler.
 struct LoadState {
@@ -42,6 +99,8 @@ struct LoadState {
 struct Thread {
   topic: String,
   rows: Vec<Row>,
+  /// Who has read up to each of those messages.
+  readers: Readers,
   list: ListState,
   composer: Entity<TextareaState>,
   /// Files that go out with the next reply.
@@ -72,6 +131,10 @@ pub struct ConversationView {
   me_avatar: Option<String>,
   messages: Arc<Vec<Arc<Message>>>,
   rows: Vec<Row>,
+  /// Who has read the conversation, as the core last said: none while Google Chat has read receipts off here.
+  receipts: Arc<Vec<ReadReceipt>>,
+  /// Who has read up to each message of the main list.
+  readers: Readers,
   /// The message layout the lists were measured with.
   density: Density,
   thread: Option<Thread>,
@@ -225,6 +288,8 @@ impl ConversationView {
       me_avatar,
       messages,
       rows,
+      receipts: Arc::default(),
+      readers: Readers::default(),
       density: cx.global::<Settings>().density,
       thread: None,
       opener,
@@ -290,6 +355,18 @@ impl ConversationView {
     self.me_avatar = me.avatar_url;
     self.me_id = me.id;
     self.rebuild(0);
+    cx.notify();
+  }
+
+  /// Takes who has read the conversation, and whether Google Chat has read receipts on in it: with them off, nobody's
+  /// avatar shows. Each avatar sits on the last message its person has read, in the main list and in the thread panel,
+  /// over the rows rather than in them, so people reading on never measure the lists again.
+  pub fn set_readers(&mut self, enabled: bool, receipts: Arc<Vec<ReadReceipt>>, cx: &mut Context<Self>) {
+    self.receipts = if enabled { receipts } else { Arc::default() };
+    self.readers = Readers::place(&self.rows, &self.receipts);
+    if let Some(thread) = &mut self.thread {
+      thread.readers = Readers::place(&thread.rows, &self.receipts);
+    }
     cx.notify();
   }
 
@@ -566,11 +643,13 @@ impl ConversationView {
     let rows = message::build_rows(&self.messages, &self.me_id);
     apply_rows(&self.list, &mut self.rows, rows, prepended);
     self.load.rows.set(self.rows.len());
+    self.readers = Readers::place(&self.rows, &self.receipts);
     let Some(thread) = &mut self.thread else {
       return;
     };
     if let Some(rows) = message::build_thread_rows(&self.messages, &thread.topic, &self.me_id) {
-      apply_rows(&thread.list, &mut thread.rows, rows, 0)
+      apply_rows(&thread.list, &mut thread.rows, rows, 0);
+      thread.readers = Readers::place(&thread.rows, &self.receipts);
     } else {
       // The starting message is gone.
       self.thread = None;
@@ -823,6 +902,7 @@ impl ConversationView {
     let Some(rows) = message::build_thread_rows(&self.messages, topic, &self.me_id) else {
       return;
     };
+    let readers = Readers::place(&rows, &self.receipts);
     let list = ListState::new(rows.len(), ListAlignment::Bottom, px(600.));
     let composer = cx.new(|cx| {
       TextareaState::new(window, cx)
@@ -839,6 +919,7 @@ impl ConversationView {
     self.thread = Some(Thread {
       topic: topic.to_string(),
       rows,
+      readers,
       list,
       composer,
       files: Vec::new(),
@@ -912,12 +993,19 @@ impl ConversationView {
     cx.notify();
   }
 
+  /// Which composer has the keyboard: `Some(true)` the thread's, `Some(false)` the main one, `None` neither.
+  fn focused_composer(&self, window: &Window, cx: &App) -> Option<bool> {
+    match &self.thread {
+      Some(thread) if thread.composer.focus_handle(cx).is_focused(window) => Some(true),
+      _ if self.composer.focus_handle(cx).is_focused(window) => Some(false),
+      _ => None,
+    }
+  }
+
   /// Cmd+V in a composer: files and pictures on the clipboard are attached; text is left to the composer.
   fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-    let in_thread = match &self.thread {
-      Some(thread) if thread.composer.focus_handle(cx).is_focused(window) => true,
-      _ if self.composer.focus_handle(cx).is_focused(window) => false,
-      _ => return,
+    let Some(in_thread) = self.focused_composer(window, cx) else {
+      return;
     };
     let Some(item) = cx.read_from_clipboard() else {
       return;
@@ -1127,11 +1215,82 @@ impl ConversationView {
     cx.notify();
   }
 
-  /// A composer's field: the button that attaches files, then the text, then rewrite when it is on.
+  /// A composer's formatting bar: a row of buttons above its text, in groups with a thin divider between them. A button
+  /// formats the selection as its key does.
+  fn format_bar(&self, in_thread: bool, cx: &mut Context<Self>) -> Div {
+    let mut bar = h_flex().w_full().px_3().pt_2().gap_1().items_center();
+    for (ix, group) in FORMAT_BAR.iter().enumerate() {
+      if ix > 0 {
+        bar = bar.child(div().w(px(1.)).h(px(16.)).mx_1().flex_shrink_0().bg(rgb(BORDER)));
+      }
+      for button in *group {
+        let format = button.format;
+        bar = bar.child(
+          div()
+            .id((button.id, usize::from(in_thread)))
+            .size(px(28.))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .cursor_pointer()
+            .hover(|s| s.bg(rgb(BORDER)))
+            .tooltip(hint(button.tip))
+            .on_click(cx.listener(move |this, _, window, cx| this.apply_format(format, in_thread, window, cx)))
+            .child(icon(button.glyph, 16., MUTED)),
+        );
+      }
+    }
+    bar
+  }
+
+  /// Formats the selection of a composer, as the formatting bar's buttons and keys do. The markers go in as range
+  /// edits, never by setting the whole text, so the chips of the draft stay and undo keeps its history.
+  fn apply_format(&mut self, format: Format, in_thread: bool, window: &mut Window, cx: &mut Context<Self>) {
+    let Some(composer) = self.composer_of(in_thread).cloned() else {
+      return;
+    };
+    composer.update(cx, |state, cx| {
+      if state.is_editable() {
+        let edit = format.apply(&state.value(), state.selected_range());
+        // From the last change to the first, so the offsets of the others stay as they are.
+        for change in edit.changes.iter().rev() {
+          state.set_selected_range(change.range.clone(), cx);
+          state.replace(change.text.clone(), window, cx);
+        }
+        state.set_selected_range(edit.selection, cx);
+      }
+      // A click on a button must leave the keyboard with the text.
+      state.focus(window, cx);
+    });
+  }
+
+  /// A formatting key: it formats the composer that has the keyboard. In any other text field of the conversation,
+  /// such as the find bar, it is left for others to take.
+  fn format_key(&mut self, format: Format, window: &mut Window, cx: &mut Context<Self>) {
+    match self.focused_composer(window, cx) {
+      Some(in_thread) => self.apply_format(format, in_thread, window, cx),
+      None => cx.propagate(),
+    }
+  }
+
+  /// The toggle at a composer's right: shows or hides the formatting bar of every composer, and leaves the keyboard
+  /// with the text.
+  fn toggle_format_bar(&mut self, in_thread: bool, window: &mut Window, cx: &mut Context<Self>) {
+    Settings::update(cx, |settings| settings.show_format_bar = !settings.show_format_bar);
+    if let Some(composer) = self.composer_of(in_thread) {
+      composer.update(cx, |state, cx| state.focus(window, cx));
+    }
+  }
+
+  /// A composer's field: the formatting bar when it is shown, then the row with the button that attaches files, the
+  /// text, the toggle of the bar, and rewrite when it is on.
   fn composer_field(&self, composer: &Entity<TextareaState>, in_thread: bool, cx: &mut Context<Self>) -> Div {
     let settings = cx.global::<Settings>();
     let rewrite = settings.rewrite != RewriteTool::Off;
     let always = settings.rewrite_always;
+    let bar = settings.show_format_bar;
     let busy = self.rewriting == Some(in_thread);
     let sparkle = icon(Icon::Sparkles, 18., if busy || always { ACCENT } else { MUTED });
     let sparkle = if busy {
@@ -1145,15 +1304,13 @@ impl ConversationView {
     } else {
       sparkle.into_any_element()
     };
-    let field = h_flex()
+    let row = h_flex()
       .w_full()
       .pl_2()
       .pr_4()
       .py_2()
       .gap_2()
       .items_end()
-      .rounded(px(24.))
-      .bg(rgb(if busy { ACCENT_BG } else { FIELD }))
       .child(
         div()
           .id(("attach", usize::from(in_thread)))
@@ -1174,6 +1331,27 @@ impl ConversationView {
           .flex_1()
           .min_w_0()
           .child(Textarea::new(composer).appearance(false).bordered(false).disabled(busy)),
+      )
+      .child(
+        div()
+          .id(("format-toggle", usize::from(in_thread)))
+          .size(px(28.))
+          .mb(px(3.))
+          .flex_shrink_0()
+          .flex()
+          .items_center()
+          .justify_center()
+          .rounded_full()
+          .cursor_pointer()
+          .hover(|s| s.bg(rgb(BORDER)))
+          .when(bar, |button| button.bg(rgb(ACCENT_BG)))
+          .tooltip(hint(if bar {
+            "Hide formatting options"
+          } else {
+            "Show formatting options"
+          }))
+          .on_click(cx.listener(move |this, _, window, cx| this.toggle_format_bar(in_thread, window, cx)))
+          .child(icon(Icon::Baseline, 21., if bar { ACCENT } else { MUTED })),
       )
       .when(rewrite, |row| {
         row.child(
@@ -1205,6 +1383,12 @@ impl ConversationView {
             .child(sparkle),
         )
       });
+    let field = v_flex()
+      .w_full()
+      .rounded(px(24.))
+      .bg(rgb(if busy { ACCENT_BG } else { FIELD }))
+      .when(bar, |field| field.child(self.format_bar(in_thread, cx)))
+      .child(row);
     let menu = self.menu.as_ref().filter(|menu| menu.in_thread == in_thread).map(|menu| {
       let view = cx.weak_entity();
       let pick: Rc<dyn Fn(usize, &mut Window, &mut App)> = Rc::new(move |ix, window, cx| {
@@ -1409,6 +1593,7 @@ impl ConversationView {
       threads: self.group.kind == GroupKind::Space,
       hovered: self.hovered.as_deref(),
       on_tools: &self.on_tools,
+      readers: self.readers.of(&id),
     };
     message::render_row(row, &ctx, cx)
   }
@@ -1434,6 +1619,7 @@ impl ConversationView {
       threads: false,
       hovered: self.hovered.as_deref(),
       on_tools: &self.on_tools,
+      readers: self.thread.as_ref().map_or(&[][..], |thread| thread.readers.of(&id)),
     };
     message::render_row(row, &ctx, cx)
   }
@@ -1684,6 +1870,12 @@ impl Render for ConversationView {
       .size_full()
       // Before the composer sees the paste, so files never land in it as text.
       .capture_action(cx.listener(Self::paste))
+      .on_action(cx.listener(|this, _: &FormatBold, window, cx| this.format_key(Format::Bold, window, cx)))
+      .on_action(cx.listener(|this, _: &FormatItalic, window, cx| this.format_key(Format::Italic, window, cx)))
+      .on_action(cx.listener(|this, _: &FormatStrikethrough, window, cx| {
+        this.format_key(Format::Strikethrough, window, cx);
+      }))
+      .on_action(cx.listener(|this, _: &FormatBulletedList, window, cx| this.format_key(Format::Bullets, window, cx)))
       .child(main)
       .children(self.render_thread_panel(cx))
   }

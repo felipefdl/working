@@ -37,6 +37,7 @@ mod conversation;
 mod emoji_picker;
 mod event_card;
 mod event_editor;
+mod format_logic;
 mod home;
 mod images;
 mod meet;
@@ -48,6 +49,7 @@ mod new_chat;
 mod notify;
 mod permissions;
 mod rail;
+mod receipt_logic;
 mod rewrite;
 mod root;
 mod screen;
@@ -60,6 +62,7 @@ mod status;
 mod status_menu;
 mod store;
 mod switcher;
+mod text_panel;
 mod theme;
 mod theme_picker;
 mod ui;
@@ -74,6 +77,7 @@ use gpui_kit::component::TitleBar;
 use gpui_kit::component::input::Escape;
 use gpui_kit::*;
 
+use crate::conversation::{FormatBold, FormatBulletedList, FormatItalic, FormatStrikethrough};
 use crate::images::Images;
 use crate::root::{
   FindInChat, FindNext, FindPrevious, GoBack, GoForward, GoHome, Hide, HideOthers, Minimize, NextConversation,
@@ -164,6 +168,13 @@ fn main() {
       KeyBinding::new("escape", Escape, Some("EventEditor")),
       KeyBinding::new("cmd-,", OpenSettings, None),
       KeyBinding::new("cmd-shift-r", RewriteDraft, None),
+      // Formatting a draft, with Google Chat's keys. In the kit's "Input" context, so they are live while a text field
+      // has the keyboard; the conversation takes them only from its composers. macOS delivers Shift+8 as the key `*`
+      // with the shift folded into it, so that is how the bulleted list's key is written.
+      KeyBinding::new("cmd-b", FormatBold, Some("Input")),
+      KeyBinding::new("cmd-i", FormatItalic, Some("Input")),
+      KeyBinding::new("cmd-shift-x", FormatStrikethrough, Some("Input")),
+      KeyBinding::new("cmd-*", FormatBulletedList, Some("Input")),
       KeyBinding::new("cmd-f", FindInChat, None),
       KeyBinding::new("cmd-g", FindNext, None),
       KeyBinding::new("cmd-shift-g", FindPrevious, None),
