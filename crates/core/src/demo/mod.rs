@@ -17,7 +17,7 @@ use crate::engine::{FetchReply, Fetcher};
 use crate::model::{
   Attachment, AttachmentKind, CardAction, Chip, ChipKind, Command, Connection, DndFor, DndSchedule, DndSchedules,
   Event, Group, GroupId, GroupKind, McpConfig, McpStatus, Message, Micros, MyStatus, PersonStatus, Quote, Reaction,
-  SearchHit, Shortcut, Snippet, User,
+  ReadReceipt, SearchHit, Shortcut, Snippet, User,
 };
 use data::{APPROVE, BUILD_BOT, CANCEL, ME, World};
 
@@ -111,6 +111,8 @@ enum Action {
     user: String,
     typing: bool,
   },
+  /// Someone has read everything in a conversation up to now: the newest message is the last they read.
+  Read { group: GroupId, user: String },
   /// Someone else's message arrives.
   Arrive(Message),
   /// A message from someone, unprompted, then the next one scheduled.
@@ -132,6 +134,8 @@ struct Demo {
   groups: HashMap<GroupId, Group>,
   histories: HashMap<GroupId, Vec<Arc<Message>>>,
   members: HashMap<GroupId, Vec<String>>,
+  /// How far each person has read each conversation, by user id: the time of the last message they read.
+  read: HashMap<GroupId, HashMap<String, Micros>>,
   windows: HashMap<GroupId, Window>,
   open: Option<GroupId>,
   timeline: Vec<(Instant, Action)>,
@@ -146,7 +150,13 @@ struct Demo {
 impl Demo {
   fn new(events: flume::Sender<Event>, now: Micros) -> Self {
     let World {
-      me, users, groups, histories, members, ..
+      me,
+      users,
+      groups,
+      histories,
+      members,
+      read,
+      ..
     } = data::world(now);
     Self {
       events,
@@ -156,6 +166,7 @@ impl Demo {
       groups: groups.into_iter().map(|group| (group.id.clone(), group)).collect(),
       histories,
       members,
+      read,
       windows: HashMap::new(),
       open: None,
       timeline: Vec::new(),
@@ -225,6 +236,7 @@ impl Demo {
           let user_name = self.user(&user).name;
           self.emit(Event::Typing { group, user_id: user, user_name, typing });
         },
+        Action::Read { group, user } => self.catch_up(&group, &user),
         Action::Arrive(mut message) => {
           message.time = now_micros();
           message.update_time = message.time;
@@ -266,7 +278,7 @@ impl Demo {
         let link = format!("https://meet.google.com/demo-meet-{}", self.next_serial());
         self.emit(Event::MeetingCreated(Ok(link)));
       },
-      Command::Edit { group, message_id, text } => self.edit(&group, &message_id, text),
+      Command::Edit { group, message_id, text } => self.edit(&group, &message_id, &text),
       Command::Delete { group, message_id } => self.delete(&group, &message_id),
       Command::MarkRead(group) => self.update_group(&group, |group| {
         group.unread = false;
@@ -390,9 +402,37 @@ impl Demo {
     });
   }
 
+  /// Who has read `group`, as the engine reports it.
+  fn emit_receipts(&self, group: &GroupId) {
+    let mut receipts: Vec<ReadReceipt> = self
+      .read
+      .get(group)
+      .into_iter()
+      .flatten()
+      .map(|(id, time)| {
+        let user = self.user(id);
+        ReadReceipt {
+          user_id: id.clone(),
+          name: user.name,
+          avatar_url: user.avatar_url,
+          read_time: *time,
+        }
+      })
+      .collect();
+    crate::convert::sort_receipts(&mut receipts);
+    // An app does not read, so its conversation has receipts off.
+    let enabled = self.groups.get(group).is_none_or(|group| group.kind != GroupKind::App);
+    self.emit(Event::ReadReceipts {
+      group: group.clone(),
+      enabled,
+      receipts: Arc::new(receipts),
+    });
+  }
+
   fn open(&mut self, group: GroupId) {
     let start = self.topic_start(&group, self.messages(&group).len().saturating_sub(LATEST_PAGE));
     self.windows.insert(group.clone(), Window { start, end: None });
+    self.emit_receipts(&group);
     self.emit_history(&group, 0, None);
     self.open = Some(group);
   }
@@ -424,6 +464,7 @@ impl Demo {
     let end = self.topic_end(&group, index + OLDER_PAGE / 2);
     let end = (end < self.messages(&group).len()).then_some(end);
     self.windows.insert(group.clone(), Window { start, end });
+    self.emit_receipts(&group);
     self.emit_history(&group, 0, Some(message_id.into()));
     self.open = Some(group);
   }
@@ -526,12 +567,15 @@ impl Demo {
     draft
   }
 
-  /// Shows `pending` at once, confirms it a moment later, and lets someone answer.
+  /// Shows `pending` at once, confirms it a moment later, and lets someone answer. Its text is the message as typed:
+  /// the markers in it become formatting, as in the engine.
   fn send(&mut self, mut pending: Message, chips: &[Chip]) {
     let group = pending.group.clone();
     let local_id = format!("working%{}", self.next_serial());
     pending.id.clone_from(&local_id);
-    pending.spans = crate::convert::chip_spans(chips);
+    let typed = crate::markup::parse(&pending.text, chips);
+    pending.spans = crate::convert::pending_spans(&typed);
+    pending.text = typed.text;
     self.upsert(&Arc::new(pending.clone()), None);
 
     let id = format!("{}-sent-{}", group.key(), self.next_serial());
@@ -544,13 +588,14 @@ impl Demo {
     sent.attachments.iter_mut().for_each(uploaded);
     let (topic, text) = (sent.topic_id.clone(), sent.text.clone());
     self.schedule(Duration::from_millis(350), Action::Confirm { local_id, message: sent });
-    self.answer(&group, &topic, &text, chips);
+    self.answer(&group, &topic, &text, &typed.chips);
   }
 
-  fn edit(&mut self, group: &GroupId, message_id: &str, text: String) {
+  fn edit(&mut self, group: &GroupId, message_id: &str, text: &str) {
+    let typed = crate::markup::parse(text, &[]);
     self.change_message(group, message_id, |message| {
-      message.text = text;
-      message.spans = Vec::new();
+      message.spans = crate::convert::pending_spans(&typed);
+      message.text = typed.text;
       message.edited = true;
       message.update_time = now_micros();
     });
@@ -621,9 +666,28 @@ impl Demo {
       user: who.into(),
       typing,
     };
+    self.schedule(after, Action::Read { group: group.clone(), user: who.into() });
     self.schedule(after, typing(true));
     self.schedule(after + Duration::from_millis(2400), typing(false));
     self.schedule(after + Duration::from_millis(2450), Action::Arrive(message));
+  }
+
+  /// `user` has read everything in `group` up to now. The receipts follow when that moved them on.
+  fn catch_up(&mut self, group: &GroupId, user: &str) {
+    let newest = self
+      .messages(group)
+      .iter()
+      .filter(|message| !message.pending)
+      .map(|message| message.time)
+      .max();
+    let Some(newest) = newest else {
+      return;
+    };
+    let read_to = self.read.entry(group.clone()).or_default().entry(user.to_string()).or_insert(0);
+    if *read_to < newest {
+      *read_to = newest;
+      self.emit_receipts(group);
+    }
   }
 
   fn bot_reply(&mut self, group: &GroupId, command: &str) {

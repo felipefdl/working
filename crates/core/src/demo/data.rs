@@ -33,6 +33,8 @@ pub struct World {
   pub histories: HashMap<GroupId, Vec<Arc<Message>>>,
   /// Who is in each conversation, without the signed-in user.
   pub members: HashMap<GroupId, Vec<String>>,
+  /// How far each person has read each conversation, by user id: the time of the last message they read.
+  pub read: HashMap<GroupId, HashMap<String, Micros>>,
 }
 
 /// A message's sidebar line: its text on one line, else its card's title.
@@ -374,6 +376,12 @@ impl Builder {
       .world
       .members
       .insert(group.id.clone(), members.iter().map(|id| (*id).to_string()).collect());
+    let people: Vec<&str> = members
+      .iter()
+      .copied()
+      .filter(|id| self.users.get(*id).is_some_and(|user| !user.is_bot))
+      .collect();
+    self.world.read.insert(group.id.clone(), reads(&messages, &people));
     self.world.histories.insert(group.id.clone(), messages);
     self.world.groups.push(group);
   }
@@ -413,6 +421,31 @@ impl Builder {
   }
 }
 
+/// How far each of `people` has read a conversation when the demo starts: the first has read its newest message, the
+/// next one the message before it, and so on, so they spread over its latest messages. Nobody has read less than they
+/// wrote, and more people than messages share the oldest one.
+fn reads(messages: &[Arc<Message>], people: &[&str]) -> HashMap<String, Micros> {
+  let mut times: Vec<Micros> = messages
+    .iter()
+    .filter(|message| !message.system)
+    .map(|message| message.time)
+    .collect();
+  times.sort_unstable_by(|a, b| b.cmp(a));
+  people
+    .iter()
+    .enumerate()
+    .filter_map(|(behind, person)| {
+      let wrote = messages
+        .iter()
+        .filter(|message| message.sender_id == *person)
+        .map(|message| message.time)
+        .max();
+      let read = times.get(behind.min(times.len().saturating_sub(1))).copied();
+      Some(((*person).to_string(), read.max(wrote)?))
+    })
+    .collect()
+}
+
 /// The workspace as it stands at `now`.
 pub fn world(now: Micros) -> World {
   let all = users();
@@ -426,6 +459,7 @@ pub fn world(now: Micros) -> World {
       groups: Vec::new(),
       histories: HashMap::new(),
       members: HashMap::new(),
+      read: HashMap::new(),
     },
   };
   jordan(&mut b);
@@ -678,7 +712,7 @@ fn weekly_sync(b: &mut Builder) {
 mod tests {
   use std::collections::HashSet;
 
-  use super::world;
+  use super::{BUILD_BOT, ME, world};
 
   #[test]
   fn spans_fall_on_their_text() {
@@ -726,6 +760,33 @@ mod tests {
         group.name
       );
       assert!(group.snippet.is_some(), "{}", group.name);
+    }
+  }
+
+  #[test]
+  fn readers_are_members_who_stopped_at_a_message_and_have_read_what_they_wrote() {
+    let world = world(1_000_000_000_000_000);
+    for group in &world.groups {
+      let (members, messages) = (&world.members[&group.id], &world.histories[&group.id]);
+      for (id, read_to) in &world.read[&group.id] {
+        assert!(members.contains(id), "{}: {id} is a member", group.name);
+        assert!(id != ME && id != BUILD_BOT, "{}: {id} does not read", group.name);
+        assert!(
+          messages.iter().any(|message| message.time == *read_to),
+          "{}: {id} stopped at a message",
+          group.name
+        );
+        let wrote = messages
+          .iter()
+          .filter(|message| message.sender_id == *id)
+          .map(|message| message.time)
+          .max();
+        assert!(
+          wrote.is_none_or(|time| *read_to >= time),
+          "{}: {id} has read what they wrote",
+          group.name
+        );
+      }
     }
   }
 }

@@ -33,11 +33,12 @@ use crate::cache::{Cache, HistoryCache, WorldCache};
 use crate::channel::{Channel, ChannelEvent};
 use crate::convert::{self, Users};
 use crate::http::{Http, SignedOut, request_header};
+use crate::markup;
 use crate::mcp;
 use crate::model::{
-  Attachment, AttachmentKind, CardAction, Chip, Command, Connection, DndFor, DndSchedule, DndSchedules, EditScope,
-  Event, EventDraft, Group, GroupId, GroupKind, McpConfig, McpStatus, Message, Micros, MyStatus, Notify, PersonStatus,
-  Placement, Presence, Quote, Reaction, Rsvp, SearchHit, Shortcut, Snippet, User,
+  Attachment, AttachmentKind, CardAction, Command, Connection, DndFor, DndSchedule, DndSchedules, EditScope, Event,
+  EventDraft, Group, GroupId, GroupKind, McpConfig, McpStatus, Message, Micros, MyStatus, Notify, PersonStatus,
+  Placement, Presence, Quote, Reaction, ReadReceipt, Rsvp, SearchHit, Shortcut, Snippet, User,
 };
 use crate::proto;
 
@@ -139,6 +140,30 @@ struct History {
   loading_newer: bool,
 }
 
+/// What was last published of one conversation's read receipts.
+#[derive(PartialEq)]
+struct Receipts {
+  enabled: bool,
+  people: Vec<ReadReceipt>,
+}
+
+impl Receipts {
+  /// What publishing `set` makes of the receipts `held`, or `None` when it changes nothing. `set` is the whole answer
+  /// of loading a conversation's messages; with `merge` it is an event of the stream, which may name only the people
+  /// who just read, so it is added to what is held.
+  fn updated(held: Option<&Self>, set: &proto::ReadReceiptSet, me: &str, users: &Users, merge: bool) -> Option<Self> {
+    let incoming = convert::read_receipts(set, me, users);
+    let next = Self {
+      enabled: incoming.is_some(),
+      people: match (incoming, held) {
+        (Some(incoming), Some(held)) if merge => convert::merge_receipts(held.people.clone(), incoming),
+        (incoming, _) => incoming.unwrap_or_default(),
+      },
+    };
+    (held != Some(&next)).then_some(next)
+  }
+}
+
 /// Which page of a conversation to fetch.
 #[derive(Clone, Copy)]
 pub(crate) enum Page {
@@ -161,6 +186,8 @@ struct State {
   world_refresh_queued: bool,
   /// Names of the user's own sidebar sections, by section id.
   sections: HashMap<String, String>,
+  /// Who has read each conversation, as last published to the UI.
+  receipts: HashMap<GroupId, Receipts>,
 }
 
 pub(crate) struct Engine {
@@ -632,6 +659,33 @@ impl Engine {
     tokio::task::spawn_blocking(move || cache.save_history(&group, &snapshot));
   }
 
+  /// Publishes who has read `group`, unless that is what was published last (see `Receipts::updated`).
+  fn note_receipts(&self, group: &GroupId, set: &proto::ReadReceiptSet, merge: bool) {
+    let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = &mut *guard;
+    let me = state.me.as_ref().map_or("", |me| me.id.as_str());
+    let Some(next) = Receipts::updated(state.receipts.get(group), set, me, &state.users, merge) else {
+      return;
+    };
+    self.emit_receipts(group, &next);
+    state.receipts.insert(group.clone(), next);
+  }
+
+  fn emit_receipts(&self, group: &GroupId, receipts: &Receipts) {
+    self.emit(Event::ReadReceipts {
+      group: group.clone(),
+      enabled: receipts.enabled,
+      receipts: Arc::new(receipts.people.clone()),
+    });
+  }
+
+  /// The receipts that came with a page of messages, when it had any.
+  fn note_page_receipts(&self, group: &GroupId, page: &proto::ListTopicsResponse) {
+    if let Some(set) = &page.read_receipt_set {
+      self.note_receipts(group, set, false);
+    }
+  }
+
   async fn list_topics(&self, group: &GroupId, page: Page) -> Result<proto::ListTopicsResponse> {
     use proto::list_topics_request::filter::Anchor;
     use proto::list_topics_request::{FetchOptions, Filter};
@@ -695,6 +749,7 @@ impl Engine {
       return Ok(());
     }
     let response = self.list_topics(&group, Page::Latest).await?;
+    self.note_page_receipts(&group, &response);
     let (fetched, anchor) = self.convert_topics(&response);
     let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let online = state.connection == Some(Connection::Online);
@@ -783,6 +838,8 @@ impl Engine {
       self.list_topics(&group, Page::After(time))
     );
     let (around, after) = (around?, after?);
+    self.note_page_receipts(&group, &around);
+    self.note_page_receipts(&group, &after);
     let (mut messages, anchor) = self.convert_topics(&around);
     let (newer, _) = self.convert_topics(&after);
     let held: HashSet<String> = messages.iter().map(|message| message.id.clone()).collect();
@@ -1037,6 +1094,9 @@ impl Engine {
           if state.histories.get(&group).is_some_and(|history| history.detached) {
             state.histories.remove(&group);
           }
+          if let Some(held) = state.receipts.get(&group) {
+            self.emit_receipts(&group, held);
+          }
           if let Some(history) = state.histories.get(&group) {
             self.emit_history(&group, history, 0);
           }
@@ -1066,7 +1126,14 @@ impl Engine {
         });
       },
       Command::Jump { group, message_id, time } => {
-        self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).open = Some(group.clone());
+        {
+          let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+          state.open = Some(group.clone());
+          // The view that jumps here may not hold who has read it yet, and `jump` publishes only what changed.
+          if let Some(held) = state.receipts.get(&group) {
+            self.emit_receipts(&group, held);
+          }
+        }
         tokio::spawn(async move {
           let result = engine.jump(group, message_id, time).await;
           engine.report(result);
@@ -1195,14 +1262,15 @@ impl Engine {
           text: quoted.text.clone(),
         });
         let attached = files.iter().map(|path| local_attachment(path)).collect();
-        let Some(pending) = self.add_pending(&group, topic_id.as_deref(), &text, &chips, shown, attached) else {
+        let typed = markup::parse(&text, &chips);
+        let Some(pending) = self.add_pending(&group, topic_id.as_deref(), &typed, shown, attached) else {
           return;
         };
         tokio::spawn(async move {
           let result = async {
             let uploads = engine.upload_files(&group, files).await?;
             engine
-              .send_message(&group, topic_id.as_deref(), &text, &chips, quoted.as_deref(), uploads, &pending)
+              .send_message(&group, topic_id.as_deref(), &typed, quoted.as_deref(), uploads, &pending)
               .await
           }
           .await;
@@ -1219,17 +1287,19 @@ impl Engine {
         let Some(original) = self.held(&group, &message_id) else {
           return;
         };
-        // Shown at once; the server's answer brings the formatting, a failure puts the old text back.
+        let typed = markup::parse(&text, &[]);
+        // Shown at once; the server's answer brings the final message, a failure puts the old one back.
         let mut edited = (*original).clone();
-        edited.text = text.clone();
-        edited.spans = Vec::new();
+        edited.text.clone_from(&typed.text);
+        edited.spans = convert::pending_spans(&typed);
         edited.edited = true;
         self.upsert_message(Arc::new(edited), None);
         tokio::spawn(async move {
           let request = proto::EditMessageRequest {
             request_header: Some(request_header()),
             id: Some(proto_message_id(&group, &original.topic_id, &original.id)),
-            text_body: Some(text),
+            annotations: convert::format_annotations(&typed.text, &typed.spans),
+            text_body: Some(typed.text),
             message_info: Some(proto::MessageInfo {
               accept_format_annotations: Some(true),
               ..Default::default()
@@ -1278,7 +1348,8 @@ impl Engine {
         if self.readonly {
           return self.emit(Event::Error("Read-only mode: the meeting was not started.".into()));
         }
-        let Some(pending) = self.add_pending(&group, None, "Starting a video meeting…", &[], None, Vec::new()) else {
+        let status = markup::parse("Starting a video meeting…", &[]);
+        let Some(pending) = self.add_pending(&group, None, &status, None, Vec::new()) else {
           return;
         };
         tokio::spawn(async move {
@@ -1503,13 +1574,13 @@ impl Engine {
     });
   }
 
-  /// Shows the message at once, before the server knows it. Returns its local id.
+  /// Shows the message at once, before the server knows it, with the formatting its markers asked for. Returns its
+  /// local id.
   fn add_pending(
     &self,
     group: &GroupId,
     topic_id: Option<&str>,
-    text: &str,
-    chips: &[Chip],
+    typed: &markup::Parsed,
     quote: Option<Quote>,
     attachments: Vec<Attachment>,
   ) -> Option<String> {
@@ -1527,8 +1598,8 @@ impl Engine {
       sender_id: me.id.clone(),
       sender_name: me.name.clone(),
       sender_avatar: me.avatar_url,
-      text: text.to_string(),
-      spans: convert::chip_spans(chips),
+      text: typed.text.clone(),
+      spans: convert::pending_spans(typed),
       time: now_micros(),
       update_time: 0,
       edited: false,
@@ -1593,13 +1664,13 @@ impl Engine {
     &self,
     group: &GroupId,
     topic_id: Option<&str>,
-    text: &str,
-    chips: &[Chip],
+    typed: &markup::Parsed,
     quoted: Option<&Message>,
     uploads: Vec<proto::UploadMetadata>,
     local_id: &str,
   ) -> Result<()> {
-    let mut annotations = convert::chip_annotations(text, chips);
+    let mut annotations = convert::chip_annotations(&typed.text, &typed.chips);
+    annotations.extend(convert::format_annotations(&typed.text, &typed.spans));
     annotations.extend(uploads.into_iter().map(|upload| proto::Annotation {
       r#type: Some(proto::AnnotationType::UploadMetadata as i32),
       chip_render_type: Some(proto::annotation::ChipRenderType::Render as i32),
@@ -1617,7 +1688,7 @@ impl Engine {
               topic_id: Some(topic_id.to_string()),
             }),
           }),
-          text_body: Some(text.to_string()),
+          text_body: Some(typed.text.clone()),
           annotations,
           local_id: Some(local_id.to_string()),
           ..Default::default()
@@ -1630,7 +1701,7 @@ impl Engine {
         let request = proto::CreateTopicRequest {
           request_header: Some(request_header()),
           group_id: Some(convert::proto_group_id(group)),
-          text_body: Some(text.to_string()),
+          text_body: Some(typed.text.clone()),
           annotations,
           local_id: Some(local_id.to_string()),
           history_v2: Some(true),
@@ -2024,7 +2095,8 @@ impl Engine {
     })
   }
 
-  /// Sends a message and waits for the server to take it. The app shows it like one typed there.
+  /// Sends a message and waits for the server to take it. The app shows it like one typed there, and its text is
+  /// read for Google Chat's markers in the same way.
   pub(crate) async fn send_now(
     self: &Arc<Self>,
     group: &GroupId,
@@ -2036,12 +2108,13 @@ impl Engine {
       return Err(anyhow!("Working runs in read-only mode"));
     }
     let attached = files.iter().map(|path| local_attachment(path)).collect();
+    let typed = markup::parse(text, &[]);
     let pending = self
-      .add_pending(group, topic_id, text, &[], None, attached)
+      .add_pending(group, topic_id, &typed, None, attached)
       .ok_or_else(|| anyhow!("the account is not loaded yet"))?;
     let result = async {
       let uploads = self.upload_files(group, files).await?;
-      self.send_message(group, topic_id, text, &[], None, uploads, &pending).await
+      self.send_message(group, topic_id, &typed, None, uploads, &pending).await
     }
     .await;
     if result.is_err() {
@@ -2126,6 +2199,9 @@ impl Engine {
       }
       if let Some(reaction) = &body.message_reaction {
         self.on_reaction(reaction);
+      }
+      if let Some(changed) = &body.read_receipt_changed {
+        self.on_read_receipts(changed, event_group.as_ref());
       }
       // Read state moved, here or on another device.
       let viewed = body
@@ -2233,6 +2309,17 @@ impl Engine {
       .unwrap_or_default();
     let add = reaction.option != Some(proto::ReactionOption::Remove as i32);
     self.apply_reaction(&group, id.message_id.as_deref().unwrap_or_default(), &emoji, &reactor, add);
+  }
+
+  fn on_read_receipts(&self, changed: &proto::ReadReceiptChangedEvent, event_group: Option<&GroupId>) {
+    let group = changed
+      .group_id
+      .as_ref()
+      .and_then(convert::group_id)
+      .or_else(|| event_group.cloned());
+    if let (Some(group), Some(set)) = (group, &changed.read_receipt_set) {
+      self.note_receipts(&group, set, true);
+    }
   }
 
   fn on_typing(&self, typing: &proto::TypingStateChangedEvent) {
@@ -2750,7 +2837,7 @@ fn starred_hit(message: &serde_json::Value, users: &Users) -> Option<SearchHit> 
 
 #[cfg(test)]
 mod tests {
-  use super::{click_card_request, file_name, meeting_link, people_list, starred_hit};
+  use super::{Receipts, click_card_request, file_name, meeting_link, people_list, starred_hit};
   use crate::convert::Users;
   use crate::model::GroupId;
   use crate::model::{CardAction, User};
@@ -2896,5 +2983,64 @@ mod tests {
     let wire = field(0x0a, &annotation);
     let answer = proto::CreateVideoCallResponse::decode(wire.as_slice()).expect("the answer decodes");
     assert_eq!(meeting_link(&answer).as_deref(), Some("https://meet.google.com/abc-defg-hij"));
+  }
+
+  /// A set of receipts as the wire has it, with made-up people.
+  fn readers(enabled: Option<bool>, people: &[(&str, i64)]) -> proto::ReadReceiptSet {
+    proto::ReadReceiptSet {
+      enabled,
+      read_receipts: people
+        .iter()
+        .map(|(id, time)| proto::ReadReceipt {
+          read_time_micros: Some(*time),
+          user: Some(proto::User {
+            user_id: Some(proto::UserId {
+              id: Some((*id).into()),
+              ..Default::default()
+            }),
+            ..Default::default()
+          }),
+        })
+        .collect(),
+    }
+  }
+
+  /// Who has read up to when, in the order published.
+  fn who(receipts: &Receipts) -> Vec<(&str, i64)> {
+    receipts
+      .people
+      .iter()
+      .map(|person| (person.user_id.as_str(), person.read_time))
+      .collect()
+  }
+
+  #[test]
+  fn receipts_are_published_when_they_change_and_a_stream_event_adds_to_them() {
+    let users = Users::new();
+    let publish =
+      |held: Option<&Receipts>, set: &proto::ReadReceiptSet, merge| Receipts::updated(held, set, "me", &users, merge);
+    // The first answer of a load is published, and the same answer again is not.
+    let whole = readers(Some(true), &[("jordan", 100), ("riley", 200)]);
+    let loaded = publish(None, &whole, false).expect("the first answer is new");
+    assert!(loaded.enabled);
+    assert_eq!(who(&loaded), [("jordan", 100), ("riley", 200)]);
+    assert!(publish(Some(&loaded), &whole, false).is_none());
+    // An event that names only who just read is added; repeating it, or an older time, changes nothing.
+    let read_on = readers(Some(true), &[("jordan", 300)]);
+    let moved = publish(Some(&loaded), &read_on, true).expect("Jordan read on");
+    assert_eq!(who(&moved), [("riley", 200), ("jordan", 300)]);
+    assert!(publish(Some(&moved), &read_on, true).is_none());
+    assert!(publish(Some(&moved), &readers(Some(true), &[("jordan", 150)]), true).is_none());
+    // The signed-in user reading is no one's receipt.
+    assert!(publish(Some(&moved), &readers(Some(true), &[("me", 400)]), true).is_none());
+    // A later load answers the whole set again, so whoever is not in it goes.
+    let reloaded = publish(Some(&moved), &readers(Some(true), &[("sam", 50)]), false).expect("a new set");
+    assert_eq!(who(&reloaded), [("sam", 50)]);
+    // Receipts turned off empty the set, once; a conversation that never had any says so as well.
+    let off = readers(Some(false), &[("sam", 50)]);
+    let cleared = publish(Some(&reloaded), &off, true).expect("receipts went off");
+    assert!(!cleared.enabled && cleared.people.is_empty());
+    assert!(publish(Some(&cleared), &off, false).is_none());
+    assert!(publish(None, &off, false).is_some_and(|first| !first.enabled));
   }
 }

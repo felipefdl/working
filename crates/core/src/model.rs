@@ -402,6 +402,20 @@ impl Message {
   }
 }
 
+/// How far one other person has read a conversation, as Google Chat shows it: their avatar sits beside the last
+/// message they read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadReceipt {
+  /// User id.
+  pub user_id: String,
+  /// Display name; empty when no profile is known for them.
+  pub name: String,
+  /// Avatar URL, when Google Chat sent one.
+  pub avatar_url: Option<String>,
+  /// They have read every message sent at or before this time, microseconds since epoch.
+  pub read_time: Micros,
+}
+
 /// Realtime stream state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Connection {
@@ -818,6 +832,17 @@ pub enum Event {
     prepended: usize,
     /// Set by `Command::Jump`: the message to scroll to and highlight.
     focus: Option<String>,
+  },
+  /// Who has read a conversation, never the signed-in user. Sent when the conversation's messages load (and when
+  /// `Command::Open` or `Command::Jump` shows the ones held), just before their `History`, and again whenever the
+  /// stream reports that someone read on. Replaces what came before for that conversation.
+  ReadReceipts {
+    /// Conversation.
+    group: GroupId,
+    /// False when Google Chat has read receipts off in this conversation: `receipts` is then empty.
+    enabled: bool,
+    /// Earliest reader first.
+    receipts: Arc<Vec<ReadReceipt>>,
   },
   /// Answer to `Command::Search`, best matches first.
   SearchResults {

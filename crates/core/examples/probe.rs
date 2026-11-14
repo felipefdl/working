@@ -13,6 +13,7 @@
   reason = "probe is a diagnostic CLI"
 )]
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use gchat_core::{Command, Core, Event};
@@ -37,6 +38,10 @@ fn main() {
   }
   let mut opened = false;
   let mut asked_older = false;
+  // Where the read receipts of each conversation land among its messages. Only times are kept, for the counts printed
+  // when the run ends.
+  let mut message_times: HashMap<gchat_core::GroupId, Vec<i64>> = HashMap::new();
+  let mut read_times: HashMap<gchat_core::GroupId, Vec<i64>> = HashMap::new();
   // Google Calendar: the calendars, then five weeks of events around today. `WORKING_PROBE_CALENDAR_WRITE=1`, without
   // `WORKING_READONLY`, also creates one private event without guests, renames it, and deletes it.
   const PROBE_TITLE: &str = "Working probe (safe to delete)";
@@ -59,6 +64,9 @@ fn main() {
   }
   while let Ok(event) = core.events().recv_deadline(deadline) {
     let at = started.elapsed().as_millis();
+    if let Event::History { group, messages, .. } = &event {
+      message_times.insert(group.clone(), messages.iter().map(|message| message.time).collect());
+    }
     match event {
       Event::Me(me) => {
         println!("[{at}ms] me: name={} avatar={}", !me.name.is_empty(), me.avatar_url.is_some());
@@ -186,6 +194,15 @@ fn main() {
             });
           }
         }
+      },
+      Event::ReadReceipts { group, enabled, receipts } => {
+        println!(
+          "[{at}ms] read receipts: {} (enabled {enabled}), named {}, with avatar {}",
+          receipts.len(),
+          receipts.iter().filter(|receipt| !receipt.name.is_empty()).count(),
+          receipts.iter().filter(|receipt| receipt.avatar_url.is_some()).count()
+        );
+        read_times.insert(group, receipts.iter().map(|receipt| receipt.read_time).collect());
       },
       Event::GroupUpsert(group) => println!("[{at}ms] group upsert: kind={:?} unread={}", group.kind, group.unread),
       Event::MessageUpsert { message, replaces, .. } => {
@@ -335,4 +352,28 @@ fn main() {
       Event::Error(error) => println!("[{at}ms] error: {error}"),
     }
   }
+  let (mut exact, mut between, mut after, mut before, mut unplaced) = (0_usize, 0_usize, 0_usize, 0_usize, 0_usize);
+  for (group, times) in &read_times {
+    let held = message_times.get(group).map_or(&[][..], Vec::as_slice);
+    let (Some(&newest), Some(&oldest)) = (held.iter().max(), held.iter().min()) else {
+      unplaced += times.len();
+      continue;
+    };
+    for time in times {
+      if held.contains(time) {
+        exact += 1;
+      } else if *time > newest {
+        after += 1;
+      } else if *time < oldest {
+        before += 1;
+      } else {
+        between += 1;
+      }
+    }
+  }
+  println!(
+    "read receipts summary: {} conversations, {} receipts: {exact} at a message time, {between} between messages, {after} after the newest message, {before} before the oldest, {unplaced} where no history is held",
+    read_times.len(),
+    read_times.values().map(Vec::len).sum::<usize>()
+  );
 }

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use super::data::{APPROVE, BUILD_BOT, ME};
 use super::{Demo, Window};
-use crate::model::{Chip, ChipKind, Command, Event, GroupId, Shortcut};
+use crate::model::{Chip, ChipKind, Command, Event, GroupId, Message, ReadReceipt, Shortcut, SpanKind};
 
 fn demo() -> (Demo, flume::Receiver<Event>) {
   let (events, received) = flume::unbounded();
@@ -109,6 +109,185 @@ fn send_confirms_and_the_person_replies() {
     event,
     Event::MessageUpsert { message, incoming: true, .. } if message.sender_id == "demo-riley"
   )));
+}
+
+/// A demo made at the real clock's now, so what the user sends during a test is the newest message of a conversation.
+/// (`demo` is dated after the clock, where a message sent now would sort before the whole workspace.)
+fn live_demo() -> (Demo, flume::Receiver<Event>) {
+  let (events, received) = flume::unbounded();
+  (Demo::new(events, super::now_micros()), received)
+}
+
+/// The receipts the last `ReadReceipts` event of `group` carried.
+fn receipts_of(events: &[Event], group: &GroupId) -> Option<Vec<ReadReceipt>> {
+  events.iter().rev().find_map(|event| match event {
+    Event::ReadReceipts { group: of, receipts, .. } if of == group => Some(receipts.to_vec()),
+    _ => None,
+  })
+}
+
+/// Where `who` has read up to, among `receipts`.
+fn read_to(receipts: &[ReadReceipt], who: &str) -> Option<i64> {
+  receipts
+    .iter()
+    .find(|receipt| receipt.user_id == who)
+    .map(|receipt| receipt.read_time)
+}
+
+#[test]
+fn opening_a_conversation_says_how_far_its_other_members_have_read() {
+  let (mut demo, events) = demo();
+  let group = GroupId::Dm("demo-riley-dm".into());
+  demo.handle(Command::Open(group.clone()));
+  let events = drain(&events);
+  let receipts_at = events
+    .iter()
+    .position(|event| matches!(event, Event::ReadReceipts { group: of, enabled: true, .. } if *of == group))
+    .expect("the receipts are sent");
+  let history_at = events
+    .iter()
+    .position(|event| matches!(event, Event::History { .. }))
+    .expect("so is the history");
+  assert!(receipts_at < history_at, "they arrive before the messages they sit beside");
+  let receipts = receipts_of(&events, &group).unwrap();
+  assert_eq!(receipts.len(), 1, "Riley is the only other member");
+  let riley = receipts.first().unwrap();
+  assert_eq!((riley.user_id.as_str(), riley.name.as_str()), ("demo-riley", "Riley Brooks"));
+  // The user wrote the last message of the conversation, and Riley has read it.
+  let last = demo.messages(&group).last().unwrap();
+  assert_eq!(last.sender_id, ME);
+  assert_eq!(riley.read_time, last.time);
+}
+
+#[test]
+fn members_of_a_group_have_read_to_different_recent_messages_and_an_app_has_no_readers() {
+  let (mut demo, events) = demo();
+  let trio = GroupId::Dm("demo-trio".into());
+  demo.handle(Command::Open(trio.clone()));
+  let receipts = receipts_of(&drain(&events), &trio).unwrap();
+  assert_eq!(receipts.len(), 3);
+  assert!(receipts.iter().all(|receipt| receipt.user_id != ME), "never the signed-in user");
+  assert!(
+    receipts.windows(2).all(|pair| pair[0].read_time <= pair[1].read_time),
+    "earliest reader first"
+  );
+  // Sam wrote the newest message and Jordan has read it as well; Riley stopped at an earlier one.
+  let newest = demo.messages(&trio).last().unwrap().time;
+  assert_eq!(read_to(&receipts, "demo-sam"), Some(newest));
+  assert_eq!(read_to(&receipts, "demo-jordan"), Some(newest));
+  assert!(read_to(&receipts, "demo-riley").is_some_and(|time| time < newest));
+  let app = GroupId::Dm("demo-build-bot-dm".into());
+  demo.handle(Command::Open(app.clone()));
+  let events = drain(&events);
+  assert_eq!(receipts_of(&events, &app), Some(Vec::new()));
+  assert!(
+    events
+      .iter()
+      .any(|event| matches!(event, Event::ReadReceipts { group, enabled: false, .. } if *group == app)),
+    "an app's conversation has receipts off"
+  );
+}
+
+#[test]
+fn the_person_who_replies_has_read_what_was_sent_and_the_others_stay() {
+  let (mut demo, events) = live_demo();
+  let group = GroupId::Dm("demo-trio".into());
+  demo.handle(Command::Open(group.clone()));
+  let opened = receipts_of(&drain(&events), &group).unwrap();
+  demo.handle(Command::Send {
+    group: group.clone(),
+    topic_id: None,
+    text: "Hello".into(),
+    quote: None,
+    files: Vec::new(),
+    chips: Vec::new(),
+  });
+  run_all(&mut demo);
+  let events = drain(&events);
+  let sent = events
+    .iter()
+    .find_map(|event| match event {
+      Event::MessageUpsert { message, .. } if message.sender_id == ME && !message.pending => Some(message.time),
+      _ => None,
+    })
+    .expect("the message is confirmed");
+  let after = receipts_of(&events, &group).expect("the receipts move on");
+  // Jordan answers a message to the group, so he has read it.
+  assert!(read_to(&opened, "demo-jordan") < Some(sent));
+  assert_eq!(read_to(&after, "demo-jordan"), Some(sent));
+  assert_eq!(read_to(&after, "demo-riley"), read_to(&opened, "demo-riley"));
+  assert_eq!(read_to(&after, "demo-sam"), read_to(&opened, "demo-sam"));
+}
+
+/// What each span of a message covers.
+fn marked(message: &Message) -> Vec<(&str, SpanKind)> {
+  message
+    .spans
+    .iter()
+    .map(|span| (message.text.get(span.range.clone()).unwrap(), span.kind.clone()))
+    .collect()
+}
+
+#[test]
+fn sent_markers_become_formatting() {
+  let (mut demo, events) = demo();
+  let group = GroupId::Dm("demo-riley-dm".into());
+  demo.handle(Command::Open(group.clone()));
+  drain(&events);
+  demo.handle(Command::Send {
+    group,
+    topic_id: None,
+    text: "*hi* _there_".into(),
+    quote: None,
+    files: Vec::new(),
+    chips: Vec::new(),
+  });
+  run_all(&mut demo);
+  let mine: Vec<_> = drain(&events)
+    .into_iter()
+    .filter_map(|event| match event {
+      Event::MessageUpsert { message, .. } if message.sender_id == ME => Some(message),
+      _ => None,
+    })
+    .collect();
+  assert!(mine.iter().any(|message| message.pending), "it shows before it is confirmed");
+  assert!(mine.iter().any(|message| !message.pending), "and after");
+  for message in &mine {
+    assert_eq!(message.text, "hi there");
+    assert_eq!(marked(message), [("hi", SpanKind::Bold), ("there", SpanKind::Italic)]);
+  }
+}
+
+#[test]
+fn markers_around_a_mention_move_it() {
+  let (mut demo, events) = demo();
+  let group = GroupId::Space("demo-release".into());
+  demo.handle(Command::Send {
+    group,
+    topic_id: None,
+    text: "*ship it* @Riley Brooks".into(),
+    quote: None,
+    files: Vec::new(),
+    chips: vec![Chip {
+      range: 10..23,
+      kind: ChipKind::Mention { user_id: "demo-riley".into(), bot: false },
+    }],
+  });
+  let pending = drain(&events)
+    .into_iter()
+    .find_map(|event| match event {
+      Event::MessageUpsert { message, .. } if message.pending => Some(message),
+      _ => None,
+    })
+    .expect("the message shows at once");
+  assert_eq!(pending.text, "ship it @Riley Brooks");
+  assert_eq!(
+    marked(&pending),
+    [
+      ("ship it", SpanKind::Bold),
+      ("@Riley Brooks", SpanKind::Mention("demo-riley".into()))
+    ]
+  );
 }
 
 #[test]
@@ -221,6 +400,29 @@ fn react_star_edit_delete_and_read() {
   demo.handle(Command::MarkRead(group.clone()));
   assert!(!demo.groups.get(&group).unwrap().unread);
   assert!(drain(&events).iter().any(|event| matches!(event, Event::MessageDeleted { .. })));
+}
+
+#[test]
+fn edited_markers_become_formatting() {
+  let (mut demo, _events) = demo();
+  let group = GroupId::Dm("demo-jordan-dm".into());
+  let first = demo.messages(&group).first().unwrap().clone();
+  demo.handle(Command::Edit {
+    group: group.clone(),
+    message_id: first.id.clone(),
+    text: "~old~ and `new`\n- one\n- two".into(),
+  });
+  let held = demo.held(&group, &first.id).unwrap();
+  assert_eq!(held.text, "old and new\none\ntwo");
+  assert_eq!(
+    marked(&held),
+    [
+      ("old", SpanKind::Strike),
+      ("new", SpanKind::Code),
+      ("one", SpanKind::ListItem),
+      ("two", SpanKind::ListItem)
+    ]
+  );
 }
 
 #[test]

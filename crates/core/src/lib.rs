@@ -11,6 +11,7 @@ mod demo;
 mod engine;
 pub mod fuzzy;
 mod http;
+mod markup;
 pub mod mcp;
 pub mod model;
 mod proto;

@@ -13,10 +13,12 @@
 )]
 
 use std::collections::HashMap;
+use std::ops::Range;
 
+use crate::markup::Parsed;
 use crate::model::{
   Attachment, AttachmentKind, Card, CardAction, CardButton, CardSection, Chip, ChipKind, Group, GroupId, GroupKind,
-  Message, Notify, Placement, Quote, Reaction, SlashCommand, Snippet, Span, SpanKind, User,
+  Message, Notify, Placement, Quote, Reaction, ReadReceipt, SlashCommand, Snippet, Span, SpanKind, User,
 };
 use crate::proto;
 
@@ -250,14 +252,14 @@ pub fn section_names(page: &str) -> HashMap<String, String> {
   names
 }
 
-fn sender(message: &proto::Message, users: &Users) -> (String, String, Option<String>) {
-  let creator = message.creator.as_ref();
-  let id = creator
-    .and_then(|creator| creator.user_id.as_ref())
+/// A person's id, name, and avatar: the profile the wire carries, else the one `users` already knows.
+fn person(profile: Option<&proto::User>, users: &Users) -> (String, String, Option<String>) {
+  let id = profile
+    .and_then(|profile| profile.user_id.as_ref())
     .and_then(|id| id.id.clone())
     .unwrap_or_default();
   let known = users.get(&id);
-  let converted = creator.and_then(user);
+  let converted = profile.and_then(user);
   let name = converted
     .as_ref()
     .map(|user| user.name.clone())
@@ -268,6 +270,10 @@ fn sender(message: &proto::Message, users: &Users) -> (String, String, Option<St
     .and_then(|user| user.avatar_url)
     .or_else(|| known.and_then(|user| user.avatar_url.clone()));
   (id, name, avatar)
+}
+
+fn sender(message: &proto::Message, users: &Users) -> (String, String, Option<String>) {
+  person(message.creator.as_ref(), users)
 }
 
 pub fn snippet(message: &proto::Message, users: &Users) -> Option<Snippet> {
@@ -282,6 +288,47 @@ pub fn snippet(message: &proto::Message, users: &Users) -> Option<Snippet> {
     text,
     time: message.create_time.unwrap_or(0),
   })
+}
+
+/// Earliest reader first; people who read at the same time by id.
+pub fn sort_receipts(receipts: &mut [ReadReceipt]) {
+  receipts.sort_by(|a, b| a.read_time.cmp(&b.read_time).then_with(|| a.user_id.cmp(&b.user_id)));
+}
+
+/// `incoming` applied to the receipts `held`: each person keeps the later of the two read times and the name and
+/// avatar the newest answer has (an event may carry only an id), and anyone not held yet is added. Earliest reader
+/// first.
+pub fn merge_receipts(mut held: Vec<ReadReceipt>, incoming: Vec<ReadReceipt>) -> Vec<ReadReceipt> {
+  for receipt in incoming {
+    let Some(slot) = held.iter_mut().find(|slot| slot.user_id == receipt.user_id) else {
+      held.push(receipt);
+      continue;
+    };
+    slot.read_time = slot.read_time.max(receipt.read_time);
+    if !receipt.name.is_empty() {
+      slot.name = receipt.name;
+    }
+    if receipt.avatar_url.is_some() {
+      slot.avatar_url = receipt.avatar_url;
+    }
+  }
+  sort_receipts(&mut held);
+  held
+}
+
+/// Who has read a conversation, from the answer to loading its messages or from an event of the stream: everyone but
+/// `me`, each resolved like the sender of a message, earliest reader first. `None` when read receipts are off. A set
+/// that lists readers is on even when it leaves the flag out; people without a read time are left out.
+pub fn read_receipts(set: &proto::ReadReceiptSet, me: &str, users: &Users) -> Option<Vec<ReadReceipt>> {
+  if !set.enabled.unwrap_or(!set.read_receipts.is_empty()) {
+    return None;
+  }
+  let readers = set.read_receipts.iter().filter_map(|receipt| {
+    let (user_id, name, avatar_url) = person(receipt.user.as_ref(), users);
+    let read_time = receipt.read_time_micros.filter(|time| *time > 0)?;
+    (!user_id.is_empty() && user_id != me).then_some(ReadReceipt { user_id, name, avatar_url, read_time })
+  });
+  Some(merge_receipts(Vec::new(), readers.collect()))
 }
 
 /// Byte offset of each UTF-16 code unit boundary in `text`.
@@ -307,14 +354,18 @@ impl Utf16Index<'_> {
   }
 }
 
+/// UTF-16 code units in `text`: what an annotation's offsets count.
+fn utf16_units(text: &str) -> i32 {
+  i32::try_from(text.encode_utf16().count()).unwrap_or(i32::MAX)
+}
+
 /// The annotations that mark `chips` in an outgoing message: mentions and the slash command, at UTF-16 offsets.
 pub fn chip_annotations(text: &str, chips: &[Chip]) -> Vec<proto::Annotation> {
-  let units = |bytes: &str| i32::try_from(bytes.encode_utf16().count()).unwrap_or(i32::MAX);
   chips
     .iter()
     .filter_map(|chip| {
       let covered = text.get(chip.range.clone()).filter(|covered| !covered.is_empty())?;
-      let start = units(text.get(..chip.range.start)?);
+      let start = utf16_units(text.get(..chip.range.start)?);
       let user_id = |id: &str, bot: bool| proto::UserId {
         id: Some(id.to_string()),
         r#type: Some(if bot {
@@ -326,7 +377,7 @@ pub fn chip_annotations(text: &str, chips: &[Chip]) -> Vec<proto::Annotation> {
       };
       let mut annotation = proto::Annotation {
         start_index: Some(start),
-        length: Some(units(covered)),
+        length: Some(utf16_units(covered)),
         ..Default::default()
       };
       match &chip.kind {
@@ -362,19 +413,72 @@ pub fn chip_annotations(text: &str, chips: &[Chip]) -> Vec<proto::Annotation> {
     .collect()
 }
 
-/// How `chips` show on the message while it is pending: its mentions.
-pub fn chip_spans(chips: &[Chip]) -> Vec<Span> {
-  chips
-    .iter()
-    .filter_map(|chip| {
-      let kind = match &chip.kind {
-        ChipKind::Mention { user_id, .. } => SpanKind::Mention(user_id.clone()),
-        ChipKind::MentionAll => SpanKind::MentionAll,
-        ChipKind::Command { .. } => return None,
-      };
-      Some(Span { range: chip.range.clone(), kind })
+/// The annotations that carry the formatting of an outgoing message, at UTF-16 offsets: the mirror of `annotations`,
+/// which reads them. Links and mentions are left out: an address is sent as plain text, and `chip_annotations` marks
+/// the mentions. Items on neighboring lines also get the list that wraps them, as on a message that was received.
+pub fn format_annotations(text: &str, spans: &[Span]) -> Vec<proto::Annotation> {
+  use proto::format_metadata::FormatType as Format;
+  let lists = list_ranges(text, spans).into_iter().map(|range| (range, Format::BulletedList));
+  let formats = spans.iter().filter_map(|span| {
+    let format = match span.kind {
+      SpanKind::Bold => Format::Bold,
+      SpanKind::Italic => Format::Italic,
+      SpanKind::Strike => Format::Strike,
+      SpanKind::Underline => Format::Underline,
+      SpanKind::Code => Format::Monospace,
+      SpanKind::CodeBlock => Format::MonospaceBlock,
+      SpanKind::ListItem => Format::BulletedListItem,
+      SpanKind::Link(_) | SpanKind::Mention(_) | SpanKind::MentionAll => return None,
+    };
+    Some((span.range.clone(), format))
+  });
+  lists
+    .chain(formats)
+    .filter_map(|(range, format)| {
+      let covered = text.get(range.clone()).filter(|covered| !covered.is_empty())?;
+      Some(proto::Annotation {
+        r#type: Some(proto::AnnotationType::FormatData as i32),
+        start_index: Some(utf16_units(text.get(..range.start)?)),
+        length: Some(utf16_units(covered)),
+        format_metadata: Some(proto::FormatMetadata {
+          format_type: Some(format as i32),
+          ..Default::default()
+        }),
+        ..Default::default()
+      })
     })
     .collect()
+}
+
+/// The ranges of the lists that the list items in `spans` make: items on neighboring lines are one list.
+fn list_ranges(text: &str, spans: &[Span]) -> Vec<Range<usize>> {
+  let mut items: Vec<&Range<usize>> = spans
+    .iter()
+    .filter(|span| span.kind == SpanKind::ListItem)
+    .map(|span| &span.range)
+    .collect();
+  items.sort_by_key(|item| item.start);
+  let mut lists: Vec<Range<usize>> = Vec::new();
+  for item in items {
+    match lists.last_mut() {
+      Some(list) if text.get(list.end..item.start) == Some("\n") => list.end = item.end,
+      _ => lists.push(item.clone()),
+    }
+  }
+  lists
+}
+
+/// How a typed message shows while it is pending: its mentions and formatting, and a link over each address.
+pub fn pending_spans(typed: &Parsed) -> Vec<Span> {
+  let mentions = typed.chips.iter().filter_map(|chip| {
+    let kind = match &chip.kind {
+      ChipKind::Mention { user_id, .. } => SpanKind::Mention(user_id.clone()),
+      ChipKind::MentionAll => SpanKind::MentionAll,
+      ChipKind::Command { .. } => return None,
+    };
+    Some(Span { range: chip.range.clone(), kind })
+  });
+  with_links(&typed.text, mentions.chain(typed.spans.iter().cloned()).collect())
 }
 
 /// The commands of the apps in the conversation, by name, without the ones that open a dialog.
@@ -542,8 +646,32 @@ fn annotations(text: &str, annotations: &[proto::Annotation]) -> (Vec<Span>, Vec
       _ => {},
     }
   }
+  (with_links(text, spans), attachments)
+}
+
+/// `spans` in text order, with a link over each web address in `text` that has none. Google Chat marks a link only
+/// when the sender's client did, and a message typed here goes out as plain text. Addresses inside code stay text.
+pub fn with_links(text: &str, mut spans: Vec<Span>) -> Vec<Span> {
+  let mut finder = linkify::LinkFinder::new();
+  finder.kinds(&[linkify::LinkKind::Url]);
+  let found: Vec<Span> = finder
+    .links(text)
+    .map(|link| link.start()..link.end())
+    .filter(|range| {
+      !spans.iter().any(|span| {
+        matches!(span.kind, SpanKind::Link(_) | SpanKind::Code | SpanKind::CodeBlock)
+          && span.range.start < range.end
+          && range.start < span.range.end
+      })
+    })
+    .map(|range| Span {
+      kind: SpanKind::Link(text[range.clone()].to_string()),
+      range,
+    })
+    .collect();
+  spans.extend(found);
   spans.sort_by_key(|span| (span.range.start, span.range.end));
-  (spans, attachments)
+  spans
 }
 
 /// Removes the HTML subset cards use (`<b>`, `<a href>`, `<br>`, `<font>`), keeping the text.
@@ -788,8 +916,12 @@ pub fn emoji_text(emoji: &proto::Emoji) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-  use super::{absolute, annotations, emoji_text, group_id, proto_group_id, strip_tags, user};
-  use crate::model::{GroupId, SpanKind};
+  use super::{
+    Users, absolute, annotations, emoji_text, format_annotations, group_id, merge_receipts, pending_spans,
+    proto_group_id, read_receipts, strip_tags, user, with_links,
+  };
+  use crate::markup::parse;
+  use crate::model::{Chip, ChipKind, GroupId, ReadReceipt, Span, SpanKind, User};
   use crate::proto;
 
   #[test]
@@ -849,6 +981,123 @@ mod tests {
     .expect("id is set");
     assert!(parsed.is_bot);
     assert_eq!(parsed.name, "Helper");
+  }
+
+  fn wire_receipt(id: &str, name: Option<&str>, avatar: Option<&str>, read_time: Option<i64>) -> proto::ReadReceipt {
+    proto::ReadReceipt {
+      read_time_micros: read_time,
+      user: Some(proto::User {
+        user_id: Some(proto::UserId {
+          id: Some(id.into()),
+          ..Default::default()
+        }),
+        name: name.map(Into::into),
+        avatar_url: avatar.map(Into::into),
+        ..Default::default()
+      }),
+    }
+  }
+
+  fn reader(id: &str, read_time: i64) -> ReadReceipt {
+    ReadReceipt {
+      user_id: id.into(),
+      name: String::new(),
+      avatar_url: None,
+      read_time,
+    }
+  }
+
+  #[test]
+  fn read_receipts_skip_the_signed_in_user_and_resolve_people_like_a_sender() {
+    let mut users = Users::new();
+    users.insert(
+      "riley".into(),
+      User {
+        id: "riley".into(),
+        name: "Riley Brooks".into(),
+        avatar_url: Some("https://lh3.googleusercontent.com/riley".into()),
+        ..User::default()
+      },
+    );
+    let set = proto::ReadReceiptSet {
+      enabled: Some(true),
+      read_receipts: vec![
+        // The profile on the wire, with a protocol-relative avatar.
+        wire_receipt(
+          "jordan",
+          Some("Jordan Park"),
+          Some("//lh3.googleusercontent.com/jordan"),
+          Some(300),
+        ),
+        // The signed-in user.
+        wire_receipt("me", Some("Avery Morgan"), None, Some(500)),
+        // Only an id: the users already known answer for it.
+        wire_receipt("riley", None, None, Some(200)),
+        // Nobody knows this one, but where they have read up to still counts.
+        wire_receipt("sam", None, None, Some(100)),
+        // Never read anything, and no one at all: nothing to place.
+        wire_receipt("noah", Some("Noah Fischer"), None, None),
+        proto::ReadReceipt { read_time_micros: Some(50), user: None },
+      ],
+    };
+    let people = read_receipts(&set, "me", &users).expect("receipts are on");
+    let shown: Vec<(&str, &str, Option<&str>, i64)> = people
+      .iter()
+      .map(|person| {
+        (
+          person.user_id.as_str(),
+          person.name.as_str(),
+          person.avatar_url.as_deref(),
+          person.read_time,
+        )
+      })
+      .collect();
+    assert_eq!(
+      shown,
+      [
+        ("sam", "", None, 100),
+        ("riley", "Riley Brooks", Some("https://lh3.googleusercontent.com/riley"), 200),
+        ("jordan", "Jordan Park", Some("https://lh3.googleusercontent.com/jordan"), 300),
+      ]
+    );
+  }
+
+  #[test]
+  fn a_set_with_receipts_off_has_none_and_one_that_lists_readers_is_on() {
+    let jordan = || vec![wire_receipt("jordan", Some("Jordan Park"), None, Some(10))];
+    let set = |enabled, read_receipts| proto::ReadReceiptSet { enabled, read_receipts };
+    let people = |set: &proto::ReadReceiptSet| read_receipts(set, "me", &Users::new());
+    assert_eq!(people(&set(Some(false), jordan())), None);
+    assert_eq!(people(&set(Some(true), Vec::new())), Some(Vec::new()));
+    assert_eq!(people(&set(None, Vec::new())), None);
+    assert_eq!(people(&set(None, jordan())).as_ref().map(Vec::len), Some(1));
+  }
+
+  #[test]
+  fn merging_receipts_moves_people_on_but_never_back() {
+    let held = vec![reader("jordan", 100), reader("riley", 200)];
+    let merged = merge_receipts(held, vec![reader("jordan", 300), reader("riley", 150), reader("sam", 250)]);
+    let order: Vec<(&str, i64)> = merged
+      .iter()
+      .map(|person| (person.user_id.as_str(), person.read_time))
+      .collect();
+    assert_eq!(order, [("riley", 200), ("sam", 250), ("jordan", 300)]);
+    // A person named twice in one answer counts once, at the later time.
+    let twice = merge_receipts(
+      Vec::new(),
+      vec![reader("jordan", 10), reader("jordan", 30), reader("jordan", 20)],
+    );
+    assert_eq!(twice, [reader("jordan", 30)]);
+    // An event may carry only an id: what is known of the person stays, and a name that comes later is kept.
+    let named = ReadReceipt {
+      name: "Jordan Park".into(),
+      avatar_url: Some("https://lh3.googleusercontent.com/jordan".into()),
+      ..reader("jordan", 100)
+    };
+    let bare = merge_receipts(vec![named.clone()], vec![reader("jordan", 200)]);
+    assert_eq!(bare, [ReadReceipt { read_time: 200, ..named.clone() }]);
+    let late_name = merge_receipts(vec![reader("jordan", 300)], vec![named.clone()]);
+    assert_eq!(late_name, [ReadReceipt { read_time: 300, ..named }]);
   }
 
   #[test]
@@ -930,5 +1179,142 @@ mod tests {
       Some(":ship:")
     );
     assert_eq!(emoji_text(&proto::Emoji::default()), None);
+  }
+
+  #[test]
+  fn a_bare_address_becomes_a_link_unless_marked_or_in_code() {
+    let text = "see https://example.com/a, `https://example.org` and https://example.net.";
+    let code = text.find('`').expect("code");
+    let marked = text.find("https://example.net").expect("marked");
+    let held = vec![
+      Span {
+        range: code..code + 21,
+        kind: SpanKind::Code,
+      },
+      Span {
+        range: marked..marked + 19,
+        kind: SpanKind::Link("https://example.net/".into()),
+      },
+    ];
+    let links: Vec<(&str, String)> = with_links(text, held)
+      .into_iter()
+      .filter_map(|span| match span.kind {
+        SpanKind::Link(url) => Some((&text[span.range], url)),
+        _ => None,
+      })
+      .collect();
+    assert_eq!(
+      links,
+      [
+        ("https://example.com/a", "https://example.com/a".to_string()),
+        ("https://example.net", "https://example.net/".to_string()),
+      ]
+    );
+  }
+
+  /// What a format annotation says: its format type, then its UTF-16 start and length.
+  fn shape(annotation: &proto::Annotation) -> (i32, i32, i32) {
+    assert_eq!(annotation.r#type, Some(proto::AnnotationType::FormatData as i32));
+    let format = annotation.format_metadata.as_ref().and_then(|format| format.format_type);
+    (
+      format.unwrap_or_default(),
+      annotation.start_index.unwrap_or(-1),
+      annotation.length.unwrap_or(-1),
+    )
+  }
+
+  #[test]
+  fn typed_formatting_reads_back_as_it_was_sent() {
+    let typed = parse("*bold* _it_ ~gone~ `code` café 😀 *x*\n- one\n- two\n```\nblock\n```", &[]);
+    assert_eq!(typed.spans.len(), 8);
+    let wire = format_annotations(&typed.text, &typed.spans);
+    let (read, attachments) = annotations(&typed.text, &wire);
+    assert_eq!(read, typed.spans);
+    assert_eq!(attachments, Vec::new());
+  }
+
+  #[test]
+  fn format_annotations_count_in_utf16_units() {
+    use proto::format_metadata::FormatType as Format;
+    // The emoji is four bytes and two UTF-16 units.
+    let wire = format_annotations("😀 hi", &[Span { range: 5..7, kind: SpanKind::Bold }]);
+    assert_eq!(wire.iter().map(shape).collect::<Vec<_>>(), [(Format::Bold as i32, 3, 2)]);
+  }
+
+  #[test]
+  fn each_kind_of_formatting_has_its_format_and_the_rest_has_none() {
+    use proto::format_metadata::FormatType as Format;
+    let text = "abc";
+    let sent = |kind: SpanKind| format_annotations(text, &[Span { range: 0..3, kind }]);
+    for (kind, format) in [
+      (SpanKind::Bold, Format::Bold),
+      (SpanKind::Italic, Format::Italic),
+      (SpanKind::Strike, Format::Strike),
+      (SpanKind::Underline, Format::Underline),
+      (SpanKind::Code, Format::Monospace),
+      (SpanKind::CodeBlock, Format::MonospaceBlock),
+    ] {
+      assert_eq!(
+        sent(kind.clone()).iter().map(shape).collect::<Vec<_>>(),
+        [(format as i32, 0, 3)],
+        "{kind:?}"
+      );
+    }
+    for kind in [
+      SpanKind::Link("https://example.com/".into()),
+      SpanKind::Mention("riley".into()),
+      SpanKind::MentionAll,
+    ] {
+      assert_eq!(sent(kind), Vec::new());
+    }
+    let empty = Span { range: 1..1, kind: SpanKind::Bold };
+    let outside = Span { range: 2..9, kind: SpanKind::Bold };
+    assert_eq!(format_annotations(text, &[empty, outside]), Vec::new());
+  }
+
+  #[test]
+  fn items_on_neighboring_lines_share_a_list() {
+    use proto::format_metadata::FormatType as Format;
+    let item = |range| Span { range, kind: SpanKind::ListItem };
+    let wire = format_annotations("a\nb\n\nc", &[item(0..1), item(2..3), item(5..6)]);
+    let (list, line) = (Format::BulletedList as i32, Format::BulletedListItem as i32);
+    assert_eq!(
+      wire.iter().map(shape).collect::<Vec<_>>(),
+      [(list, 0, 3), (list, 5, 1), (line, 0, 1), (line, 2, 1), (line, 5, 1)]
+    );
+  }
+
+  #[test]
+  fn a_pending_message_shows_mentions_formatting_and_links() {
+    let text = "*hi* @Riley Brooks, see https://example.com/a";
+    let start = text.find('@').expect("mention");
+    let mention = Chip {
+      range: start..start + 13,
+      kind: ChipKind::Mention { user_id: "riley".into(), bot: false },
+    };
+    let typed = parse(text, &[mention]);
+    let shown: Vec<(&str, SpanKind)> = pending_spans(&typed)
+      .into_iter()
+      .map(|span| (&typed.text[span.range], span.kind))
+      .collect();
+    assert_eq!(
+      shown,
+      [
+        ("hi", SpanKind::Bold),
+        ("@Riley Brooks", SpanKind::Mention("riley".into())),
+        ("https://example.com/a", SpanKind::Link("https://example.com/a".into())),
+      ]
+    );
+    let command = Chip {
+      range: 0..7,
+      kind: ChipKind::Command {
+        bot_id: "build-bot".into(),
+        command_id: 2,
+        name: "/deploy".into(),
+      },
+    };
+    let typed = parse("/deploy *now*", &[command]);
+    let kinds: Vec<SpanKind> = pending_spans(&typed).into_iter().map(|span| span.kind).collect();
+    assert_eq!(kinds, [SpanKind::Bold]);
   }
 }
