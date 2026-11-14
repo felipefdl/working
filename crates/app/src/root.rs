@@ -28,7 +28,8 @@ use crate::status;
 use crate::status_menu::{self, ComposerHandle, OpenNotificationSettings, StatusComposer};
 use crate::store::{Store, View};
 use crate::switcher::{Switcher, SwitcherEvent};
-use crate::theme::{ACCENT, BG, BORDER, FIELD, MUTED, PANEL, ROW_HOVER, TEXT, is_light, rgb};
+use crate::text_panel::{TextPanel, TextPanelHandle};
+use crate::theme::{self, ACCENT, BG, BORDER, FIELD, MUTED, PANEL, ROW_HOVER, TEXT, is_light, rgb};
 use crate::theme_picker::{ThemePicker, ThemePickerEvent};
 use crate::ui::{Icon, icon};
 use crate::viewer::{Viewer, ViewerHandle};
@@ -164,6 +165,7 @@ pub struct RootView {
   logo: [Arc<Image>; 2],
   viewer: Entity<Viewer>,
   menu: Entity<ContextMenu>,
+  text_panel: Entity<TextPanel>,
   emoji: Entity<EmojiPicker>,
   composer: Entity<StatusComposer>,
   switcher: Option<(Entity<Switcher>, Subscription)>,
@@ -203,10 +205,12 @@ impl RootView {
     let images = store.read(cx).images.clone();
     let viewer = cx.new(|cx| Viewer::new(core.clone(), images, cx));
     let menu = cx.new(ContextMenu::new);
+    let text_panel = cx.new(|cx| TextPanel::new(store.clone(), window, cx));
     let emoji = cx.new(|cx| EmojiPicker::new(window, cx));
     let composer = cx.new(|cx| StatusComposer::new(core.clone(), window, cx));
     cx.set_global(ViewerHandle(viewer.clone()));
     cx.set_global(MenuHandle(menu.clone()));
+    cx.set_global(TextPanelHandle(text_panel.clone()));
     cx.set_global(EmojiHandle(emoji.clone()));
     cx.set_global(ComposerHandle(composer.clone()));
 
@@ -309,6 +313,7 @@ impl RootView {
       logo,
       viewer,
       menu,
+      text_panel,
       emoji,
       composer,
       switcher: None,
@@ -682,6 +687,10 @@ impl RootView {
   }
 
   fn on_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.text_panel.read(cx).is_open() {
+      self.text_panel.update(cx, |panel, cx| panel.close(window, cx));
+      return;
+    }
     if self.composer.read(cx).is_open() && !self.emoji.read(cx).is_open() {
       self.composer.update(cx, |composer, cx| composer.close(window, cx));
     } else if self.emoji.read(cx).is_open() {
@@ -725,6 +734,7 @@ impl RootView {
   /// A modal overlay has the keyboard: conversation hotkeys stay out of its way.
   fn modal_open(&self, cx: &App) -> bool {
     self.settings.is_some()
+      || self.text_panel.read(cx).is_open()
       || self.switcher.is_some()
       || self.theme_picker.is_some()
       || self.new_chat.is_some()
@@ -1076,6 +1086,7 @@ impl Render for RootView {
       .bg(rgb(BG))
       .text_color(rgb(TEXT))
       .text_size(px(13.))
+      .font_family(theme::sans())
       .key_context(context)
       .track_focus(&self.focus)
       .on_action(cx.listener(|this, _: &Escape, window, cx| this.on_escape(window, cx)))
@@ -1163,6 +1174,7 @@ impl Render for RootView {
       .child(self.viewer.clone())
       .child(self.composer.clone())
       .child(self.menu.clone())
+      .child(self.text_panel.clone())
       .child(self.emoji.clone())
       .children(crate::updater::card(cx))
       .into_any_element()
