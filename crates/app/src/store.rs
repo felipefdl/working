@@ -6,7 +6,7 @@ use std::sync::Arc;
 use gchat_core::fuzzy::Fuzzy;
 use gchat_core::{
   AttachmentKind, Calendar, CalendarEvent, Command, Connection, Core, Event, Group, GroupId, GroupKind, Message,
-  Micros, Notify, Placement, SearchHit, Shortcut, SpanKind, User,
+  Micros, Notify, Placement, ReadReceipt, SearchHit, Shortcut, SpanKind, User,
 };
 use gpui_kit::*;
 
@@ -258,6 +258,15 @@ pub struct History {
   pub reached_end: bool,
 }
 
+/// Who has read the open conversation, as the core last said it.
+struct OpenReceipts {
+  group: GroupId,
+  /// Google Chat has read receipts on in this conversation.
+  enabled: bool,
+  /// Earliest reader first, never the signed-in user.
+  receipts: Arc<Vec<ReadReceipt>>,
+}
+
 /// A message search: `hits` is `None` until the core answers.
 pub struct Search {
   pub query: String,
@@ -318,6 +327,9 @@ pub struct Store {
   collapsed: HashSet<Section>,
   show_all: HashSet<Section>,
   histories: HashMap<GroupId, History>,
+  /// Who has read the open conversation. Each event for that conversation replaces it, and it is dropped as soon as
+  /// another view takes the conversation's place: the core sends it again whenever a conversation opens.
+  receipts: Option<OpenReceipts>,
   /// Recently opened conversations, newest first.
   pub recent: Vec<GroupId>,
   /// Unread conversations shown on the Dock icon.
@@ -371,6 +383,7 @@ impl Store {
       collapsed: HashSet::from([Section::Meetings]),
       show_all: HashSet::new(),
       histories: HashMap::new(),
+      receipts: None,
       recent: Vec::new(),
       badge: 0,
       notified: HashMap::new(),
@@ -462,6 +475,19 @@ impl Store {
             if new_incoming && reached_end && window.is_window_active() {
               self.core.send(Command::MarkRead(group));
             }
+          }
+        },
+        Event::ReadReceipts { group, enabled, receipts } => {
+          // Only the open conversation shows them. The core sends them again whenever one opens.
+          let held = self
+            .receipts
+            .as_ref()
+            .is_some_and(|held| held.group == group && held.enabled == enabled && held.receipts == receipts);
+          if self.is_open(&group) && !held {
+            if let Some(view) = &self.conv {
+              view.update(cx, |view, cx| view.set_readers(enabled, receipts.clone(), cx));
+            }
+            self.receipts = Some(OpenReceipts { group, enabled, receipts });
           }
         },
         Event::SearchResults { query, hits } => {
@@ -1149,6 +1175,10 @@ impl Store {
       self.forward.clear();
     }
     self.view = view;
+    // Who has read a conversation belongs to it alone.
+    if self.receipts.as_ref().is_some_and(|held| !self.is_open(&held.group)) {
+      self.receipts = None;
+    }
   }
 
   /// Returns to the view before this one. With nothing recorded, a conversation or a shortcut goes home.

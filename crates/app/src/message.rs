@@ -6,7 +6,9 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use gchat_core::{Attachment, AttachmentKind, Card, Command, Core, GroupId, Message, Micros, Reaction, Span, SpanKind};
+use gchat_core::{
+  Attachment, AttachmentKind, Card, Command, Core, GroupId, Message, Micros, Reaction, ReadReceipt, Span, SpanKind,
+};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -15,16 +17,31 @@ use gpui_kit::*;
 use crate::emoji_picker;
 use crate::images::Images;
 use crate::menu::{self, MenuItem};
+use crate::receipt_logic;
 use crate::settings::{Density, Settings};
+use crate::text_panel;
 use crate::theme::{
-  ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, BUBBLE_OWN, CODE_BG, FIELD, MARK, MONO, MUTED, PANEL, PLACEHOLDER, POPOVER,
-  RED, ROW_HOVER, TEXT, Tone, WHITE, rgb,
+  ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, BUBBLE_OWN, CODE_BG, FIELD, MARK, MUTED, PANEL, PLACEHOLDER, POPOVER, RED,
+  ROW_HOVER, TEXT, Tone, WHITE, rgb,
 };
 use crate::ui::{Icon, avatar, icon};
 use crate::util;
 use crate::viewer;
 
 const FIVE_MINUTES: i64 = 5 * 60 * 1_000_000;
+
+/// One avatar of whoever has read up to a message: the picture, and the ring in the page's color around it that keeps
+/// it apart from its neighbors and from the part of the message it sits on.
+const READER_FACE: f32 = 16.;
+const READER_RING: f32 = 18.;
+/// How far each avatar after the nearest reaches over the one before it, rings included.
+const READER_OVERLAP: f32 = 6.;
+/// How far the nearest avatar reaches over the corner it sits on, ring included.
+const READER_TUCK: f32 = 4.;
+/// The room kept between the avatars and the row's edge when they have to move over the part they sit on.
+const READER_EDGE_GAP: f32 = 2.;
+/// The padding at both ends of a message row: the avatars may reach into it, all but `READER_EDGE_GAP`.
+const ROW_PAD: f32 = 16.;
 
 /// Reply summary of a thread: shown as a footer under its starting message in the main list and as the
 /// `N replies` divider in the thread panel.
@@ -131,6 +148,42 @@ pub fn build_thread_rows(messages: &[Arc<Message>], topic: &str, me_id: &str) ->
   Some(rows)
 }
 
+/// Who has read up to each message of a list of rows, by message id: their avatars sit on its corner.
+#[derive(Default)]
+pub struct Readers(HashMap<String, Vec<ReadReceipt>>);
+
+impl Readers {
+  /// Puts each of `receipts` on the newest message of `rows` sent at or before their read time. A line of the
+  /// conversation itself, a message still going out, and one that failed are nobody's last read message.
+  pub fn place(rows: &[Row], receipts: &[ReadReceipt]) -> Self {
+    if receipts.is_empty() {
+      return Self::default();
+    }
+    let candidates: Vec<&Row> = rows
+      .iter()
+      .filter(|row| !row.msg.system && !row.msg.pending && !row.msg.failed)
+      .collect();
+    let times: Vec<Micros> = candidates.iter().map(|row| row.msg.time).collect();
+    let read_times: Vec<Micros> = receipts.iter().map(|receipt| receipt.read_time).collect();
+    let by_message = receipt_logic::place(&times, &read_times)
+      .into_iter()
+      .filter_map(|(at, readers)| {
+        let id = candidates.get(at)?.msg.id.clone();
+        Some((
+          id,
+          readers.into_iter().filter_map(|reader| receipts.get(reader).cloned()).collect(),
+        ))
+      })
+      .collect();
+    Self(by_message)
+  }
+
+  /// Who has read up to the message `id`, earliest reader first.
+  pub fn of(&self, id: &str) -> &[ReadReceipt] {
+    self.0.get(id).map_or(&[][..], Vec::as_slice)
+  }
+}
+
 pub struct MsgCtx<'a> {
   pub images: &'a Images,
   pub core: &'a Core,
@@ -154,6 +207,9 @@ pub struct MsgCtx<'a> {
   pub hovered: Option<&'a str>,
   /// Set while the pointer is on a toolbar, which can reach over the row above its message.
   pub on_tools: &'a Rc<Cell<bool>>,
+  /// Who has read up to this message: their avatars sit on its bottom corner, out of the row's layout. Empty in a
+  /// conversation with read receipts off.
+  pub readers: &'a [ReadReceipt],
 }
 
 /// What a message's toolbar asks the conversation to do.
@@ -239,19 +295,25 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
     })
   });
 
+  // As wide as the row lets it be, so the part the readers' avatars sit on knows the room beside it (`read_mark`). Its
+  // children keep their own widths: each is no wider than it needs, as in a column as wide as the widest of them.
   let mut content = v_flex()
     .relative()
+    .flex_1()
     .when(aside, gpui_kit::Styled::items_end)
     .when(!aside, gpui_kit::Styled::items_start)
     .gap_1()
     .min_w_0()
     .when(msg.pending, |d| d.opacity(0.55));
+  // What the message shows, top to bottom, and where in it the text bubble, the last attachment and the last card are.
+  let mut body: Vec<AnyElement> = Vec::new();
+  let (mut bubble_at, mut attachment_at, mut card_at) = (None, None, None);
   if row.head {
     let time = div()
       .text_size(px(11.))
       .text_color(rgb(MUTED))
       .child(util::message_time(msg.time));
-    content = content.child(if aside {
+    let header = if aside {
       time
     } else {
       h_flex()
@@ -273,13 +335,18 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
           }
         })
         .child(time)
-    });
+    };
+    body.push(header.into_any_element());
   }
 
   let bubble_bg = if row.own { BUBBLE_OWN } else { BUBBLE };
   let has_text = !msg.text.trim().is_empty();
-  if has_text || msg.quote.is_some() {
+  let has_bubble = has_text || msg.quote.is_some();
+  if has_bubble {
+    // A click on the bubble, the quote in it included, opens its text in the panel where it can be selected. A link or
+    // a mention in the text stops the click (`rich_text`), as does the readers' overlay on its corner.
     let mut bubble = v_flex()
+      .id(SharedString::from(format!("{}-bubble", msg.id)))
       .max_w(px(600.))
       .gap_1()
       .px_3p5()
@@ -290,13 +357,7 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
       .text_color(rgb(TEXT))
       .when(has_text, |bubble| {
         let msg = msg.clone();
-        bubble.on_mouse_down(MouseButton::Right, move |event, window, cx| {
-          let msg = msg.clone();
-          let copy = MenuItem::new("Copy Text", move |_, cx| {
-            cx.write_to_clipboard(ClipboardItem::new_string(msg.text.clone()));
-          });
-          menu::show(event.position, vec![copy], window, cx);
-        })
+        bubble.on_click(move |event, window, cx| text_panel::show(event.position(), &msg.text, window, cx))
       });
     if let Some(quote) = &msg.quote {
       bubble = bubble.child(
@@ -324,35 +385,57 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
         bubble = bubble.child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("(edited)"));
       }
     }
-    content = content.child(bubble);
+    bubble_at = Some(body.len());
+    body.push(bubble.into_any_element());
   }
 
   for (i, attachment) in msg.attachments.iter().enumerate() {
     let id = SharedString::from(format!("{}-a{i}", msg.id));
-    content = content.child(attachment_view(attachment, id, bubble_bg, ctx, cx));
+    attachment_at = Some(body.len());
+    body.push(attachment_view(attachment, id, bubble_bg, ctx, cx));
   }
   if msg.starred {
-    content = content.child(
+    body.push(
       h_flex()
         .gap_1()
         .items_center()
         .text_size(px(11.))
         .text_color(rgb(MUTED))
         .child(icon(Icon::Star, 11., MUTED))
-        .child("Starred"),
+        .child("Starred")
+        .into_any_element(),
     );
   }
   for (i, card) in msg.cards.iter().enumerate() {
-    content = content.child(card_view(card, msg, ctx.core, i));
+    card_at = Some(body.len());
+    body.push(card_view(card, msg, ctx.core, i));
   }
   if !msg.reactions.is_empty() {
-    content = content.child(reactions_view(&msg.reactions, msg, ctx.core));
+    body.push(reactions_view(&msg.reactions, msg, ctx.core));
   }
   if msg.failed {
-    content = content.child(div().text_size(px(12.)).text_color(rgb(RED)).child("Not sent"));
+    body.push(
+      div()
+        .text_size(px(12.))
+        .text_color(rgb(RED))
+        .child("Not sent")
+        .into_any_element(),
+    );
   }
   if let (Some(info), Some(open)) = (row.thread, ctx.open_thread) {
-    content = content.child(thread_footer(&msg.id, info, open.clone()));
+    body.push(thread_footer(&msg.id, info, open.clone()));
+  }
+  // The avatars of whoever has read up to here sit on the bottom corner of the text bubble, or else of the last
+  // attachment, or else of the last card, never below the reactions, the cards, or the thread footer; a message with
+  // none of those has them on the last thing it shows.
+  let mark = bubble_at.or(attachment_at).or(card_at).or_else(|| body.len().checked_sub(1));
+  let mut readers = readers_group(aside, &msg.id, ctx, cx);
+  for (ix, part) in body.into_iter().enumerate() {
+    content = content.child(if mark == Some(ix) {
+      read_mark(part, readers.take(), aside).into_any_element()
+    } else {
+      part
+    });
   }
 
   // Floats over the top edge of the first bubble, as in Google Chat, so it can reach over the row above.
@@ -392,11 +475,10 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
       .id(SharedString::from(format!("{}-row", msg.id)))
       .w_full()
       .max_w(px(780.))
-      .px_4()
+      .px(px(ROW_PAD))
       .pt(if row.head { px(10.) } else { px(2.) })
       .gap_2()
       .items_start()
-      .when(aside, gpui_kit::Styled::justify_end)
       .on_hover(move |hovered, window, cx| {
         if *hovered {
           act(Act::Hover, &entered, window, cx);
@@ -427,9 +509,106 @@ fn tool(id: SharedString, name: Icon) -> Stateful<Div> {
     .child(icon(name, 15., MUTED))
 }
 
-/// A tooltip naming a toolbar button. The buttons that open a menu go without: theirs would stay over it.
-fn hint(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView {
-  move |window, cx| Tooltip::new(text).build(window, cx)
+/// A tooltip with this text, over a button or a group of avatars. The buttons that open a menu go without: theirs
+/// would stay over it.
+fn hint(text: impl Into<SharedString>) -> impl Fn(&mut Window, &mut App) -> AnyView {
+  let text: SharedString = text.into();
+  move |window, cx| Tooltip::new(text.clone()).build(window, cx)
+}
+
+/// `part` of a message with the avatars of whoever has read up to the message on its bottom corner (`readers_group`).
+///
+/// A row as wide as the message's column: `part` first, in a column of its own where it is as wide as it would be in
+/// the message's column (it never grows or shrinks for what follows), then a holder that takes the rest, the room
+/// beside it. Over the holder lies a track from `READER_TUCK` inside the part to `READER_EDGE_GAP` short of the row's
+/// edge (its `ROW_PAD` less the gap), and the avatars sit in it on the part's bottom edge: next to the part while they
+/// fit, their auto margin taking the room that is left, else against the far end of the track, over the part's corner.
+/// Mirrored beside a bubble on the right. Every row has this, read or not, and the track is out of the layout, so
+/// people reading on never change a row.
+fn read_mark(part: impl IntoElement, readers: Option<Stateful<Div>>, aside: bool) -> Div {
+  let reach = ROW_PAD - READER_EDGE_GAP;
+  let track = readers.map(|group| {
+    let track = h_flex().absolute().bottom_0();
+    if aside {
+      track
+        .left(px(-reach))
+        .right(px(-READER_TUCK))
+        .justify_start()
+        .child(group.ml_auto())
+    } else {
+      track
+        .left(px(-READER_TUCK))
+        .right(px(-reach))
+        .justify_end()
+        .child(group.mr_auto())
+    }
+  });
+  h_flex()
+    .self_stretch()
+    .items_start()
+    .when(aside, gpui_kit::Styled::flex_row_reverse)
+    .child(
+      v_flex()
+        .min_w_0()
+        .when(aside, gpui_kit::Styled::items_end)
+        .when(!aside, gpui_kit::Styled::items_start)
+        .child(part),
+    )
+    .child(div().relative().flex_1().min_w_0().self_stretch().children(track))
+}
+
+/// The avatars of whoever has read up to a message, `None` when nobody has: at most `MAX_SHOWN`, overlapping, then `+N`
+/// in muted text, with a tooltip that names them all. Laid out from the part's corner outward (`read_mark` places
+/// them): left to right, or right to left beside a bubble on the right, with the count outermost.
+fn readers_group(aside: bool, msg_id: &str, ctx: &MsgCtx, cx: &App) -> Option<Stateful<Div>> {
+  if ctx.readers.is_empty() {
+    return None;
+  }
+  let (faces, folded) = receipt_logic::shown(ctx.readers);
+  let pictures = faces.iter().enumerate().map(|(ix, reader)| {
+    let ring = div()
+      .size(px(READER_RING))
+      .flex_shrink_0()
+      .flex()
+      .items_center()
+      .justify_center()
+      .rounded_full()
+      .bg(rgb(BG))
+      .child(avatar(
+        ctx.images,
+        cx,
+        reader.avatar_url.as_deref(),
+        None,
+        &reader.name,
+        READER_FACE,
+      ));
+    // Each avatar after the nearest reaches back over the one before it.
+    match (ix, aside) {
+      (0, _) => ring,
+      (_, false) => ring.ml(px(-READER_OVERLAP)),
+      (_, true) => ring.mr(px(-READER_OVERLAP)),
+    }
+  });
+  let count = (folded > 0).then(|| {
+    div()
+      .flex_shrink_0()
+      .text_size(px(11.))
+      .text_color(rgb(MUTED))
+      .child(format!("+{folded}"))
+  });
+  let outward = |row: Div| if aside { row.flex_row_reverse() } else { row };
+  let names: Vec<&str> = ctx.readers.iter().map(|reader| reader.name.as_str()).collect();
+  Some(
+    outward(h_flex())
+      .id(SharedString::from(format!("{msg_id}-readers")))
+      .flex_shrink_0()
+      .gap(px(3.))
+      .tooltip(hint(receipt_logic::read_by(&names)))
+      // Over the bubble, a click on it is not a click on the bubble.
+      .on_click(|_, _, cx| cx.stop_propagation())
+      .child(outward(h_flex()).children(pictures))
+      .children(count),
+  )
 }
 
 /// The reactions one click away, left of the toolbar.
@@ -785,7 +964,7 @@ fn rich_text(
           .py_2()
           .rounded(px(8.))
           .bg(rgb(CODE_BG))
-          .font_family(MONO)
+          .font_family(crate::theme::mono())
           .text_size(px(12.5))
           .child(code),
       )
@@ -878,7 +1057,7 @@ fn text_segment(
       highlights.push((a..b, style));
     }
     if code {
-      fonts.push((a..b, SharedString::from(MONO)));
+      fonts.push((a..b, crate::theme::mono()));
     }
   }
   let highlights = compact_highlights(slice, highlights);
@@ -917,10 +1096,15 @@ fn text_segment(
   } else {
     let open_person = open_person.clone();
     InteractiveText::new(id, styled)
-      .on_click(link_ranges, move |ix, window, cx| match targets.get(ix) {
-        Some(Target::Url(url)) => cx.open_url(url),
-        Some(Target::Person(user_id)) => open_person(user_id, window, cx),
-        None => {},
+      // Runs before the bubble's click, its listener being added after the bubble's: stopping here keeps a click on a
+      // link or a mention from also opening the text panel.
+      .on_click(link_ranges, move |ix, window, cx| {
+        cx.stop_propagation();
+        match targets.get(ix) {
+          Some(Target::Url(url)) => cx.open_url(url),
+          Some(Target::Person(user_id)) => open_person(user_id, window, cx),
+          None => {},
+        }
       })
       .into_any_element()
   }
@@ -1571,5 +1755,61 @@ mod tests {
     assert!(rows[0].own);
     assert!(!rows[1].own);
     assert_eq!(rows[0].thread.map(|info| info.count), Some(1));
+  }
+
+  #[test]
+  fn readers_sit_on_the_newest_delivered_message_they_have_read() {
+    use super::{Readers, build_rows};
+    use gchat_core::{GroupId, Message, ReadReceipt};
+    use std::sync::Arc;
+    let message = |id: &str, time: i64| Message {
+      id: id.into(),
+      topic_id: id.into(),
+      group: GroupId::Dm("g".into()),
+      sender_id: "you".into(),
+      sender_name: "you".into(),
+      sender_avatar: None,
+      text: id.into(),
+      spans: Vec::new(),
+      time,
+      update_time: 0,
+      edited: false,
+      system: false,
+      reactions: Vec::new(),
+      attachments: Vec::new(),
+      cards: Vec::new(),
+      quote: None,
+      starred: false,
+      pending: false,
+      failed: false,
+    };
+    let mut joined = message("joined", 40);
+    joined.system = true;
+    let mut sending = message("sending", 50);
+    sending.pending = true;
+    let rows = build_rows(
+      &[
+        Arc::new(message("a", 10)),
+        Arc::new(message("b", 20)),
+        Arc::new(joined),
+        Arc::new(sending),
+      ],
+      "me",
+    );
+    let reader = |id: &str, read_time: i64| ReadReceipt {
+      user_id: id.into(),
+      name: id.into(),
+      avatar_url: None,
+      read_time,
+    };
+    // Jordan stopped after `a`; Riley read past everything, so she is on `b` and not on the system line or the message
+    // still going out; Sam read none of it.
+    let placed = Readers::place(&rows, &[reader("jordan", 15), reader("riley", 60), reader("sam", 5)]);
+    let at = |id: &str| placed.of(id).iter().map(|reader| reader.user_id.as_str()).collect::<Vec<_>>();
+    assert_eq!(at("a"), ["jordan"]);
+    assert_eq!(at("b"), ["riley"]);
+    assert_eq!(at("joined"), Vec::<&str>::new());
+    assert_eq!(at("sending"), Vec::<&str>::new());
+    assert_eq!(Readers::place(&rows, &[]).of("a"), []);
   }
 }
