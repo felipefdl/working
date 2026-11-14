@@ -1594,7 +1594,11 @@ message GroupNotificationSettings {
 		NOTIFY_LESS = 2;
 		NOTIFY_NEVER = 3;
 	}
+	// The web client now writes, and the server reports, 4 (every message) and 5 (main conversations) too, which this
+	// enum does not name; `convert::notify` reads the raw value.
 	optional RoomNotificationState room_state = 2;
+	// What the web client writes and reads for mute; `state` above stays unset on such conversations.
+	optional GroupMuteSetting mute = 3;
 }
 
 message RetentionSettings {
@@ -3447,6 +3451,55 @@ message MarkGroupReadstateRequest {
 message MarkGroupReadstateResponse {
 	optional GroupReadState read_state = 1;
 	optional WriteRevision user_revision = 2;
+}
+
+// Captured from the web client; it echoes the conversation's current room state unchanged.
+message UpdateGroupNotificationSettingsRequest {
+	optional RequestHeader request_header = 100;
+	optional GroupId group_id = 1;
+	optional GroupNotificationSettings settings = 2;
+}
+
+message GroupMuteSetting {
+	enum MuteState {
+		UNKNOWN_MUTE_STATE = 0;
+		UNMUTED = 1;
+		MUTED = 2;
+	}
+	optional MuteState state = 1;
+}
+
+message UpdateGroupNotificationSettingsResponse {
+}
+
+// Captured from the web client: 0 clears the mark.
+message SetMarkAsUnreadTimestampRequest {
+	optional RequestHeader request_header = 100;
+	optional GroupId group_id = 1;
+	optional int64 mark_as_unread_timestamp_usec = 2;
+}
+
+message SetMarkAsUnreadTimestampResponse {
+}
+
+// Captured from the web client: moves a conversation into a custom section (`CUSTOM_SECTION` with the section id).
+message ApplyGroupLabelRequest {
+	optional RequestHeader request_header = 100;
+	optional GroupLabelId group_label_id = 1;
+	optional GroupId group_id = 2;
+}
+
+message ApplyGroupLabelResponse {
+}
+
+// Captured from the web client: takes a conversation out of the custom section it is in.
+message RemoveGroupLabelRequest {
+	optional RequestHeader request_header = 100;
+	optional GroupLabelId group_label_id = 1;
+	optional GroupId group_id = 2;
+}
+
+message RemoveGroupLabelResponse {
 }
 
 message SetPresenceSharedRequest {

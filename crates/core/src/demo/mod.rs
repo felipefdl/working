@@ -16,8 +16,8 @@ use tokio::time::Instant;
 use crate::engine::{FetchReply, Fetcher};
 use crate::model::{
   Attachment, AttachmentKind, CardAction, Chip, ChipKind, Command, Connection, DndFor, DndSchedule, DndSchedules,
-  Event, Group, GroupId, GroupKind, McpConfig, McpStatus, Message, Micros, MyStatus, PersonStatus, Quote, Reaction,
-  ReadReceipt, SearchHit, Shortcut, Snippet, User,
+  Event, Group, GroupId, GroupKind, McpConfig, McpStatus, Message, Micros, MyStatus, Notify, PersonStatus, Placement,
+  Quote, Reaction, ReadReceipt, SearchHit, Shortcut, Snippet, User,
 };
 use data::{APPROVE, BUILD_BOT, CANCEL, ME, World};
 
@@ -268,22 +268,20 @@ impl Demo {
         draft.attachments = files.iter().map(|path| local_attachment(path)).collect();
         self.send(draft, &chips);
       },
-      Command::StartMeet(group) => {
-        let code = format!("dem-{:04}-mtg", self.next_serial());
-        let mut draft = self.draft(&group, None, "", None);
-        draft.attachments = vec![data::meet(&code)];
-        self.send(draft, &[]);
-      },
-      Command::CreateMeeting => {
-        let link = format!("https://meet.google.com/demo-meet-{}", self.next_serial());
-        self.emit(Event::MeetingCreated(Ok(link)));
-      },
+      Command::StartMeet(group) => self.start_meet(&group),
+      Command::CreateMeeting => self.create_meeting(),
       Command::Edit { group, message_id, text } => self.edit(&group, &message_id, &text),
       Command::Delete { group, message_id } => self.delete(&group, &message_id),
-      Command::MarkRead(group) => self.update_group(&group, |group| {
-        group.unread = false;
-        group.last_read_time = now_micros();
-      }),
+      Command::MarkRead(group) => self.mark_read(&group),
+      Command::MarkUnread(group) => self.mark_unread(&group),
+      Command::SetPinned { group, pinned } => self.set_pinned(&group, pinned),
+      Command::SetMuted { group, muted } => self.set_muted(&group, muted),
+      Command::SetHidden { group, hidden } => self.update_group(&group, |group| group.hidden = hidden),
+      Command::SetBlocked { group, blocked } => self.set_blocked(&group, blocked),
+      Command::Leave(group) => self.leave(&group),
+      Command::DeleteConversation(group) => self.delete_conversation(&group),
+      Command::SetNotify { group, notify } => self.set_notify(&group, notify),
+      Command::MoveToSection { group, section } => self.move_to_section(&group, section),
       Command::ClickCard { group, message_id, card_id, action, .. } => {
         self.click_card(&group, &message_id, &card_id, &action);
       },
@@ -476,6 +474,8 @@ impl Demo {
   fn upsert(&mut self, message: &Arc<Message>, local_id: Option<&str>) {
     let group = message.group.clone();
     let open = self.open.as_ref() == Some(&group);
+    // A hidden or blocked conversation does not notify, as in the engine.
+    let quiet = self.groups.get(&group).is_some_and(|group| group.hidden || group.blocked);
     let window = self.windows.get(&group).copied();
     let list = self.histories.entry(group.clone()).or_default();
     let found = list
@@ -503,7 +503,7 @@ impl Demo {
       }
     }
     if shown {
-      let incoming = is_new && !message.pending && message.sender_id != ME;
+      let incoming = is_new && !message.pending && message.sender_id != ME && !quiet;
       self.emit(Event::MessageUpsert {
         message: message.clone(),
         replaces,
@@ -520,6 +520,8 @@ impl Demo {
           text,
           time: message.time,
         });
+        // A new message brings a hidden conversation back.
+        group.hidden = false;
         if message.sender_id == ME {
           group.unread = false;
         } else if !open {
@@ -535,10 +537,122 @@ impl Demo {
     };
     let before = group.clone();
     change(group);
+    // A hidden or blocked conversation never counts as unread, as in the engine.
+    if group.hidden || group.blocked {
+      group.unread = false;
+    }
     if *group != before {
       let group = group.clone();
       self.emit(Event::GroupUpsert(group));
     }
+  }
+
+  fn mark_read(&mut self, group: &GroupId) {
+    self.update_group(group, |group| {
+      group.unread = false;
+      group.last_read_time = now_micros();
+    });
+  }
+
+  fn mark_unread(&mut self, group: &GroupId) {
+    self.update_group(group, |group| group.unread = true);
+  }
+
+  fn set_pinned(&mut self, group: &GroupId, pinned: bool) {
+    self.update_group(group, |group| group.pinned = pinned);
+  }
+
+  /// Mutes or unmutes a conversation; its notifications follow, as the server sets them.
+  fn set_muted(&mut self, group: &GroupId, muted: bool) {
+    self.update_group(group, |group| {
+      group.muted = muted;
+      group.notify = if muted { Notify::Off } else { Notify::All };
+    });
+  }
+
+  /// Sets what a conversation notifies about; a muted one stays off, as the engine shows it.
+  fn set_notify(&mut self, group: &GroupId, notify: Notify) {
+    self.update_group(group, |group| group.notify = if group.muted { Notify::Off } else { notify });
+  }
+
+  /// Posts a new meeting's link in the conversation, as the call button does.
+  fn start_meet(&mut self, group: &GroupId) {
+    let code = format!("dem-{:04}-mtg", self.next_serial());
+    let mut draft = self.draft(group, None, "", None);
+    draft.attachments = vec![data::meet(&code)];
+    self.send(draft, &[]);
+  }
+
+  fn create_meeting(&mut self) {
+    let link = format!("https://meet.google.com/demo-meet-{}", self.next_serial());
+    self.emit(Event::MeetingCreated(Ok(link)));
+  }
+
+  /// Blocks or unblocks the other person of a DM, which stays listed and marked; blocking a space leaves it.
+  fn set_blocked(&mut self, group: &GroupId, blocked: bool) {
+    let Some(kind) = self.groups.get(group).map(|held| held.kind) else {
+      return;
+    };
+    match kind {
+      GroupKind::Dm => self.update_group(group, |group| group.blocked = blocked),
+      GroupKind::Space if blocked => self.remove_group(group),
+      GroupKind::Space => self.emit(Event::Error("A space cannot be unblocked here.".into())),
+      GroupKind::GroupDm | GroupKind::App => {
+        self.emit(Event::Error("Only a person or a space can be blocked.".into()));
+      },
+    }
+  }
+
+  fn leave(&mut self, group: &GroupId) {
+    match self.groups.get(group).map(|held| held.kind) {
+      Some(GroupKind::Space | GroupKind::GroupDm) => self.remove_group(group),
+      Some(GroupKind::Dm | GroupKind::App) => {
+        self.emit(Event::Error("Only a space or a group conversation can be left.".into()));
+      },
+      None => {},
+    }
+  }
+
+  fn delete_conversation(&mut self, group: &GroupId) {
+    match self.groups.get(group).map(|held| held.kind) {
+      Some(GroupKind::Space) => self.remove_group(group),
+      Some(_) => self.emit(Event::Error("Only a space can be deleted.".into())),
+      None => {},
+    }
+  }
+
+  /// Takes a conversation the user is no longer in off the list and publishes the list without it.
+  fn remove_group(&mut self, group: &GroupId) {
+    if self.groups.remove(group).is_some() {
+      self.histories.remove(group);
+      self.members.remove(group);
+      self.read.remove(group);
+      if self.open.as_ref() == Some(group) {
+        self.open = None;
+      }
+      self.emit(Event::World(Arc::new(self.groups.values().cloned().collect())));
+    }
+  }
+
+  /// Moves a conversation to one of the user's sections, named as the list names it, or back to the section of its
+  /// kind. A meeting chat is never moved back, as in the engine.
+  fn move_to_section(&mut self, group: &GroupId, section: Option<String>) {
+    let meeting = self
+      .groups
+      .get(group)
+      .is_some_and(|held| matches!(held.placement, Placement::Meeting));
+    if meeting && section.is_none() {
+      return;
+    }
+    let placement = section.map_or(Placement::ByKind, |id| {
+      let name = data::SECTIONS
+        .iter()
+        .find(|(known, _)| *known == id)
+        .map_or("Section", |(_, name)| *name)
+        .to_string();
+      Placement::Custom { id, name }
+    });
+    self.update_group(group, |group| group.placement = placement);
   }
 
   fn held(&self, group: &GroupId, message_id: &str) -> Option<Arc<Message>> {
@@ -875,9 +989,12 @@ impl Demo {
       unread: false,
       pinned: false,
       muted: false,
-      notify: crate::model::Notify::All,
+      notify: Notify::All,
       snippet: None,
-      placement: crate::model::Placement::ByKind,
+      placement: Placement::ByKind,
+      hidden: false,
+      blocked: false,
+      can_delete: false,
     };
     self.groups.insert(id.clone(), group.clone());
     self.members.insert(id.clone(), ids);

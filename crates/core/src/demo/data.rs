@@ -23,6 +23,8 @@ pub const BUILD_BOT: &str = "demo-build-bot";
 pub const APPROVE: &str = "demo.approve";
 /// Card button method that cancels a deploy.
 pub const CANCEL: &str = "demo.cancel";
+/// The user's own sidebar sections, by id: the section a conversation can be moved into.
+pub const SECTIONS: &[(&str, &str)] = &[("demo-social", "Social")];
 
 /// The workspace the demo serves.
 pub struct World {
@@ -403,6 +405,9 @@ impl Builder {
       notify: Notify::All,
       snippet: None,
       placement: Placement::ByKind,
+      hidden: false,
+      blocked: false,
+      can_delete: false,
     }
   }
 
@@ -686,6 +691,8 @@ fn release_train(b: &mut Builder) {
 fn coffee(b: &mut Builder) {
   let (mei, noah) = (b.user("demo-mei"), b.user("demo-noah"));
   let (mut group, mut chat) = b.space("demo-coffee", "Coffee chat", "☕");
+  // The user made this space, so it can be deleted.
+  group.can_delete = true;
   group.placement = Placement::Custom {
     id: "demo-social".into(),
     name: "Social".into(),

@@ -9,7 +9,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::store::{Conv, Store};
+use crate::store::{Conv, Store, listed};
 use crate::theme::{BORDER, MUTED, POPOVER, ROW_HOVER, ROW_SELECTED, TEXT, rgb};
 use crate::ui::group_avatar;
 
@@ -56,7 +56,7 @@ impl Switcher {
     let mut results: Vec<Arc<Conv>> = Vec::new();
     if query.is_empty() {
       for id in &store.recent {
-        if let Some(conv) = store.group(id) {
+        if let Some(conv) = store.group(id).filter(|conv| listed(&conv.g)) {
           results.push(conv.clone());
         }
       }
@@ -69,8 +69,9 @@ impl Switcher {
         }
       }
     } else {
-      // `all` is by recency, so equally good matches come most recent first.
-      let ranked = Fuzzy::new(&query).rank(store.all.iter(), |conv| conv.g.name.as_str());
+      // `every` is by recency, so equally good matches come most recent first. Hidden and blocked conversations are
+      // found too, so they can be opened again.
+      let ranked = Fuzzy::new(&query).rank(store.every.iter(), |conv| conv.g.name.as_str());
       results.extend(ranked.into_iter().map(|(_, conv)| conv.clone()));
     }
     results.truncate(MAX_RESULTS);

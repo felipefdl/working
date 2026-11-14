@@ -56,6 +56,10 @@ pub struct Snippet {
 
 /// One conversation the signed-in user can open.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[expect(
+  clippy::struct_excessive_bools,
+  reason = "each flag is one fact Google Chat reports about the conversation"
+)]
 pub struct Group {
   /// Stable identity.
   pub id: GroupId,
@@ -90,6 +94,15 @@ pub struct Group {
   /// Where the web app's sidebar lists this conversation.
   #[serde(default)]
   pub placement: Placement,
+  /// Hidden from the lists ("Hide conversation"). It never counts as unread and never notifies.
+  #[serde(default)]
+  pub hidden: bool,
+  /// Blocked: the other person of a DM. It never counts as unread and never notifies.
+  #[serde(default)]
+  pub blocked: bool,
+  /// The signed-in user owns this space and can delete it.
+  #[serde(default)]
+  pub can_delete: bool,
 }
 
 /// A conversation's notification setting in Google Chat.
@@ -1019,6 +1032,55 @@ pub enum Command {
   CreateMeeting,
   /// Mark this conversation read.
   MarkRead(GroupId),
+  /// Marks a conversation unread from its newest message.
+  MarkUnread(GroupId),
+  /// Pins or unpins a conversation.
+  SetPinned {
+    /// Conversation.
+    group: GroupId,
+    /// True to pin, false to unpin.
+    pinned: bool,
+  },
+  /// Mutes or unmutes a conversation's notifications.
+  SetMuted {
+    /// Conversation.
+    group: GroupId,
+    /// True to mute, false to unmute.
+    muted: bool,
+  },
+  /// Hides a conversation from the lists, or brings it back.
+  SetHidden {
+    /// Conversation.
+    group: GroupId,
+    /// True to hide, false to show it again.
+    hidden: bool,
+  },
+  /// Blocks or unblocks a conversation: the other person of a DM, or a space (blocking a space also leaves it).
+  SetBlocked {
+    /// Conversation.
+    group: GroupId,
+    /// True to block, false to unblock.
+    blocked: bool,
+  },
+  /// Leaves a space or group DM.
+  Leave(GroupId),
+  /// Deletes a space for every member.
+  DeleteConversation(GroupId),
+  /// Sets what the conversation notifies about.
+  SetNotify {
+    /// Conversation.
+    group: GroupId,
+    /// The new level.
+    notify: Notify,
+  },
+  /// Moves a conversation to a custom section (its id, as in `Placement::Custom`), or with `None` back to the
+  /// section of its kind.
+  MoveToSection {
+    /// Conversation.
+    group: GroupId,
+    /// Section id, or `None` for the section of its kind.
+    section: Option<String>,
+  },
   /// Press a card button that calls its app back. The app answers by updating the message or posting a new one.
   ClickCard {
     /// Conversation.

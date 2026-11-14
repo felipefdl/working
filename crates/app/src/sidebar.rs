@@ -12,6 +12,7 @@ use gchat_core::Shortcut;
 
 use crate::calendar::OpenCalendar;
 use crate::conv_list::{calendar_tip, meet_tip};
+use crate::home::conversation_menu;
 use crate::meet::OpenMeet;
 use crate::menu;
 use crate::new_chat::OpenNewChat;
@@ -186,6 +187,7 @@ impl Sidebar {
         SidebarItem::Conv(conv) => {
           let selected = selected_group.as_ref() == Some(&conv.g.id);
           let id = conv.g.id.clone();
+          let right_click = conversation_menu(&self.store, conv.g.id.clone());
           let store_handle = self.store.clone();
           row
             .child(
@@ -194,6 +196,7 @@ impl Sidebar {
                   let id = id.clone();
                   store_handle.update(cx, |s, cx| s.open(id, window, cx));
                 })
+                .on_mouse_down(MouseButton::Right, right_click)
                 .child(group_avatar(&store.images, cx, &conv.g, 20.))
                 .child(div().flex_1().min_w_0().child(label(&conv.g.name, conv.g.unread).truncate()))
                 .when(conv.g.pinned, |d| d.child(icon(Icon::Pin, 12., MUTED)))

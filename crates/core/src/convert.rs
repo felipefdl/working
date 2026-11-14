@@ -86,16 +86,18 @@ pub fn member_ids(item: &proto::WorldItemLite) -> Vec<String> {
   dm.chain(named).filter_map(|id| id.id.clone()).collect()
 }
 
-/// Whether the conversation belongs in the list at all (joined, not hidden, not blocked).
-pub fn is_listed(item: &proto::WorldItemLite) -> bool {
-  let Some(state) = &item.read_state else {
-    return true;
-  };
-  let joined = state
-    .membership_state
-    .is_none_or(|value| value == proto::MembershipState::MemberJoined as i32);
-  joined && !state.blocked.unwrap_or(false) && state.hide_timestamp.unwrap_or(0) == 0
+/// Whether the signed-in user is still in the conversation. Hidden and blocked ones are; a space left, deleted, or
+/// blocked (which leaves it) is not.
+pub fn is_member(item: &proto::WorldItemLite) -> bool {
+  item
+    .read_state
+    .as_ref()
+    .and_then(|state| state.membership_state)
+    .is_none_or(|value| value == proto::MembershipState::MemberJoined as i32)
 }
+
+/// The custom section label key of the Meetings section.
+const MEETING_SECTION: &str = "predefined_meeting_chat";
 
 pub fn group(
   item: &proto::WorldItemLite,
@@ -175,6 +177,8 @@ pub fn group(
   let last_read_time = state.and_then(|state| state.last_read_time).unwrap_or(0);
   let sort_time = item.sort_timestamp.unwrap_or(0);
   let snippet = item.message.as_ref().and_then(|message| snippet(message, users));
+  let hidden = state.and_then(|state| state.hide_timestamp).unwrap_or(0) != 0;
+  let blocked = state.and_then(|state| state.blocked).unwrap_or(false);
   let marked_unread = state.and_then(|state| state.mark_as_unread_timestamp_usec).unwrap_or(0) > 0;
   let counted_unread = state.and_then(|state| state.unread_message_count).unwrap_or(0) > 0;
   let newer = match &snippet {
@@ -182,28 +186,17 @@ pub fn group(
     None => sort_time > last_read_time,
   };
   let settings = state.and_then(|state| state.notification_settings.as_ref());
-  let muted = settings.and_then(|settings| settings.state)
-    == Some(proto::group_notification_settings::GroupNotificationState::Muted as i32);
-  let notify = {
-    use proto::group_notification_settings::RoomNotificationState as Room;
-    match settings
-      .and_then(|settings| settings.room_state)
-      .and_then(|value| Room::try_from(value).ok())
-    {
-      _ if muted => Notify::Off,
-      Some(Room::NotifyLessWithNewThreads) => Notify::MainConversations,
-      Some(Room::NotifyLess) => Notify::Mentions,
-      Some(Room::NotifyNever) => Notify::Off,
-      Some(Room::NotifyAlways) | None => Notify::All,
-    }
-  };
+  let muted = settings.is_some_and(|settings| {
+    settings.state == Some(proto::group_notification_settings::GroupNotificationState::Muted as i32)
+      || settings.mute.as_ref().and_then(|mute| mute.state) == Some(proto::group_mute_setting::MuteState::Muted as i32)
+  });
   let placement = state
     .into_iter()
     .flat_map(|state| &state.group_label_id)
     .filter(|label| label.group_label_type == Some(proto::group_label_id::GroupLabelType::CustomSection as i32))
     .filter_map(|label| label.label_secondary_key.as_deref())
     .map(|key| match key {
-      "predefined_meeting_chat" => Placement::Meeting,
+      MEETING_SECTION => Placement::Meeting,
       id => Placement::Custom {
         id: id.to_string(),
         name: sections.get(id).cloned().unwrap_or_else(|| "Section".into()),
@@ -221,13 +214,43 @@ pub fn group(
     member_avatars,
     sort_time,
     last_read_time,
-    unread: marked_unread || counted_unread || newer,
+    // A hidden or blocked conversation never counts as unread.
+    unread: !hidden && !blocked && (marked_unread || counted_unread || newer),
     pinned: state.and_then(|state| state.starred).unwrap_or(false),
     muted,
-    notify,
+    notify: notify(muted, settings.and_then(|settings| settings.room_state)),
     snippet,
     placement,
+    hidden,
+    blocked,
+    can_delete: kind == GroupKind::Space
+      && state.and_then(|state| state.membership_role) == Some(proto::MembershipRole::RoleOwner as i32),
   })
+}
+
+/// What Google Chat notifies about in a conversation, from its mute state and its raw room notification state:
+/// 0 or 4 every message, 1 or 5 main conversations, 2 mentions, 3 nothing. The web client writes 4 and 5 now, which
+/// the proto enum does not name.
+pub const fn notify(muted: bool, room_state: Option<i32>) -> Notify {
+  if muted {
+    return Notify::Off;
+  }
+  match room_state {
+    Some(1 | 5) => Notify::MainConversations,
+    Some(2) => Notify::Mentions,
+    Some(3) => Notify::Off,
+    _ => Notify::All,
+  }
+}
+
+/// The raw room notification state the web client writes for a level (see `notify`).
+pub const fn room_state(notify: Notify) -> i32 {
+  match notify {
+    Notify::All => 4,
+    Notify::MainConversations => 5,
+    Notify::Mentions => 2,
+    Notify::Off => 3,
+  }
 }
 
 /// Names of the user's own sidebar sections, read from the data embedded in the web app's page. Each section
@@ -916,13 +939,82 @@ pub fn emoji_text(emoji: &proto::Emoji) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+  use std::collections::HashMap;
+
   use super::{
-    Users, absolute, annotations, emoji_text, format_annotations, group_id, merge_receipts, pending_spans,
-    proto_group_id, read_receipts, strip_tags, user, with_links,
+    Users, absolute, annotations, emoji_text, format_annotations, group, group_id, is_member, merge_receipts, notify,
+    pending_spans, proto_group_id, read_receipts, room_state, strip_tags, user, with_links,
   };
   use crate::markup::parse;
-  use crate::model::{Chip, ChipKind, GroupId, ReadReceipt, Span, SpanKind, User};
+  use crate::model::{Chip, ChipKind, GroupId, Notify, ReadReceipt, Span, SpanKind, User};
   use crate::proto;
+
+  #[test]
+  fn notify_reads_the_levels_the_web_client_writes() {
+    assert_eq!(notify(false, Some(4)), Notify::All);
+    assert_eq!(notify(false, Some(5)), Notify::MainConversations);
+    assert_eq!(notify(false, Some(0)), Notify::All);
+    assert_eq!(notify(false, Some(1)), Notify::MainConversations);
+    assert_eq!(notify(false, Some(2)), Notify::Mentions);
+    assert_eq!(notify(false, Some(3)), Notify::Off);
+    assert_eq!(notify(false, None), Notify::All);
+    assert_eq!(notify(true, Some(4)), Notify::Off);
+    for level in [Notify::All, Notify::MainConversations, Notify::Mentions, Notify::Off] {
+      assert_eq!(notify(false, Some(room_state(level))), level);
+    }
+  }
+
+  fn space_item(state: proto::GroupReadState) -> proto::WorldItemLite {
+    proto::WorldItemLite {
+      group_id: Some(proto_group_id(&GroupId::Space("AAAA1".into()))),
+      room_name: Some("Design reviews".into()),
+      read_state: Some(state),
+      ..Default::default()
+    }
+  }
+
+  #[test]
+  fn hidden_and_blocked_conversations_stay_but_never_count_as_unread() {
+    let users = Users::default();
+    let sections = HashMap::new();
+    let hidden = space_item(proto::GroupReadState {
+      hide_timestamp: Some(10),
+      unread_message_count: Some(3),
+      ..Default::default()
+    });
+    let shown = group(&hidden, "me", &users, &sections).expect("listed");
+    assert!(is_member(&hidden));
+    assert!(shown.hidden && !shown.blocked && !shown.unread);
+
+    let blocked = space_item(proto::GroupReadState {
+      blocked: Some(true),
+      unread_message_count: Some(3),
+      ..Default::default()
+    });
+    let shown = group(&blocked, "me", &users, &sections).expect("listed");
+    assert!(shown.blocked && !shown.hidden && !shown.unread);
+
+    let left = space_item(proto::GroupReadState {
+      membership_state: Some(proto::MembershipState::MemberNotAMember as i32),
+      ..Default::default()
+    });
+    assert!(!is_member(&left));
+  }
+
+  #[test]
+  fn only_the_owner_of_a_space_can_delete_it() {
+    let users = Users::default();
+    let sections = HashMap::new();
+    let role = |role: proto::MembershipRole| {
+      let item = space_item(proto::GroupReadState {
+        membership_role: Some(role as i32),
+        ..Default::default()
+      });
+      group(&item, "me", &users, &sections).expect("listed").can_delete
+    };
+    assert!(role(proto::MembershipRole::RoleOwner));
+    assert!(!role(proto::MembershipRole::RoleMember));
+  }
 
   #[test]
   fn group_id_round_trips() {

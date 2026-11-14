@@ -635,3 +635,75 @@ fn a_write_to_a_gone_event_says_so() {
   });
   assert!(matches!(drain(&events).first(), Some(Event::CalendarWritten(Err(_)))));
 }
+
+#[test]
+fn conversation_actions_change_the_list() {
+  let (mut demo, events) = demo();
+  let group = release();
+  demo.handle(Command::SetPinned { group: group.clone(), pinned: true });
+  demo.handle(Command::SetMuted { group: group.clone(), muted: true });
+  demo.handle(Command::MarkUnread(group.clone()));
+  let held = demo.groups.get(&group).unwrap();
+  assert!(held.pinned && held.muted && held.unread);
+  assert!(drain(&events).iter().any(|event| matches!(
+    event,
+    Event::GroupUpsert(listed) if listed.id == group && listed.pinned && listed.muted && listed.unread
+  )));
+  demo.handle(Command::MarkRead(group.clone()));
+  assert!(!demo.groups.get(&group).unwrap().unread);
+  drain(&events);
+  demo.handle(Command::MarkUnread(group.clone()));
+  demo.handle(Command::SetHidden { group: group.clone(), hidden: true });
+  let held = demo.groups.get(&group).expect("a hidden conversation stays in the world");
+  assert!(held.hidden && !held.unread);
+  assert!(drain(&events).iter().any(|event| matches!(
+    event,
+    Event::GroupUpsert(listed) if listed.id == group && listed.hidden && !listed.unread
+  )));
+  demo.handle(Command::SetHidden { group: group.clone(), hidden: false });
+  assert!(!demo.groups.get(&group).unwrap().hidden);
+  demo.handle(Command::SetHidden { group: group.clone(), hidden: true });
+  drain(&events);
+  demo.handle(Command::Send {
+    group: group.clone(),
+    topic_id: None,
+    text: "Back again".into(),
+    quote: None,
+    files: Vec::new(),
+    chips: Vec::new(),
+  });
+  assert!(!demo.groups.get(&group).unwrap().hidden);
+  assert!(
+    drain(&events)
+      .iter()
+      .any(|event| matches!(event, Event::GroupUpsert(listed) if listed.id == group && !listed.hidden))
+  );
+}
+
+#[test]
+fn leaving_or_deleting_takes_the_conversation_out_of_the_world() {
+  let (mut demo, events) = demo();
+  let trio = GroupId::Dm("demo-trio".into());
+  demo.handle(Command::Leave(trio.clone()));
+  assert!(!demo.groups.contains_key(&trio));
+  assert!(
+    drain(&events)
+      .iter()
+      .any(|event| matches!(event, Event::World(groups) if groups.iter().all(|listed| listed.id != trio)))
+  );
+  let coffee = GroupId::Space("demo-coffee".into());
+  assert!(demo.groups.get(&coffee).unwrap().can_delete);
+  demo.handle(Command::DeleteConversation(coffee.clone()));
+  assert!(!demo.groups.contains_key(&coffee));
+  // A one-to-one chat cannot be left: it stays, and the answer says why.
+  let dm = demo
+    .groups
+    .values()
+    .find(|group| group.kind == crate::model::GroupKind::Dm)
+    .map(|group| group.id.clone())
+    .unwrap();
+  drain(&events);
+  demo.handle(Command::Leave(dm.clone()));
+  assert!(demo.groups.contains_key(&dm));
+  assert!(drain(&events).iter().any(|event| matches!(event, Event::Error(_))));
+}

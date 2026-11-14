@@ -440,7 +440,7 @@ impl Engine {
       ..Default::default()
     };
     let response: proto::PaginatedWorldResponse = self.http.api("paginated_world", &request).await?;
-    let items: Vec<proto::WorldItemLite> = response.world_items.into_iter().filter(convert::is_listed).collect();
+    let items: Vec<proto::WorldItemLite> = response.world_items.into_iter().filter(convert::is_member).collect();
 
     let mut needed: HashSet<String> = HashSet::from([me_id.clone()]);
     for item in &items {
@@ -603,7 +603,12 @@ impl Engine {
   async fn prefetch_histories(self: &Arc<Self>) {
     let mut recent: Vec<(Micros, GroupId)> = {
       let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-      state.groups.values().map(|group| (group.sort_time, group.id.clone())).collect()
+      state
+        .groups
+        .values()
+        .filter(|group| !group.hidden && !group.blocked)
+        .map(|group| (group.sort_time, group.id.clone()))
+        .collect()
     };
     recent.sort_unstable_by(|a, b| b.0.cmp(&a.0));
     let slots = Arc::new(Semaphore::new(3));
@@ -1378,7 +1383,19 @@ impl Engine {
         if !changed {
           return;
         }
+        // A mark set with "Mark as unread" stays until it is cleared on its own.
+        let marked = self.marked_unread(&group);
+        if marked > 0 {
+          self.set_marked_unread(&group, 0);
+        }
         tokio::spawn(async move {
+          if marked > 0 {
+            let cleared = engine.set_mark_as_unread(&group, 0).await;
+            if cleared.is_err() {
+              engine.set_marked_unread(&group, marked);
+            }
+            engine.report(cleared);
+          }
           let request = proto::MarkGroupReadstateRequest {
             request_header: Some(request_header()),
             id: Some(convert::proto_group_id(&group)),
@@ -1391,6 +1408,82 @@ impl Engine {
           engine.report(result.map(|_| ()));
         });
       },
+      Command::MarkUnread(group) => {
+        if self.readonly {
+          return self.emit(Event::Error("Read-only mode: the conversation was not marked unread.".into()));
+        }
+        let Some(before) = self.group(&group) else {
+          return;
+        };
+        let time = before.snippet.as_ref().map_or(before.sort_time, |snippet| snippet.time);
+        let marked = self.marked_unread(&group);
+        self.set_marked_unread(&group, time);
+        self.update_group(&group, |group| group.unread = true);
+        tokio::spawn(async move {
+          let result = engine.set_mark_as_unread(&group, time).await;
+          if result.is_err() {
+            engine.set_marked_unread(&group, marked);
+            engine.update_group(&group, |group| group.unread = before.unread);
+          }
+          engine.report_change(result, "The conversation was not marked unread.");
+        });
+      },
+      Command::SetPinned { group, pinned } => {
+        if self.readonly {
+          return self.emit(Event::Error("Read-only mode: the pin was not changed.".into()));
+        }
+        let Some(before) = self.group(&group) else {
+          return;
+        };
+        self.update_group(&group, |group| group.pinned = pinned);
+        tokio::spawn(async move {
+          let arguments = serde_json::json!([page_group_id(&group), i32::from(pinned)]);
+          let result = engine.http.page_rpc("XZhsdc", &arguments).await.map(|_| ());
+          if result.is_err() {
+            engine.update_group(&group, |group| group.pinned = before.pinned);
+          }
+          let failure = if pinned {
+            "The conversation was not pinned."
+          } else {
+            "The conversation was not unpinned."
+          };
+          engine.report_change(result, failure);
+        });
+      },
+      Command::SetMuted { group, muted } => {
+        if self.readonly {
+          return self.emit(Event::Error("Read-only mode: notifications were not changed.".into()));
+        }
+        let Some(before) = self.group(&group) else {
+          return;
+        };
+        let room_state = self.room_state(&group);
+        self.update_group(&group, |group| {
+          group.muted = muted;
+          group.notify = convert::notify(muted, room_state);
+        });
+        tokio::spawn(async move {
+          let result = engine.update_notifications(&group, room_state, muted).await;
+          if result.is_err() {
+            engine.update_group(&group, |group| {
+              group.muted = before.muted;
+              group.notify = before.notify;
+            });
+          }
+          let failure = if muted {
+            "The conversation was not muted."
+          } else {
+            "The conversation was not unmuted."
+          };
+          engine.report_change(result, failure);
+        });
+      },
+      Command::SetHidden { group, hidden } => self.set_hidden(group, hidden),
+      Command::SetBlocked { group, blocked } => self.set_blocked(group, blocked),
+      Command::Leave(group) => self.leave(group),
+      Command::DeleteConversation(group) => self.delete_conversation(group),
+      Command::SetNotify { group, notify } => self.set_notify(group, notify),
+      Command::MoveToSection { group, section } => self.move_to_section(group, section),
       Command::ClickCard {
         group,
         topic_id,
@@ -1543,11 +1636,359 @@ impl Engine {
     };
     let before = group.clone();
     change(group);
+    // A hidden or blocked conversation never counts as unread.
+    if group.hidden || group.blocked {
+      group.unread = false;
+    }
     if *group == before {
       return false;
     }
     self.emit(Event::GroupUpsert(group.clone()));
     true
+  }
+
+  /// A conversation as held now.
+  fn group(&self, id: &GroupId) -> Option<Group> {
+    let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.groups.get(id).cloned()
+  }
+
+  /// When "Mark as unread" marked this conversation, as the server last listed it; 0 when it is not marked.
+  fn marked_unread(&self, id: &GroupId) -> Micros {
+    let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    state
+      .items
+      .get(id)
+      .and_then(|item| item.read_state.as_ref())
+      .and_then(|read| read.mark_as_unread_timestamp_usec)
+      .unwrap_or(0)
+  }
+
+  /// Keeps the held list item's unread mark in step with a change made here or reported by the stream.
+  fn set_marked_unread(&self, id: &GroupId, time: Micros) {
+    let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(item) = state.items.get_mut(id) {
+      item.read_state.get_or_insert_default().mark_as_unread_timestamp_usec = Some(time);
+    }
+  }
+
+  /// The raw room notification state the server last listed for a conversation, echoed back when muting.
+  fn room_state(&self, id: &GroupId) -> Option<i32> {
+    let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    state
+      .items
+      .get(id)?
+      .read_state
+      .as_ref()?
+      .notification_settings
+      .as_ref()?
+      .room_state
+  }
+
+  /// Keeps the held list item's room notification state in step with a change made here.
+  fn set_room_state(&self, id: &GroupId, room_state: Option<i32>) {
+    let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(item) = state.items.get_mut(id) {
+      item
+        .read_state
+        .get_or_insert_default()
+        .notification_settings
+        .get_or_insert_default()
+        .room_state = room_state;
+    }
+  }
+
+  /// Takes a conversation the user is no longer in off the list, publishes the list without it, and saves it.
+  fn remove_group(&self, id: &GroupId) {
+    {
+      let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      if state.groups.remove(id).is_none() {
+        return;
+      }
+      state.items.remove(id);
+      self.emit(Event::World(Arc::new(state.groups.values().cloned().collect())));
+    }
+    self.save_world();
+  }
+
+  /// `update_group_notification_settings`: the raw room state (left out when `None`) and the mute state.
+  async fn update_notifications(&self, group: &GroupId, room_state: Option<i32>, muted: bool) -> Result<()> {
+    use proto::group_mute_setting::MuteState;
+    let mute = if muted {
+      MuteState::Muted
+    } else {
+      MuteState::Unmuted
+    };
+    let request = proto::UpdateGroupNotificationSettingsRequest {
+      request_header: Some(request_header()),
+      group_id: Some(convert::proto_group_id(group)),
+      settings: Some(proto::GroupNotificationSettings {
+        state: None,
+        room_state,
+        mute: Some(proto::GroupMuteSetting { state: Some(mute as i32) }),
+      }),
+    };
+    self
+      .http
+      .api::<_, proto::UpdateGroupNotificationSettingsResponse>("update_group_notification_settings", &request)
+      .await
+      .map(|_| ())
+  }
+
+  /// `set_mark_as_unread_timestamp`: marks the conversation unread from `time`, or clears the mark with 0.
+  async fn set_mark_as_unread(&self, group: &GroupId, time: Micros) -> Result<()> {
+    let request = proto::SetMarkAsUnreadTimestampRequest {
+      request_header: Some(request_header()),
+      group_id: Some(convert::proto_group_id(group)),
+      mark_as_unread_timestamp_usec: Some(time),
+    };
+    self
+      .http
+      .api::<_, proto::SetMarkAsUnreadTimestampResponse>("set_mark_as_unread_timestamp", &request)
+      .await
+      .map(|_| ())
+  }
+
+  /// Reports a failed conversation change with `failure`, short enough to show; the cause goes to the log.
+  fn report_change(&self, result: Result<()>, failure: &str) {
+    let Err(error) = result else { return };
+    match error.downcast_ref::<SignedOut>() {
+      Some(signed_out) => self.emit(Event::SignedOut(signed_out.0.clone())),
+      None => {
+        tracing::warn!("{failure} {error:#}");
+        self.emit(Event::Error(failure.to_string()));
+      },
+    }
+  }
+
+  /// `Command::SetHidden`: page RPC `n7ICcf` with 1 to hide, 0 to bring the conversation back.
+  fn set_hidden(self: &Arc<Self>, group: GroupId, hidden: bool) {
+    if self.readonly {
+      let what = if hidden { "hidden" } else { "unhidden" };
+      return self.emit(Event::Error(format!("Read-only mode: the conversation was not {what}.")));
+    }
+    let Some(before) = self.group(&group) else {
+      return;
+    };
+    self.update_group(&group, |group| group.hidden = hidden);
+    let engine = self.clone();
+    tokio::spawn(async move {
+      let arguments = serde_json::json!([page_group_id(&group), i32::from(hidden)]);
+      let result = engine.http.page_rpc("n7ICcf", &arguments).await.map(|_| ());
+      if result.is_err() {
+        engine.update_group(&group, |group| {
+          group.hidden = before.hidden;
+          group.unread = before.unread;
+        });
+      }
+      let failure = if hidden {
+        "The conversation was not hidden."
+      } else {
+        "The conversation was not unhidden."
+      };
+      engine.report_change(result, failure);
+    });
+  }
+
+  /// `Command::SetBlocked`: page RPC `BFhA9d`, naming the other person of a DM, or a space. Blocking a space also
+  /// leaves it, so it goes from the list once the server agrees; a blocked DM stays, marked.
+  fn set_blocked(self: &Arc<Self>, group: GroupId, blocked: bool) {
+    let failure = if blocked {
+      "The conversation was not blocked."
+    } else {
+      "The conversation was not unblocked."
+    };
+    if self.readonly {
+      return self.emit(Event::Error(format!("Read-only mode: {}", failure.to_lowercase())));
+    }
+    let Some(before) = self.group(&group) else {
+      return;
+    };
+    let arguments = match before.kind {
+      GroupKind::Space if blocked => block_arguments(&group, None, true),
+      GroupKind::Space => return self.emit(Event::Error("A space cannot be unblocked here.".into())),
+      GroupKind::Dm => {
+        let Some(user) = before.member_ids.first() else {
+          return self.emit(Event::Error(format!("{failure} The other person is not known.")));
+        };
+        block_arguments(&group, Some(user.as_str()), blocked)
+      },
+      GroupKind::GroupDm | GroupKind::App => {
+        return self.emit(Event::Error("Only a person or a space can be blocked.".into()));
+      },
+    };
+    let space = before.kind == GroupKind::Space;
+    if !space {
+      self.update_group(&group, |group| group.blocked = blocked);
+    }
+    let engine = self.clone();
+    tokio::spawn(async move {
+      let result = engine.http.page_rpc("BFhA9d", &arguments).await.map(|_| ());
+      match (&result, space) {
+        (Ok(()), true) => engine.remove_group(&group),
+        (Ok(()), false) => {},
+        (Err(_), _) => {
+          engine.update_group(&group, |group| {
+            group.blocked = before.blocked;
+            group.unread = before.unread;
+          });
+        },
+      }
+      engine.report_change(result, failure);
+    });
+  }
+
+  /// `Command::Leave`: `remove_memberships` naming the signed-in user. The conversation goes from the list once the
+  /// server agrees.
+  fn leave(self: &Arc<Self>, group: GroupId) {
+    if self.readonly {
+      return self.emit(Event::Error("Read-only mode: the conversation was not left.".into()));
+    }
+    let Some(held) = self.group(&group) else {
+      return;
+    };
+    if !matches!(held.kind, GroupKind::Space | GroupKind::GroupDm) {
+      return self.emit(Event::Error("Only a space or a group conversation can be left.".into()));
+    }
+    let me = self.me_id();
+    if me.is_empty() {
+      return self.emit(Event::Error(
+        "The conversation was not left. The signed-in user is not known yet.".into(),
+      ));
+    }
+    let engine = self.clone();
+    tokio::spawn(async move {
+      let request = proto::RemoveMembershipsRequest {
+        request_header: Some(request_header()),
+        member_ids: vec![proto::MemberId {
+          user_id: Some(proto::UserId { id: Some(me), ..Default::default() }),
+          ..Default::default()
+        }],
+        group_id: Some(convert::proto_group_id(&group)),
+        membership_state: None,
+      };
+      let result = engine
+        .http
+        .api::<_, proto::RemoveMembershipsResponse>("remove_memberships", &request)
+        .await
+        .map(|_| ());
+      if result.is_ok() {
+        engine.remove_group(&group);
+      }
+      engine.report_change(result, "The conversation was not left.");
+    });
+  }
+
+  /// `Command::DeleteConversation`: page RPC `U3Vwwb`, spaces only. The space goes from the list once the server
+  /// agrees.
+  fn delete_conversation(self: &Arc<Self>, group: GroupId) {
+    if self.readonly {
+      return self.emit(Event::Error("Read-only mode: the space was not deleted.".into()));
+    }
+    let Some(held) = self.group(&group) else {
+      return;
+    };
+    if held.kind != GroupKind::Space {
+      return self.emit(Event::Error("Only a space can be deleted.".into()));
+    }
+    let engine = self.clone();
+    tokio::spawn(async move {
+      let arguments = delete_arguments(&group);
+      let result = engine.http.page_rpc("U3Vwwb", &arguments).await.map(|_| ());
+      if result.is_ok() {
+        engine.remove_group(&group);
+      }
+      engine.report_change(result, "The space was not deleted.");
+    });
+  }
+
+  /// `Command::SetNotify`: `update_group_notification_settings` with the level's raw room state and the current
+  /// mute state, as the web client's dialog sends them.
+  fn set_notify(self: &Arc<Self>, group: GroupId, notify: Notify) {
+    if self.readonly {
+      return self.emit(Event::Error("Read-only mode: notifications were not changed.".into()));
+    }
+    let Some(before) = self.group(&group) else {
+      return;
+    };
+    let held_room_state = self.room_state(&group);
+    let room_state = convert::room_state(notify);
+    self.set_room_state(&group, Some(room_state));
+    self.update_group(&group, |group| group.notify = convert::notify(group.muted, Some(room_state)));
+    let engine = self.clone();
+    tokio::spawn(async move {
+      let result = engine.update_notifications(&group, Some(room_state), before.muted).await;
+      if result.is_err() {
+        engine.set_room_state(&group, held_room_state);
+        engine.update_group(&group, |group| group.notify = before.notify);
+      }
+      engine.report_change(result, "Notifications were not changed.");
+    });
+  }
+
+  /// `Command::MoveToSection`: `apply_group_label` for the new custom section, after `remove_group_label` for the
+  /// user's section the conversation is in; back to the section of its kind is the removal alone. The web client was
+  /// never seen removing the Meetings label, so a meeting chat only gains the new label and is never moved back.
+  fn move_to_section(self: &Arc<Self>, group: GroupId, section: Option<String>) {
+    if self.readonly {
+      return self.emit(Event::Error("Read-only mode: the conversation was not moved.".into()));
+    }
+    let Some(before) = self.group(&group) else {
+      return;
+    };
+    let current = match &before.placement {
+      Placement::Custom { id, .. } => Some(id.clone()),
+      Placement::ByKind | Placement::Meeting => None,
+    };
+    if current == section || (matches!(before.placement, Placement::Meeting) && section.is_none()) {
+      return;
+    }
+    let placement = section.as_ref().map_or(Placement::ByKind, |id| Placement::Custom {
+      id: id.clone(),
+      name: self.section_name(id),
+    });
+    self.update_group(&group, |group| group.placement = placement);
+    let engine = self.clone();
+    tokio::spawn(async move {
+      let result = engine.relabel(&group, current.as_deref(), section.as_deref()).await;
+      if result.is_err() {
+        engine.update_group(&group, |group| group.placement = before.placement);
+      }
+      engine.report_change(result, "The conversation was not moved.");
+    });
+  }
+
+  /// The title of one of the user's sections, as the list names it.
+  fn section_name(&self, id: &str) -> String {
+    let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.sections.get(id).cloned().unwrap_or_else(|| "Section".into())
+  }
+
+  /// Takes a conversation out of the custom section `from` and puts it in `to`.
+  async fn relabel(&self, group: &GroupId, from: Option<&str>, to: Option<&str>) -> Result<()> {
+    if let Some(from) = from {
+      let request = proto::RemoveGroupLabelRequest {
+        request_header: Some(request_header()),
+        group_label_id: Some(section_label(from)),
+        group_id: Some(convert::proto_group_id(group)),
+      };
+      self
+        .http
+        .api::<_, proto::RemoveGroupLabelResponse>("remove_group_label", &request)
+        .await?;
+    }
+    if let Some(to) = to {
+      let request = proto::ApplyGroupLabelRequest {
+        request_header: Some(request_header()),
+        group_label_id: Some(section_label(to)),
+        group_id: Some(convert::proto_group_id(group)),
+      };
+      self
+        .http
+        .api::<_, proto::ApplyGroupLabelResponse>("apply_group_label", &request)
+        .await?;
+    }
+    Ok(())
   }
 
   /// A message held in memory for a conversation.
@@ -1927,7 +2368,12 @@ impl Engine {
       self.save_history(&message.group, &state.histories[&message.group]);
     }
     if shown {
-      let incoming = is_new && !message.pending && message.sender_id != me_id;
+      // A hidden or blocked conversation does not notify.
+      let quiet = state
+        .groups
+        .get(&message.group)
+        .is_some_and(|group| group.hidden || group.blocked);
+      let incoming = is_new && !message.pending && message.sender_id != me_id && !quiet;
       self.emit(Event::MessageUpsert {
         message: message.clone(),
         replaces,
@@ -1950,7 +2396,7 @@ impl Engine {
       });
       if message.sender_id == me_id {
         group.unread = false;
-      } else if !open {
+      } else if !open && !group.hidden && !group.blocked {
         group.unread = true;
       }
       self.emit(Event::GroupUpsert(group.clone()));
@@ -2047,13 +2493,14 @@ impl Engine {
     self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).me.clone()
   }
 
-  /// Every conversation with the text it can be found by: its name and, for a one-to-one chat, the other
-  /// side's email.
+  /// Every conversation the user sees in the lists (not hidden, not blocked) with the text it can be found by: its
+  /// name and, for a one-to-one chat, the other side's email.
   pub(crate) fn directory(&self) -> Vec<(Group, String)> {
     let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     state
       .groups
       .values()
+      .filter(|group| !group.hidden && !group.blocked)
       .map(|group| {
         let mut text = group.name.clone();
         if matches!(group.kind, GroupKind::Dm | GroupKind::App) {
@@ -2182,14 +2629,16 @@ impl Engine {
           &self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).users,
         );
         if let Some(message) = converted {
-          let known = self
+          // A new message may bring a hidden conversation back; the server's list says whether it did.
+          let listed = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .groups
-            .contains_key(&message.group);
+            .get(&message.group)
+            .is_some_and(|group| !group.hidden);
           self.upsert_message(Arc::new(message), posted.local_id.as_deref());
-          if !known {
+          if !listed {
             self.queue_world_refresh();
           }
         }
@@ -2207,18 +2656,22 @@ impl Engine {
       let viewed = body
         .group_viewed
         .as_ref()
-        .map(|viewed| (viewed.group_id.as_ref(), viewed.view_time, false));
+        .map(|viewed| (viewed.group_id.as_ref(), viewed.view_time, None));
       let read_state = body.group_read_state_updated_event.as_ref().map(|updated| {
         (
           updated.group_id.as_ref(),
           updated.most_recent_read_time,
-          updated.mark_as_unread_time.unwrap_or(0) > 0,
+          updated.mark_as_unread_time,
         )
       });
-      for (group, read_time, marked_unread) in viewed.into_iter().chain(read_state) {
+      for (group, read_time, mark) in viewed.into_iter().chain(read_state) {
         let Some(group) = group.and_then(convert::group_id).or_else(|| event_group.clone()) else {
           continue;
         };
+        if let Some(mark) = mark {
+          self.set_marked_unread(&group, mark);
+        }
+        let marked_unread = mark.unwrap_or(0) > 0;
         let me = self.me_id();
         self.update_group(&group, |group| {
           group.last_read_time = group.last_read_time.max(read_time.unwrap_or(0));
@@ -2236,7 +2689,14 @@ impl Engine {
           .and_then(convert::group_id)
           .or_else(|| event_group.clone());
         if let Some(group) = group {
-          self.update_group(&group, |group| group.unread = true);
+          // 0 is the mark being cleared, as "Mark as read" does.
+          let time = marked.updated_mark_as_unread_timestamp_usec;
+          if let Some(time) = time {
+            self.set_marked_unread(&group, time);
+          }
+          if time != Some(0) {
+            self.update_group(&group, |group| group.unread = true);
+          }
         }
       }
       if let Some(typing) = &body.typing_state_changed_event {
@@ -2751,6 +3211,9 @@ fn created_group(id: GroupId, member_ids: Vec<String>, me: &str, users: &convert
     notify: Notify::All,
     snippet: None,
     placement: Placement::ByKind,
+    hidden: false,
+    blocked: false,
+    can_delete: false,
   }
 }
 
@@ -2759,6 +3222,22 @@ const WEB_REQUEST_HEADER: &str = r#"[0,3,1,"en",[null,null,null,null,2,2,null,2,
 
 /// The web app's world section of starred messages: up to 100 entries filtered by the starred label.
 const STARRED_SECTION: &str = r#"[100,null,null,null,null,null,null,null,null,[[1,1],[1]],[4],null,null,null,null,[[[3,[null,null,null,null,[2,[null,null,null,null,null,null,null,"label"],[null,null,null,null,null,null,null,"100G"]]]]]]]"#;
+
+/// The label that puts a conversation in a custom section.
+fn section_label(id: &str) -> proto::GroupLabelId {
+  proto::GroupLabelId {
+    group_label_type: Some(proto::group_label_id::GroupLabelType::CustomSection as i32),
+    label_secondary_key: Some(id.to_string()),
+  }
+}
+
+/// A conversation as the web app's page RPCs name it: its path, its id, and its kind (2 a space, 5 a DM).
+fn page_group_id(group: &GroupId) -> serde_json::Value {
+  match group {
+    GroupId::Space(id) => serde_json::json!([format!("space/{id}"), id, 2]),
+    GroupId::Dm(id) => serde_json::json!([format!("dm/{id}"), id, 5]),
+  }
+}
 
 /// `apply_message_label` / `remove_message_label` for the star, in the web app's JSON: the message id (topic and
 /// conversation inside), the label, and the request header as field 100.
@@ -2835,14 +3314,69 @@ fn starred_hit(message: &serde_json::Value, users: &Users) -> Option<SearchHit> 
   })
 }
 
+/// Page RPC `BFhA9d`'s arguments: block a space (`person` `None`), or block or unblock the other person of a DM.
+fn block_arguments(group: &GroupId, person: Option<&str>, blocked: bool) -> serde_json::Value {
+  let triple = page_group_id(group);
+  let Some(user) = person else {
+    return serde_json::json!([null, triple, 1, 0]);
+  };
+  let person = serde_json::json!([user, format!("human/{user}"), 0]);
+  if blocked {
+    serde_json::json!([person, null, 1, 0, null, triple])
+  } else {
+    serde_json::json!([person, null, 0, null, null, triple])
+  }
+}
+
+/// Page RPC `U3Vwwb`'s arguments: delete a space.
+fn delete_arguments(group: &GroupId) -> serde_json::Value {
+  serde_json::json!([page_group_id(group)])
+}
+
 #[cfg(test)]
 mod tests {
-  use super::{Receipts, click_card_request, file_name, meeting_link, people_list, starred_hit};
+  use super::{
+    Receipts, block_arguments, click_card_request, delete_arguments, file_name, meeting_link, page_group_id,
+    people_list, starred_hit,
+  };
   use crate::convert::Users;
   use crate::model::GroupId;
   use crate::model::{CardAction, User};
   use crate::proto;
   use std::path::Path;
+
+  /// The id triple the web app's pin and hide page RPCs carry, captured with the ids replaced.
+  #[test]
+  fn page_group_id_matches_the_web_app() {
+    assert_eq!(
+      page_group_id(&GroupId::Space("AAAA1".into())),
+      serde_json::json!(["space/AAAA1", "AAAA1", 2])
+    );
+    assert_eq!(
+      page_group_id(&GroupId::Dm("DM1".into())),
+      serde_json::json!(["dm/DM1", "DM1", 5])
+    );
+  }
+
+  /// The block, unblock, and delete arguments the web app sent, captured with the ids replaced.
+  #[test]
+  fn block_and_delete_arguments_match_the_web_app() {
+    let space = GroupId::Space("AAAA1".into());
+    let dm = GroupId::Dm("DM1".into());
+    assert_eq!(
+      block_arguments(&space, None, true),
+      serde_json::json!([null, ["space/AAAA1", "AAAA1", 2], 1, 0])
+    );
+    assert_eq!(
+      block_arguments(&dm, Some("111"), true),
+      serde_json::json!([["111", "human/111", 0], null, 1, 0, null, ["dm/DM1", "DM1", 5]])
+    );
+    assert_eq!(
+      block_arguments(&dm, Some("111"), false),
+      serde_json::json!([["111", "human/111", 0], null, 0, null, null, ["dm/DM1", "DM1", 5]])
+    );
+    assert_eq!(delete_arguments(&space), serde_json::json!([["space/AAAA1", "AAAA1", 2]]));
+  }
 
   /// The body the web app sent for a card button, captured with its ids replaced.
   #[test]

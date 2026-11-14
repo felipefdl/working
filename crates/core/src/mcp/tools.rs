@@ -1375,6 +1375,9 @@ mod tests {
       notify: Notify::All,
       snippet: None,
       placement: Placement::ByKind,
+      hidden: false,
+      blocked: false,
+      can_delete: false,
     }
   }
 

@@ -8,9 +8,10 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use gchat_core::SearchHit;
+use gchat_core::{GroupId, SearchHit};
 
 use crate::conv_list::{chip_button, chip_row, kinds_present, sort_button};
+use crate::menu;
 use crate::settings::Settings;
 use crate::store::{Conv, Pane, Store};
 use crate::theme::{ACCENT, FIELD, MARK, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, rgb};
@@ -217,6 +218,24 @@ fn select_conversation(typing: bool) -> Div {
     )
 }
 
+/// A conversation row's right-click: the conversation's menu at the pointer, as it is when clicked. Every list's
+/// conversation rows use it.
+pub fn conversation_menu(
+  handle: &Entity<Store>,
+  id: GroupId,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+  let handle = handle.clone();
+  move |event, window, cx| {
+    cx.stop_propagation();
+    let store = handle.read(cx);
+    let Some(conv) = store.group(&id) else {
+      return;
+    };
+    let items = menu::conversation_items(store, &conv.g, event.position);
+    menu::show(event.position, items, window, cx);
+  }
+}
+
 /// How a `conv_row` differs from the row Home draws.
 #[derive(Clone, Copy, Default)]
 pub struct RowMarks {
@@ -227,7 +246,8 @@ pub struct RowMarks {
 }
 
 /// One conversation: avatar, name, a preview line led by "You:" or the sender's name, the time of the last message,
-/// and a dot while it is unread. A click opens it. The caller sets the id and may restyle the frame.
+/// and a dot while it is unread. A click opens it; a right-click shows its menu. The caller sets the id and may restyle
+/// the frame.
 pub fn conv_row(
   handle: &Entity<Store>,
   store: &Store,
@@ -253,6 +273,7 @@ pub fn conv_row(
   });
   let time = g.snippet.as_ref().map_or(g.sort_time, |s| s.time);
   let opened = g.id.clone();
+  let right_click = conversation_menu(handle, g.id.clone());
   let handle = handle.clone();
   h_flex()
     .id(id)
@@ -268,6 +289,7 @@ pub fn conv_row(
       let group = opened.clone();
       handle.update(cx, |s, cx| s.open(group, window, cx));
     })
+    .on_mouse_down(MouseButton::Right, right_click)
     .child(group_avatar(&store.images, cx, g, 40.))
     .child(
       v_flex()

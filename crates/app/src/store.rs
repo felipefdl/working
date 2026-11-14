@@ -42,13 +42,21 @@ impl Section {
     }
   }
 
-  fn of(group: &Group) -> Self {
-    match (&group.placement, group.kind) {
-      (Placement::Custom { id, name }, _) => Self::Custom { id: id.clone(), name: name.clone() },
-      (Placement::Meeting, _) => Self::Meetings,
-      (Placement::ByKind, GroupKind::Dm | GroupKind::GroupDm) => Self::Dms,
-      (Placement::ByKind, GroupKind::App) => Self::Apps,
-      (Placement::ByKind, GroupKind::Space) => Self::Spaces,
+  /// Where the sidebar lists a conversation.
+  pub fn of(group: &Group) -> Self {
+    match &group.placement {
+      Placement::Custom { id, name } => Self::Custom { id: id.clone(), name: name.clone() },
+      Placement::Meeting => Self::Meetings,
+      Placement::ByKind => Self::of_kind(group.kind),
+    }
+  }
+
+  /// The section of a kind of conversation, where one goes when no other section holds it.
+  pub const fn of_kind(kind: GroupKind) -> Self {
+    match kind {
+      GroupKind::Dm | GroupKind::GroupDm => Self::Dms,
+      GroupKind::App => Self::Apps,
+      GroupKind::Space => Self::Spaces,
     }
   }
 
@@ -291,12 +299,17 @@ pub struct Store {
   pub connection: Connection,
   pub signed_out: Option<String>,
   groups: HashMap<GroupId, Arc<Conv>>,
-  /// Every conversation by `sort_time` descending.
+  /// Every conversation by `sort_time` descending, hidden and blocked ones included: what a search looks through, so
+  /// they can be found again.
+  pub every: Vec<Arc<Conv>>,
+  /// `every` without hidden and blocked conversations: what the browsing lists, unread counts, and the Dock badge
+  /// take.
   pub all: Vec<Arc<Conv>>,
-  /// What Home shows: `all` narrowed by the Unread toggle and, best match first, by the search text.
+  /// What Home shows: `all` narrowed by the Unread toggle; while there is search text, `every` narrowed by the toggle
+  /// and ranked by the text, best match first.
   pub home: Vec<Arc<Conv>>,
-  /// What the Messages and Rail list shows: `all` narrowed by `pane`, the Unread toggle, and the search text,
-  /// pinned first.
+  /// What the Messages and Rail list shows: `all` narrowed by `pane` and the Unread toggle, pinned first; while there is
+  /// search text, `every` narrowed by those and the text instead.
   pub list: Vec<Arc<Conv>>,
   pub pane: Pane,
   /// Every Rail entry: All, Mentions, Starred, the user's own sections, each kind the account has, then Meetings.
@@ -351,6 +364,7 @@ impl Store {
       connection: Connection::Connecting,
       signed_out: (!gchat_core::has_session()).then(|| "Sign in to start.".into()),
       groups: HashMap::new(),
+      every: Vec::new(),
       all: Vec::new(),
       home: Vec::new(),
       list: Vec::new(),
@@ -637,10 +651,11 @@ impl Store {
       self.rebuild();
     }
     // The Dock number counts what asked for attention: unread conversations set to notify for everything,
-    // and the others only while a notification Working posted for them (a mention) is still unread.
+    // and the others only while a notification Working posted for them (a mention) is still unread. Hidden and
+    // blocked conversations are out of the lists, so they are out of it too.
     let badge = self
-      .groups
-      .values()
+      .all
+      .iter()
       .filter(|c| c.g.unread)
       .filter(|c| match c.g.notify {
         Notify::All | Notify::MainConversations => true,
@@ -779,9 +794,10 @@ impl Store {
   // Derived lists.
 
   fn rebuild(&mut self) {
-    let mut all: Vec<Arc<Conv>> = self.groups.values().cloned().collect();
-    all.sort_by(|a, b| b.g.sort_time.cmp(&a.g.sort_time).then_with(|| a.g.name.cmp(&b.g.name)));
-    self.all = all;
+    let mut every: Vec<Arc<Conv>> = self.groups.values().cloned().collect();
+    every.sort_by(|a, b| b.g.sort_time.cmp(&a.g.sort_time).then_with(|| a.g.name.cmp(&b.g.name)));
+    self.all = every.iter().filter(|conv| listed(&conv.g)).cloned().collect();
+    self.every = every;
     self.rebuild_sidebar();
     self.rebuild_lists();
   }
@@ -789,6 +805,12 @@ impl Store {
   /// Home, the Messages and Rail list, and the Rail tabs.
   fn rebuild_lists(&mut self) {
     let query = self.query.trim();
+    // Searching finds hidden and blocked conversations too, so they can be opened, unhidden, or unblocked again.
+    let source = if query.is_empty() {
+      &self.all
+    } else {
+      &self.every
+    };
     let rank = |shown: Vec<Arc<Conv>>| -> Vec<Arc<Conv>> {
       if query.is_empty() {
         shown
@@ -821,8 +843,7 @@ impl Store {
       Pane::All | Pane::Section(_) | Pane::Shortcut(_) => true,
     };
     self.home = rank(
-      self
-        .all
+      source
         .iter()
         .filter(|conv| (!unread_only || conv.g.unread) && in_home(conv))
         .cloned()
@@ -831,8 +852,7 @@ impl Store {
     by_name(&mut self.home);
 
     let mut list = rank(
-      self
-        .all
+      source
         .iter()
         .filter(|conv| (!unread_only || conv.g.unread) && in_pane(conv))
         .cloned()
@@ -1031,6 +1051,17 @@ impl Store {
     }
   }
 
+  /// The sections the user made in Google Chat, A to Z: those its conversations are placed in.
+  pub fn custom_sections(&self) -> Vec<Section> {
+    let present: HashSet<Section> = self
+      .every
+      .iter()
+      .map(|conv| Section::of(&conv.g))
+      .filter(|section| matches!(section, Section::Custom { .. }))
+      .collect();
+    ordered(present.iter())
+  }
+
   /// The order of a Google Chat sidebar section: the user's pick, or the section's default.
   pub fn section_sort(&self, section: &Section) -> Sort {
     self
@@ -1202,7 +1233,7 @@ impl Store {
   }
 
   /// The newest view on one stack that can still be shown and is not the one on screen. Conversations that are
-  /// gone (left, or deleted) are skipped.
+  /// gone (left, or deleted) or out of the lists (hidden, or blocked) are skipped.
   fn next_step(&mut self, back: bool) -> Option<View> {
     let stack = if back {
       &mut self.back
@@ -1211,7 +1242,7 @@ impl Store {
     };
     while let Some(view) = stack.pop() {
       let shown = match &view {
-        View::Conversation(id) => self.groups.contains_key(id),
+        View::Conversation(id) => self.groups.get(id).is_some_and(|conv| listed(&conv.g)),
         View::Home | View::Shortcut(_) | View::Calendar | View::Meet => true,
       };
       if shown && view != self.view {
@@ -1451,6 +1482,11 @@ fn conv(group: Group) -> Conv {
   Conv { g: group, lower }
 }
 
+/// Whether a conversation belongs in the browsing lists: neither hidden nor blocked. Searches find it either way.
+pub const fn listed(group: &Group) -> bool {
+  !group.hidden && !group.blocked
+}
+
 /// Sections in sidebar order: the user's own A to Z, then the fixed ones. Only those in `present`.
 fn ordered<'a>(present: impl Iterator<Item = &'a Section>) -> Vec<Section> {
   let present: Vec<&Section> = present.collect();
@@ -1491,6 +1527,9 @@ mod tests {
       notify: Notify::All,
       snippet: None,
       placement,
+      hidden: false,
+      blocked: false,
+      can_delete: false,
     }
   }
 
