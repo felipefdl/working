@@ -17,13 +17,22 @@ pub fn set_title_bar(options: &mut WindowOptions, title: &'static str, bar_heigh
   // Linux defaults to the window manager's decorations, a second title bar above ours. Client-side ones let the kit's
   // title bar draw the window's buttons; where the compositor insists on its own, the kit leaves them out. The app id
   // (the X11 `WM_CLASS`) is the desktop entry's name, `working.desktop` (`scripts/package-linux.sh`), by which docks
-  // and task bars put the window under the app's name and icon.
+  // and task bars put the window under the app's name and icon. An AppImage run straight from a folder has no
+  // desktop entry installed, so the window carries the icon too.
   #[cfg(target_os = "linux")]
   {
     options.window_decorations = Some(WindowDecorations::Client);
     options.app_id = Some("working".into());
+    options.icon = WINDOW_ICON.clone();
   }
 }
+
+/// The app icon as the X11 window icon, at the size docks draw it.
+#[cfg(target_os = "linux")]
+static WINDOW_ICON: std::sync::LazyLock<Option<std::sync::Arc<image::RgbaImage>>> = std::sync::LazyLock::new(|| {
+  let icon = image::load_from_memory(include_bytes!("../../../logo/icon-light.png")).ok()?;
+  Some(std::sync::Arc::new(icon.thumbnail(256, 256).into_rgba8()))
+});
 
 /// Where a top bar's content starts: `mac` on macOS, clear of the traffic lights, and a plain margin elsewhere.
 pub const fn inset(mac: f32) -> f32 {

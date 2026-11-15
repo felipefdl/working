@@ -866,6 +866,33 @@ impl SettingsView {
       ))
   }
 
+  /// Linux: the switch for the app's own desktop entry, while the app is an `AppImage` that may add one or has one to
+  /// remove (`desktop_entry.rs`).
+  #[cfg(target_os = "linux")]
+  fn desktop(cx: &App) -> Option<Div> {
+    if !cx.try_global::<crate::desktop_entry::Integration>()?.switch() {
+      return None;
+    }
+    let on = cx.global::<Settings>().desktop_entry == crate::desktop_entry::Choice::Yes;
+    Some(Self::group(
+      "Desktop",
+      Self::card().child(
+        Self::row(
+          "Show in apps menu",
+          "Working's icon and name in the dock and the app launcher. Off removes them.",
+          true,
+        )
+        .child(Self::toggle("desktop-entry", on).on_click(move |_, _, cx| crate::desktop_entry::set(!on, cx))),
+      ),
+    ))
+  }
+
+  /// Only an `AppImage` on Linux installs a desktop entry of its own.
+  #[cfg(not(target_os = "linux"))]
+  const fn desktop(_: &App) -> Option<Div> {
+    None
+  }
+
   fn calls(settings: Settings) -> Div {
     // Linux has no call window (meetings open in the browser there), so these switches do nothing on it.
     let call_window = cfg!(not(target_os = "linux"));
@@ -1506,7 +1533,7 @@ impl Render for SettingsView {
     }
 
     let body = match self.section {
-      Section::Appearance => self.appearance(settings),
+      Section::Appearance => self.appearance(settings).children(Self::desktop(cx)),
       Section::Status => Self::status(settings),
       Section::Notifications => self.notifications(settings, cx),
       Section::Calls => Self::calls(settings),

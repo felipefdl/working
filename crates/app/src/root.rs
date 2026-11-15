@@ -1162,6 +1162,10 @@ impl Render for RootView {
     } else {
       "Root"
     };
+    // The cards in the bottom-right corner, stacked: the restart card, and on Linux the question about the apps menu.
+    let cards: Vec<AnyElement> = crate::updater::card(cx).into_iter().collect();
+    #[cfg(target_os = "linux")]
+    let cards: Vec<AnyElement> = cards.into_iter().chain(crate::desktop_entry::card(cx)).collect();
 
     emoji_font::fallback(v_flex())
       .size_full()
@@ -1258,7 +1262,9 @@ impl Render for RootView {
       .child(self.menu.clone())
       .child(self.text_panel.clone())
       .child(self.emoji.clone())
-      .children(crate::updater::card(cx))
+      .when(!cards.is_empty(), |root| {
+        root.child(v_flex().absolute().right(px(20.)).bottom(px(20.)).gap_2().children(cards))
+      })
       .into_any_element()
   }
 }

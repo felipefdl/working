@@ -49,6 +49,8 @@ mod completion;
 mod console;
 mod conv_list;
 mod conversation;
+#[cfg(target_os = "linux")]
+mod desktop_entry;
 mod emoji_font;
 mod emoji_picker;
 mod event_card;
@@ -158,6 +160,8 @@ fn main() {
     #[cfg(target_os = "linux")]
     emoji_font::register(cx);
     cx.set_global(Settings::load());
+    #[cfg(target_os = "linux")]
+    desktop_entry::start(cx);
     settings::apply_appearance(cx);
     settings::keep_mcp(core.clone(), cx);
     cx.set_global(status::DndState::default());

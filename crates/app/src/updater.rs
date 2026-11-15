@@ -163,64 +163,58 @@ fn restart(installer: &Pending, cx: &mut App) {
     .detach();
 }
 
-/// The persistent card in the bottom-right corner of the main window, shown once an update is ready.
+/// The persistent card shown once an update is ready; the window root puts it in the bottom-right corner.
 pub fn card(cx: &App) -> Option<AnyElement> {
   let ready = cx.try_global::<Updater>()?.0.clone()?;
   let pending = ready.pending.clone();
   Some(
-    div()
-      .absolute()
-      .right(px(20.))
-      .bottom(px(20.))
+    h_flex()
+      .id("update-card")
+      .w(px(300.))
+      .p_3()
+      .gap_3()
+      .items_center()
+      .rounded(px(12.))
+      .border_1()
+      .border_color(rgb(BORDER))
+      .bg(rgb(POPOVER))
+      .shadow_lg()
+      .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
       .child(
-        h_flex()
-          .id("update-card")
-          .w(px(300.))
-          .p_3()
-          .gap_3()
-          .items_center()
-          .rounded(px(12.))
-          .border_1()
-          .border_color(rgb(BORDER))
-          .bg(rgb(POPOVER))
-          .shadow_lg()
-          .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        v_flex()
+          .flex_1()
+          .min_w_0()
+          .gap_0p5()
           .child(
-            v_flex()
-              .flex_1()
-              .min_w_0()
-              .gap_0p5()
-              .child(
-                div()
-                  .text_size(px(13.))
-                  .font_weight(FontWeight::SEMIBOLD)
-                  .text_color(rgb(TEXT))
-                  .child(format!("Working {} is ready", ready.version)),
-              )
-              .child(
-                div()
-                  .text_size(px(12.))
-                  .text_color(rgb(MUTED))
-                  .child("Restart to finish updating."),
-              ),
+            div()
+              .text_size(px(13.))
+              .font_weight(FontWeight::SEMIBOLD)
+              .text_color(rgb(TEXT))
+              .child(format!("Working {} is ready", ready.version)),
           )
           .child(
             div()
-              .id("update-restart")
-              .h(px(28.))
-              .px_3()
-              .flex()
-              .flex_shrink_0()
-              .items_center()
-              .rounded(px(8.))
-              .bg(rgb(ACCENT_BG))
-              .text_size(px(13.))
-              .text_color(rgb(ACCENT))
-              .cursor_pointer()
-              .hover(|style| style.opacity(0.85))
-              .on_click(move |_, _, cx| restart(&pending, cx))
-              .child("Restart"),
+              .text_size(px(12.))
+              .text_color(rgb(MUTED))
+              .child("Restart to finish updating."),
           ),
+      )
+      .child(
+        div()
+          .id("update-restart")
+          .h(px(28.))
+          .px_3()
+          .flex()
+          .flex_shrink_0()
+          .items_center()
+          .rounded(px(8.))
+          .bg(rgb(ACCENT_BG))
+          .text_size(px(13.))
+          .text_color(rgb(ACCENT))
+          .cursor_pointer()
+          .hover(|style| style.opacity(0.85))
+          .on_click(move |_, _, cx| restart(&pending, cx))
+          .child("Restart"),
       )
       .into_any_element(),
   )

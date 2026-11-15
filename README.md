@@ -81,6 +81,8 @@ Download `Working_<version>_x86_64.AppImage` or `Working_<version>_aarch64.AppIm
 - An X11 session, or XWayland under Wayland
 - A glibc at least as new as Ubuntu 24.04's, where the release is built
 
+The first time the AppImage runs, a card in the window asks to add Working to your apps menu. **Add** writes `~/.local/share/applications/working.desktop`, which runs the AppImage where it is, and the icon `~/.local/share/icons/hicolor/512x512/apps/working.png` (under `$XDG_DATA_HOME` when it is set); the dock and the launcher then show Working's icon and name, the open window included. Each start rewrites the entry when the AppImage has moved or been replaced. **No thanks** writes nothing, and the app does not ask again. **Settings › Appearance › Show in apps menu** changes the answer: off removes those two files, and only those, and the dock goes back to a generic icon and the name `working`. Working neither asks nor writes under the AppImage opt-outs (a running `appimaged`, a `no_desktopintegration` file in `$XDG_DATA_HOME/appimagekit`, `/usr/share/appimagekit`, or `/etc/appimagekit`, or a non-empty `DESKTOPINTEGRATION` variable), or when a desktop entry for the AppImage that it did not write is already there, such as one from AppImageLauncher or Gear Lever.
+
 On Linux, Meet opens in your default browser: joining from a meeting card, the Meet view, a conversation's call button, or a `https://meet.google.com/...` link given to `working` on the command line all hand the link to the browser. WebKitGTK as Fedora builds it has no WebRTC (`RTCPeerConnection` is missing even with WebRTC turned on), and the webview refuses camera and microphone requests, so a call cannot run inside the app. The call button still posts the meeting in the chat.
 
 On Linux, Working draws emoji with its own copy of Google's Noto Color Emoji on every distribution. GPUI's Linux text stack cannot draw the COLRv1 color emoji font some distributions install (Fedora's `Noto-COLRv1.ttf`), so emoji would otherwise be blank there ([zed#42255](https://github.com/zed-industries/zed/issues/42255), [swash#21](https://github.com/dfrg/swash/issues/21)). The system emoji font is not used and does not need replacing. In the composer, an emoji the interface font also has, such as `❤️`, shows as that font's black glyph; the sent message shows it in color.
@@ -88,6 +90,8 @@ On Linux, Working draws emoji with its own copy of Google's Noto Color Emoji on 
 In the media viewer, a video can stay black while its sound plays. This was seen in a Fedora 44 virtual machine whose GStreamer had the needed demuxers and decoders (Matroska, VP8, VP9, AV1, H.264), so missing codec packages are not the cause there. The cause is still open: the most likely one is that VM's VA-API video decoder, which isn't confirmed. Audio, PDF, and text files open normally.
 
 On the welcome screen, after the sign-in page is canceled, the window can ignore clicks until it is resized or the pointer leaves it and comes back ([gpui-kit#3985](https://github.com/longbridge/gpui-kit/issues/3985)).
+
+With the window maximized, a window button can keep its hover color after the pointer leaves the window through the top edge, until the pointer comes back in ([gpui-kit#3987](https://github.com/longbridge/gpui-kit/issues/3987)).
 
 ### Windows
 
