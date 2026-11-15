@@ -335,7 +335,7 @@ pub fn conv_row(
 /// One message found by the search or listed by a shortcut: sender, conversation, time, and the text with the
 /// query's words marked.
 pub fn hit_row(handle: &Entity<Store>, store: &Store, ix: usize, hit: &SearchHit, query: &str, cx: &App) -> AnyElement {
-  let conversation = store.group(&hit.group).map(|conv| conv.g.name.clone()).unwrap_or_default();
+  let conversation = store.group(&hit.group).map_or_default(|conv| conv.g.name.clone());
   let title = if conversation.is_empty() || conversation == hit.sender_name {
     hit.sender_name.clone()
   } else {

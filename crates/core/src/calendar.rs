@@ -291,7 +291,7 @@ impl Session {
         query.push(("pageToken", token));
       }
       let answer = self.call(Method::GET, "users/me/calendarList", &query, None).await?;
-      let items = answer["items"].as_array().map(Vec::as_slice).unwrap_or_default();
+      let items = answer["items"].as_array().map_or_default(Vec::as_slice);
       list.extend(items.iter().filter_map(|entry| calendar_from(entry, &self.pastels)));
       match answer["nextPageToken"].as_str() {
         Some(token) => page = Some(token.to_string()),
@@ -352,7 +352,7 @@ impl Session {
         Ok(answer) => answer,
         Err(error) => return Err(error.context(format!("reading {}", calendar.name))),
       };
-      let items = answer["items"].as_array().map(Vec::as_slice).unwrap_or_default();
+      let items = answer["items"].as_array().map_or_default(Vec::as_slice);
       events.extend(items.iter().filter_map(|item| event_from(item, calendar)));
       match answer["nextPageToken"].as_str() {
         Some(token) => page = Some(token.to_string()),
@@ -652,8 +652,7 @@ fn event_from(item: &Value, calendar: &Calendar) -> Option<CalendarEvent> {
   let (end, _) = when(&item["end"])?;
   let guests: Vec<Guest> = item["attendees"]
     .as_array()
-    .map(|list| list.iter().filter_map(guest_from).collect())
-    .unwrap_or_default();
+    .map_or_default(|list| list.iter().filter_map(guest_from).collect());
   let organizer_me = item["organizer"]["self"].as_bool() == Some(true);
   let my_rsvp = guests
     .iter()

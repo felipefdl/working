@@ -214,7 +214,7 @@ impl ConversationView {
       Some(h) => (h.messages, h.reached_start, true),
       None => (Arc::new(Vec::new()), true, false),
     };
-    let me_id = me.as_ref().map(|u| u.id.clone()).unwrap_or_default();
+    let me_id = me.as_ref().map_or_default(|u| u.id.clone());
     let me_avatar = me.and_then(|u| u.avatar_url);
     let rows = message::build_rows(&messages, &me_id);
     let list = ListState::new(rows.len(), ListAlignment::Bottom, px(600.));

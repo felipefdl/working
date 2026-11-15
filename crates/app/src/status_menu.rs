@@ -302,7 +302,7 @@ impl Render for StatusComposer {
 
 /// Opens the status menu at `at`.
 pub fn show(at: Point<Pixels>, core: Core, window: &mut Window, cx: &mut App) {
-  let mine = cx.try_global::<Mine>().map(|mine| mine.0.clone()).unwrap_or_default();
+  let mine = cx.try_global::<Mine>().map_or_default(|mine| mine.0.clone());
   let away = cx.global::<Settings>().away;
   let now = now_usec();
   let dnd = mine.dnd_on(now);

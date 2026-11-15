@@ -654,7 +654,7 @@ async fn inbox(engine: &Arc<Engine>, arguments: Value) -> Result<String, String>
   let args: InboxArgs = parse(arguments)?;
   let limit = args.limit.unwrap_or(10).clamp(1, 25);
   let each = args.messages_each.unwrap_or(5).clamp(1, 20);
-  let me = engine.me().map(|me| me.id).unwrap_or_default();
+  let me = engine.me().map_or_default(|me| me.id);
 
   let unread = directory(engine)
     .into_iter()
@@ -913,7 +913,7 @@ fn stamp_line(group: &Group, topics: &[Topic], me: &str, now: Micros) -> String 
 async fn recent_activity(engine: &Arc<Engine>, arguments: Value) -> Result<String, String> {
   let args: ActivityArgs = parse(arguments)?;
   let limit = args.limit.unwrap_or(10).clamp(1, 25);
-  let me = engine.me().map(|me| me.id).unwrap_or_default();
+  let me = engine.me().map_or_default(|me| me.id);
   let now = Local::now().timestamp_micros();
   let since = now - RECENT;
 
@@ -1072,7 +1072,7 @@ async fn read_conversation(engine: &Arc<Engine>, reads: &Reads, arguments: Value
   let args: ReadArgs = parse(arguments)?;
   let group = resolve(&directory(engine), &args.conversation, false)?;
   let limit = args.limit.unwrap_or(30).clamp(1, 100);
-  let me = engine.me().map(|me| me.id).unwrap_or_default();
+  let me = engine.me().map_or_default(|me| me.id);
   let thread = args
     .thread
     .as_deref()
@@ -1207,7 +1207,7 @@ async fn search_messages(engine: &Arc<Engine>, arguments: Value) -> Result<Strin
     Some(reference) => Some(resolve(&all, reference, false)?),
     None => None,
   };
-  let me = engine.me().map(|me| me.id).unwrap_or_default();
+  let me = engine.me().map_or_default(|me| me.id);
 
   let mut hits = engine.search_hits(query).await.map_err(offline)?;
   let filtered = only.is_some() || args.from.is_some();

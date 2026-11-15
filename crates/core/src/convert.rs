@@ -133,9 +133,9 @@ pub fn group(
     given_name
   } else if members.len() == 1 && kind == GroupKind::GroupDm {
     // A group chat left with one other person, labeled as the web app does.
-    format!("Group: {}", members.first().map(|user| user.name.as_str()).unwrap_or_default())
+    format!("Group: {}", members.first().map_or_default(|user| user.name.as_str()))
   } else if members.len() == 1 {
-    members.first().map(|user| user.name.clone()).unwrap_or_default()
+    members.first().map_or_default(|user| user.name.clone())
   } else {
     let first_names: Vec<&str> = members
       .iter()

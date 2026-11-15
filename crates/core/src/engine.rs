@@ -407,8 +407,7 @@ impl Engine {
       .unwrap_or_else(std::sync::PoisonError::into_inner)
       .me
       .as_ref()
-      .map(|me| me.id.clone())
-      .unwrap_or_default()
+      .map_or_default(|me| me.id.clone())
   }
 
   // ---- Conversation list ----
@@ -985,7 +984,7 @@ impl Engine {
           group,
           message_id: message[17][0].as_str()?.to_string(),
           topic_id: message[17][2][0].as_str().unwrap_or_default().to_string(),
-          sender_name: sender.map(|user| user.name.clone()).unwrap_or_default(),
+          sender_name: sender.map_or_default(|user| user.name.clone()),
           sender_avatar: sender.and_then(|user| user.avatar_url.clone()),
           sender_id,
           text: message[5].as_str().unwrap_or_default().to_string(),
@@ -2331,7 +2330,7 @@ impl Engine {
   /// message this one confirms.
   fn upsert_message(&self, message: Arc<Message>, local_id: Option<&str>) {
     let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let me_id = state.me.as_ref().map(|me| me.id.clone()).unwrap_or_default();
+    let me_id = state.me.as_ref().map_or_default(|me| me.id.clone());
     let open = state.open.as_ref() == Some(&message.group);
     let history = state.histories.entry(message.group.clone()).or_default();
     let by_id = history.messages.iter().position(|held| held.id == message.id);
@@ -2798,7 +2797,7 @@ impl Engine {
     if state.me.as_ref().is_some_and(|me| me.id == user_id) {
       return;
     }
-    let user_name = state.users.get(&user_id).map(|user| user.name.clone()).unwrap_or_default();
+    let user_name = state.users.get(&user_id).map_or_default(|user| user.name.clone());
     self.emit(Event::Typing {
       group,
       user_id,
@@ -2908,8 +2907,7 @@ impl Engine {
     let flag = |value: &serde_json::Value| value.as_bool().unwrap_or(value.as_i64() == Some(1));
     let schedules = settings[3]
       .as_array()
-      .map(Vec::as_slice)
-      .unwrap_or_default()
+      .map_or_default(Vec::as_slice)
       .iter()
       .map(|schedule| DndSchedule {
         days: schedule[1]
@@ -3306,7 +3304,7 @@ fn starred_hit(message: &serde_json::Value, users: &Users) -> Option<SearchHit> 
     group,
     message_id: message[0][1].as_str()?.to_string(),
     topic_id: topic[1].as_str().unwrap_or_default().to_string(),
-    sender_name: sender.map(|user| user.name.clone()).unwrap_or_default(),
+    sender_name: sender.map_or_default(|user| user.name.clone()),
     sender_avatar: sender.and_then(|user| user.avatar_url.clone()),
     sender_id,
     text: message[9].as_str().unwrap_or_default().to_string(),

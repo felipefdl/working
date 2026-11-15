@@ -408,7 +408,7 @@ impl Store {
   }
 
   pub fn me_id(&self) -> String {
-    self.me.as_ref().map(|u| u.id.clone()).unwrap_or_default()
+    self.me.as_ref().map_or_default(|u| u.id.clone())
   }
 
   pub fn group(&self, id: &GroupId) -> Option<&Arc<Conv>> {

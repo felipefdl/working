@@ -12,7 +12,7 @@ use crate::theme::{BORDER, FIELD, MUTED, POPOVER, ROW_HOVER, TEXT, rgb};
 
 const COLUMNS: usize = 8;
 const CELL: f32 = 36.0;
-const WIDTH: f32 = COLUMNS as f32 * CELL + 16.0;
+const WIDTH: f32 = (COLUMNS as f32).mul_add(CELL, 16.0);
 const HEIGHT: f32 = 340.0;
 
 /// What to do with the emoji the user picked.
@@ -121,7 +121,7 @@ impl EmojiPicker {
     range
       .map(|row| {
         let mut line = h_flex().h(px(CELL));
-        for ix in row * COLUMNS..((row + 1) * COLUMNS).min(self.results.len()) {
+        for (ix, emoji) in self.results.iter().enumerate().skip(row * COLUMNS).take(COLUMNS) {
           line = line.child(
             div()
               .id(("emoji", ix))
@@ -134,7 +134,7 @@ impl EmojiPicker {
               .cursor_pointer()
               .hover(|s| s.bg(rgb(ROW_HOVER)))
               .on_click(cx.listener(move |this, _, window, cx| this.pick(ix, window, cx)))
-              .child(emoji_font::text(self.results[ix].as_str())),
+              .child(emoji_font::text(emoji.as_str())),
           );
         }
         line.into_any_element()
