@@ -24,7 +24,7 @@ That runs format check, clippy, tests, and supply-chain gates. The contract is [
 
 Mid-change, `just task <package>` or `just t '<nextest filter>'` covers one crate or a test filter. Completion still needs `just check`.
 
-Working builds for macOS, Linux, and Windows; build prerequisites per system are in the [README](README.md#build-from-source). The gate builds for the machine it runs on, so a change to code behind `#[cfg(target_os = "...")]` also needs clippy and tests on that system. On Windows, run them through cargo (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace`), and run the app with `cargo run --release -p working`.
+Working builds for macOS, Linux, and Windows; build prerequisites per system are in [docs/platforms.md](docs/platforms.md#build-prerequisites). The gate builds for the machine it runs on, so a change to code behind `#[cfg(target_os = "...")]` also needs clippy and tests on that system. On Windows, run them through cargo (`cargo clippy --workspace --all-targets -- -D warnings`, `cargo nextest run --workspace`), and run the app with `cargo run --release -p working`.
 
 ## Conventions
 
