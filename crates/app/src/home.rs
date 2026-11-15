@@ -11,6 +11,7 @@ use gpui_kit::*;
 use gchat_core::{GroupId, SearchHit};
 
 use crate::conv_list::{chip_button, chip_row, kinds_present, sort_button};
+use crate::emoji_font;
 use crate::menu;
 use crate::settings::Settings;
 use crate::store::{Conv, Pane, Store};
@@ -184,7 +185,8 @@ pub fn unread_toggle(on: bool) -> Stateful<Div> {
 /// What the pane beside the conversation list says with nothing open and no search: how to pick a conversation.
 /// `typing` adds that Enter searches messages.
 fn select_conversation(typing: bool) -> Div {
-  let hint = |keys: &'static str, what: &'static str| {
+  let hint = |binding: &str, what: &'static str| {
+    let keys = crate::keys::text(binding);
     h_flex()
       .gap_3()
       .items_center()
@@ -212,9 +214,9 @@ fn select_conversation(typing: bool) -> Div {
     .child(
       v_flex()
         .gap_2()
-        .when(typing, |hints| hints.child(hint("⏎", "Search messages")))
-        .child(hint("⌘N", "New chat"))
-        .child(hint("⌥⌘↓", "Next conversation")),
+        .when(typing, |hints| hints.child(hint("enter", "Search messages")))
+        .child(hint("secondary-n", "New chat"))
+        .child(hint(crate::keys::NEXT_CONVERSATION, "Next conversation")),
     )
 }
 
@@ -310,7 +312,7 @@ pub fn conv_row(
             .text_size(px(13.))
             .text_color(rgb(MUTED))
             .when(g.unread, |d| d.text_color(rgb(TEXT)))
-            .child(snippet.unwrap_or_default()),
+            .child(emoji_font::text(snippet.unwrap_or_default())),
         ),
     )
     .child(

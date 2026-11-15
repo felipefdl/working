@@ -688,7 +688,7 @@ impl Store {
     }
   }
 
-  /// A macOS notification for someone else's new message, when the conversation's Google Chat setting asks
+  /// A desktop notification for someone else's new message, when the conversation's Google Chat setting asks
   /// for one and the user is not already looking at it.
   fn notify_incoming(&mut self, message: &Message, window: &Window, cx: &App) {
     let Some(conv) = self.groups.get(&message.group) else {
@@ -733,7 +733,7 @@ impl Store {
     } else {
       message.text.as_str()
     };
-    let sound = cx.global::<crate::settings::Settings>().sound;
+    let sound = cx.global::<crate::settings::Settings>().sound.resolved();
     let space = (!direct).then_some(conv.g.name.as_str());
     crate::notify::post(&message.id, &message.group.key(), &message.sender_name, space, body, sound);
     self.notified.entry(message.group.clone()).or_default().push(message.id.clone());

@@ -8,6 +8,7 @@ use gpui_kit::*;
 
 use gchat_core::{Command, Core, Group, GroupId, GroupKind, Notify, Placement};
 
+use crate::emoji_font;
 use crate::settings::Sort;
 use crate::store::{Section, Store};
 use crate::theme::{ACCENT, BORDER, MUTED, POPOVER, RED, ROW_HOVER, TEXT, rgb};
@@ -448,7 +449,7 @@ impl ContextMenu {
             .cursor_pointer()
             .hover(|s| s.bg(rgb(ROW_HOVER)))
             .on_click(cx.listener(move |this, _, window, cx| this.pick(None, ix, window, cx)))
-            .child(item.label.clone()),
+            .child(emoji_font::text(item.label.clone())),
         );
         continue;
       }

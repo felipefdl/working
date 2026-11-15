@@ -20,3 +20,8 @@ for rendition in Default Dark; do
     --rendition "$rendition" --width 512 --height 512 --scale 1 >/dev/null
 done
 echo "Wrote logo/icon-light.png and logo/icon-dark.png"
+
+# Windows icon: the light rendition at the sizes Explorer, the taskbar, and the installer use, embedded in the exe by
+# crates/app/build.rs and used by the NSIS installer. Needs ImageMagick (brew install imagemagick).
+magick logo/icon-light.png -define icon:auto-resize=256,64,48,40,32,24,20,16 crates/app/assets/working.ico
+echo "Wrote crates/app/assets/working.ico"

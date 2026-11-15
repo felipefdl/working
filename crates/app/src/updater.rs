@@ -1,9 +1,17 @@
-//! Self-update. Release builds check GitHub for a newer version, install it over the running bundle, and show
-//! a restart card until the user restarts. There is no setting: every release build updates itself. Local
-//! builds (`just run`) never update, because `WORKING_UPDATES` is set only by the release workflow.
+//! Self-update. Release builds check GitHub for a newer version, get it ready, and show a restart card until the
+//! user restarts. macOS installs the new bundle over the running one, Linux the new `AppImage` over the running one
+//! (only an `AppImage` updates itself: a package manager owns any other install), and Windows keeps the verified NSIS
+//! installer for the restart, which runs it. There is no setting: every release build updates itself. Local builds
+//! (`just run`) never update, because `WORKING_UPDATES` is set only by the release workflow.
 
-use std::path::PathBuf;
+#[cfg(not(target_os = "windows"))]
+use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
+use std::sync::Arc;
 use std::time::Duration;
+
+#[cfg(target_os = "windows")]
+use cargo_packager_updater::Update;
 
 use cargo_packager_updater::{Config, UpdaterBuilder, semver::Version};
 use gpui_kit::component::{h_flex, v_flex};
@@ -23,21 +31,32 @@ const INTERVAL: Duration = Duration::from_hours(4);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 
-/// An update installed over the bundle, waiting for a restart.
+/// What the restart finishes the update with: the new bundle (macOS) or `AppImage` (Linux), already installed over the
+/// running one.
+#[cfg(not(target_os = "windows"))]
+type Pending = PathBuf;
+
+/// What the restart finishes the update with: the update and its verified installer, which replaces the running app
+/// and so waits for the restart.
+#[cfg(target_os = "windows")]
+type Pending = Arc<(Update, Vec<u8>)>;
+
+/// An update waiting for a restart.
 #[derive(Clone)]
 pub struct Ready {
   pub version: String,
-  pub bundle: PathBuf,
+  pending: Pending,
 }
 
-/// Whether an installed update waits for a restart.
+/// Whether an update waits for a restart.
 #[derive(Default)]
 pub struct Updater(pub Option<Ready>);
 
 impl Global for Updater {}
 
 fn enabled() -> bool {
-  option_env!("WORKING_UPDATES") == Some("1")
+  let installable = !cfg!(target_os = "linux") || std::env::var_os("APPIMAGE").is_some();
+  option_env!("WORKING_UPDATES") == Some("1") && installable
 }
 
 /// Starts the background check loop in release builds. It stops once an update is installed.
@@ -67,12 +86,15 @@ pub fn start(cx: &mut App) {
   .detach();
 }
 
-/// Checks the manifest and, when a newer version exists, downloads, verifies, and installs it.
+/// Checks the manifest and, when a newer version exists, downloads and verifies it, and installs it where the running
+/// app can be replaced (macOS, Linux).
 fn check_and_install() -> Result<Option<Ready>, String> {
   let current: Version = env!("CARGO_PKG_VERSION").parse().map_err(|err| format!("{err}"))?;
   let config = Config {
     endpoints: vec![ENDPOINT.parse().map_err(|err| format!("{err}"))?],
     pubkey: PUBKEY.into(),
+    // The default: Windows runs the NSIS installer passively (`/P /R`), which closes the app, installs, and opens it
+    // again.
     windows: None,
   };
   let updater = UpdaterBuilder::new(current, config)
@@ -83,15 +105,28 @@ fn check_and_install() -> Result<Option<Ready>, String> {
     return Ok(None);
   };
   update.timeout = Some(DOWNLOAD_TIMEOUT);
-  update.download_and_install().map_err(|err| err.to_string())?;
-  Ok(Some(Ready {
-    version: update.version.clone(),
-    bundle: update.extract_path,
-  }))
+  #[cfg(not(target_os = "windows"))]
+  {
+    update.download_and_install().map_err(|err| err.to_string())?;
+    Ok(Some(Ready {
+      version: update.version.clone(),
+      pending: update.extract_path,
+    }))
+  }
+  // Installing runs the installer and exits this process at once, so only the download happens now.
+  #[cfg(target_os = "windows")]
+  {
+    let bytes = update.download().map_err(|err| err.to_string())?;
+    Ok(Some(Ready {
+      version: update.version.clone(),
+      pending: Arc::new((update, bytes)),
+    }))
+  }
 }
 
 /// Opens the new bundle once this process has exited, then quits.
-fn restart(bundle: &std::path::Path, cx: &mut App) {
+#[cfg(target_os = "macos")]
+fn restart(bundle: &Path, cx: &mut App) {
   let spawned = std::process::Command::new("/bin/sh")
     .arg("-c")
     .arg(r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; open "$2""#)
@@ -105,10 +140,33 @@ fn restart(bundle: &std::path::Path, cx: &mut App) {
   }
 }
 
-/// The persistent card in the bottom-right corner of the main window, shown once an update is installed.
+/// Runs the new `AppImage` once this process has exited, then quits. `$APPIMAGE`, not the running executable, which sits
+/// in the old image's temporary mount.
+#[cfg(target_os = "linux")]
+fn restart(appimage: &Path, cx: &mut App) {
+  cx.set_restart_path(appimage.to_path_buf());
+  cx.restart();
+}
+
+/// Runs the installer, which closes this process, installs, and opens the new version. Off the main thread: starting a
+/// process on Windows can pump the window messages, which re-enters GPUI.
+#[cfg(target_os = "windows")]
+fn restart(installer: &Pending, cx: &mut App) {
+  let installer = installer.clone();
+  cx.background_executor()
+    .spawn(async move {
+      let (update, bytes) = &*installer;
+      if let Err(err) = update.install(bytes.clone()) {
+        tracing::warn!("restart failed: {err}");
+      }
+    })
+    .detach();
+}
+
+/// The persistent card in the bottom-right corner of the main window, shown once an update is ready.
 pub fn card(cx: &App) -> Option<AnyElement> {
   let ready = cx.try_global::<Updater>()?.0.clone()?;
-  let bundle = ready.bundle.clone();
+  let pending = ready.pending.clone();
   Some(
     div()
       .absolute()
@@ -160,7 +218,7 @@ pub fn card(cx: &App) -> Option<AnyElement> {
               .text_color(rgb(ACCENT))
               .cursor_pointer()
               .hover(|style| style.opacity(0.85))
-              .on_click(move |_, _, cx| restart(&bundle, cx))
+              .on_click(move |_, _, cx| restart(&pending, cx))
               .child("Restart"),
           ),
       )

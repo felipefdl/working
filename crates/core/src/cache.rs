@@ -1,4 +1,4 @@
-//! Disk cache under `~/Library/Caches/working`: what makes a cold start and a first click paint without the network.
+//! Disk cache in [`crate::cache_dir`]: what makes a cold start and a first click paint without the network.
 #![allow(
   clippy::unused_self,
   reason = "read/write stay methods so call sites stay on Cache"
@@ -41,8 +41,7 @@ pub struct Cache {
 
 impl Cache {
   pub fn open() -> Self {
-    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-    let dir = home.join("Library/Caches/working");
+    let dir = crate::cache_dir();
     let _ = std::fs::create_dir_all(dir.join("history"));
     let _ = std::fs::create_dir_all(dir.join("img"));
     Self { dir }

@@ -4,6 +4,7 @@ use gchat_core::{Group, GroupKind, PersonStatus};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::emoji_font;
 use crate::images::Images;
 use crate::theme::{ACCENT, BG, FIELD, GREEN, MUTED, RED, TEXT, Tone, WHITE, rgb, switch_off};
 use crate::util;
@@ -38,13 +39,22 @@ pub enum Icon {
   Play,
   Phone,
   Video,
+  /// The call window's controls, which Linux has no call window for.
+  #[cfg(not(target_os = "linux"))]
   VideoOff,
+  #[cfg(not(target_os = "linux"))]
   Mic,
+  #[cfg(not(target_os = "linux"))]
   MicOff,
+  #[cfg(not(target_os = "linux"))]
   ScreenShare,
+  #[cfg(not(target_os = "linux"))]
   Hand,
+  #[cfg(not(target_os = "linux"))]
   PhoneOff,
   Monitor,
+  /// The macOS permissions section of Settings, which only macOS has.
+  #[cfg(target_os = "macos")]
   Shield,
   Bot,
   Activity,
@@ -133,27 +143,34 @@ impl Icon {
       Self::Video => lucide!(
         r#"<path d="m16 13 5.223 3.482a.5.5 0 0 0 .777-.416V7.87a.5.5 0 0 0-.752-.432L16 10.5"/><rect x="2" y="6" width="14" height="12" rx="2"/>"#
       ),
+      #[cfg(not(target_os = "linux"))]
       Self::VideoOff => lucide!(
         r#"<path d="M10.66 6H14a2 2 0 0 1 2 2v2.5l5.248-3.062A.5.5 0 0 1 22 7.87v8.196"/><path d="M16 16a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h2"/><path d="m2 2 20 20"/>"#
       ),
+      #[cfg(not(target_os = "linux"))]
       Self::Mic => lucide!(
         r#"<path d="M12 19v3"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><rect x="9" y="2" width="6" height="13" rx="3"/>"#
       ),
+      #[cfg(not(target_os = "linux"))]
       Self::MicOff => lucide!(
         r#"<path d="M12 19v3"/><path d="M15 9.34V5a3 3 0 0 0-5.68-1.33"/><path d="M16.95 16.95A7 7 0 0 1 5 12v-2"/><path d="M18.89 13.23A7 7 0 0 0 19 12v-2"/><path d="m2 2 20 20"/><path d="M9 9v3a3 3 0 0 0 5.12 2.12"/>"#
       ),
+      #[cfg(not(target_os = "linux"))]
       Self::ScreenShare => lucide!(
         r#"<path d="m9 10 3-3 3 3"/><path d="M12 13V7"/><rect width="20" height="14" x="2" y="3" rx="2"/><path d="M12 17v4"/><path d="M8 21h8"/>"#
       ),
+      #[cfg(not(target_os = "linux"))]
       Self::Hand => lucide!(
         r#"<path d="M18 11V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2"/><path d="M14 10V4a2 2 0 0 0-2-2a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/>"#
       ),
+      #[cfg(not(target_os = "linux"))]
       Self::PhoneOff => lucide!(
         r#"<path d="M10.1 13.9a14 14 0 0 0 3.732 2.668 1 1 0 0 0 1.213-.303l.355-.465A2 2 0 0 1 17 15h3a2 2 0 0 1 2 2v3a2 2 0 0 1-2 2 18 18 0 0 1-12.728-5.272"/><path d="M22 2 2 22"/><path d="M4.76 13.582A18 18 0 0 1 2 4a2 2 0 0 1 2-2h3a2 2 0 0 1 2 2v3a2 2 0 0 1-.8 1.6l-.468.351a1 1 0 0 0-.292 1.233 14 14 0 0 0 .244.473"/>"#
       ),
       Self::Monitor => lucide!(
         r#"<rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/>"#
       ),
+      #[cfg(target_os = "macos")]
       Self::Shield => lucide!(
         r#"<path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/><path d="m9 12 2 2 4-4"/>"#
       ),
@@ -278,7 +295,7 @@ pub fn avatar(images: &Images, cx: &App, url: Option<&str>, emoji: Option<&str>,
     return circle
       .bg(rgb(FIELD))
       .text_size(px(size * 0.55))
-      .child(emoji.to_string())
+      .child(emoji_font::text(emoji.to_string()))
       .into_any_element();
   }
   if let Some(url) = url {

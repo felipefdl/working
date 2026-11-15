@@ -1,4 +1,4 @@
-//! `WKWebView` cookie store: read and install the Google session.
+//! macOS: the `WKWebView` cookie store, reached directly through `WebKit`.
 #![allow(unsafe_code, reason = "WKWebView cookie FFI")]
 
 use std::ptr::NonNull;

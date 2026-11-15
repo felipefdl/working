@@ -34,8 +34,11 @@ struct FormatButton {
   format: Format,
   glyph: Icon,
   id: &'static str,
-  /// What its tooltip says: the name, and the key when it has one.
-  tip: &'static str,
+  /// The name its tooltip shows, before the key when it has one.
+  name: &'static str,
+  /// The key, as a binding (`secondary-` is Cmd on macOS and Ctrl elsewhere); the bulleted list's is spelled with
+  /// the 8 the user presses rather than the `*` it is bound as.
+  keys: Option<&'static str>,
 }
 
 /// The formatting bar's buttons, in groups with a divider between them: styles, the list, and code.
@@ -45,39 +48,45 @@ const FORMAT_BAR: [&[FormatButton]; 3] = [
       format: Format::Bold,
       glyph: Icon::Bold,
       id: "format-bold",
-      tip: "Bold (⌘B)",
+      name: "Bold",
+      keys: Some("secondary-b"),
     },
     FormatButton {
       format: Format::Italic,
       glyph: Icon::Italic,
       id: "format-italic",
-      tip: "Italic (⌘I)",
+      name: "Italic",
+      keys: Some("secondary-i"),
     },
     FormatButton {
       format: Format::Strikethrough,
       glyph: Icon::Strikethrough,
       id: "format-strikethrough",
-      tip: "Strikethrough (⇧⌘X)",
+      name: "Strikethrough",
+      keys: Some("secondary-shift-x"),
     },
   ],
   &[FormatButton {
     format: Format::Bullets,
     glyph: Icon::List,
     id: "format-bullets",
-    tip: "Bulleted list (⇧⌘8)",
+    name: "Bulleted list",
+    keys: Some("secondary-shift-8"),
   }],
   &[
     FormatButton {
       format: Format::Code,
       glyph: Icon::Code,
       id: "format-code",
-      tip: "Code",
+      name: "Code",
+      keys: None,
     },
     FormatButton {
       format: Format::CodeBlock,
       glyph: Icon::SquareCode,
       id: "format-code-block",
-      tip: "Code block",
+      name: "Code block",
+      keys: None,
     },
   ],
 ];
@@ -885,7 +894,7 @@ impl ConversationView {
     )
   }
 
-  /// The header's arrow: the same step back as Cmd+[.
+  /// The header's arrow: the same step back as Cmd+[ (Ctrl+[ off macOS).
   fn go_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     self.store.update(cx, |store, cx| store.go_back(window, cx)).ok();
   }
@@ -1002,7 +1011,7 @@ impl ConversationView {
     }
   }
 
-  /// Cmd+V in a composer: files and pictures on the clipboard are attached; text is left to the composer.
+  /// Paste in a composer: files and pictures on the clipboard are attached; text is left to the composer.
   fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
     let Some(in_thread) = self.focused_composer(window, cx) else {
       return;
@@ -1236,7 +1245,13 @@ impl ConversationView {
             .rounded_full()
             .cursor_pointer()
             .hover(|s| s.bg(rgb(BORDER)))
-            .tooltip(hint(button.tip))
+            .tooltip({
+              let tip = SharedString::from(match button.keys {
+                Some(keys) => format!("{} ({})", button.name, crate::keys::text(keys)),
+                None => button.name.to_string(),
+              });
+              move |window, cx| Tooltip::new(tip.clone()).build(window, cx)
+            })
             .on_click(cx.listener(move |this, _, window, cx| this.apply_format(format, in_thread, window, cx)))
             .child(icon(button.glyph, 16., MUTED)),
         );

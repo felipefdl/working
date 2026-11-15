@@ -14,33 +14,24 @@ mod http;
 mod markup;
 pub mod mcp;
 pub mod model;
+mod paths;
 mod proto;
 
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 pub use calendar::{EVENT_COLORS, boundary_date, local_midnight};
 pub use engine::device_time_zone;
 pub use http::SessionCookie;
 pub use model::*;
+#[cfg(target_os = "windows")]
+pub use paths::webview_dir;
+pub use paths::{cache_dir, config_dir};
 
 /// True when `WORKING_DEMO=1`: the core serves a made-up workspace and never signs in.
 pub fn demo_mode() -> bool {
   std::env::var("WORKING_DEMO").is_ok_and(|value| value == "1")
-}
-
-/// Directory holding `cookies.json` (written by the app or `scripts/login.sh`).
-///
-/// In demo mode, a directory of its own under the temp dir, so the demo never reads the session or changes
-/// the settings of a real run.
-pub fn config_dir() -> PathBuf {
-  if demo_mode() {
-    return std::env::temp_dir().join("working-demo");
-  }
-  let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-  home.join(".config/working")
 }
 
 /// Session cookies for an embedded Meet browser.
@@ -89,13 +80,7 @@ fn write_cookies(path: &Path, cookies: &[SessionCookie]) -> io::Result<()> {
   }
   let text = serde_json::to_string_pretty(cookies).map_err(io::Error::other)?;
   let staging = path.with_extension("json.new");
-  let mut file = std::fs::OpenOptions::new()
-    .write(true)
-    .create(true)
-    .truncate(true)
-    .mode(0o600)
-    .open(&staging)?;
-  file.write_all(text.as_bytes())?;
+  paths::create_private(&staging)?.write_all(text.as_bytes())?;
   std::fs::rename(&staging, path)?;
   Ok(())
 }

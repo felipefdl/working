@@ -1,8 +1,8 @@
-//! macOS notifications for incoming messages, and the unread count on the Dock icon.
+//! macOS: `UserNotifications` for incoming messages, and the unread count on the Dock icon.
 #![allow(unsafe_code, reason = "UserNotifications FFI")]
 //!
-//! Each notification carries its conversation's key as the thread identifier: macOS groups a conversation's
-//! notifications by it, and a click sends it back so the app can open that conversation.
+//! The conversation's key is the notification's thread identifier, by which macOS groups a conversation's
+//! notifications.
 
 use std::ptr::NonNull;
 use std::sync::LazyLock;

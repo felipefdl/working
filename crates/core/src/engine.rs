@@ -2865,7 +2865,7 @@ fn meeting_link(call: &proto::CreateVideoCallResponse) -> Option<String> {
 /// How often the server is told the user is still there (or still gone).
 const HEARTBEAT: Duration = Duration::from_secs(120);
 
-/// The time zone of this Mac, as Google Chat names zones.
+/// The time zone of this computer, as Google Chat names zones.
 pub fn device_time_zone() -> String {
   iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".into())
 }

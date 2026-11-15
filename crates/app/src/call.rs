@@ -11,16 +11,21 @@
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::*;
 use gpui_webview::WebView;
-use wry::WebViewBuilder;
 
+use crate::chrome;
+#[cfg(target_os = "macos")]
 use crate::screen::{self, End, Frame, Share};
 use crate::session;
 use crate::settings::Settings;
 use crate::theme::{self, ACCENT, ACCENT_BG, BG, FIELD, GREEN, HANGUP, MUTED, OFF_BG, TEXT, Tone, WHITE, rgb};
 
 use crate::ui::{Icon, icon};
+use crate::webview;
 
-/// Meet supports Safari; the default `WKWebView` agent has no browser name and gets the "unsupported" page.
+/// Meet supports Safari; the default agent of macOS's `WKWebView` has no browser name and gets the "unsupported"
+/// page. Windows' `WebView2` is Chromium and keeps its own agent. Linux has no call window: meetings open in the
+/// browser there.
+#[cfg(not(target_os = "windows"))]
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15";
 
 const TOP_BAR_HEIGHT: f32 = 44.0;
@@ -84,7 +89,8 @@ impl CallState {
 }
 
 struct CallView {
-  web: Entity<WebView>,
+  /// Empty until the webview is built.
+  web: Option<Entity<WebView>>,
   /// The meeting link as shared in the chat.
   url: String,
   code: SharedString,
@@ -93,7 +99,8 @@ struct CallView {
   _copied_reset: Option<Task<()>>,
   state: CallState,
   /// The screen share, from the macOS picker to its end, with the tasks that pass its frames and its end to
-  /// the page.
+  /// the page. Elsewhere the page shares through the webview's own `getDisplayMedia`.
+  #[cfg(target_os = "macos")]
   share: Option<(Share, Task<()>, Task<()>)>,
   _reports: Task<()>,
   _session_sync: Task<()>,
@@ -106,48 +113,50 @@ impl CallView {
     let (report_tx, report_rx) = flume::unbounded::<String>();
     // `WORKING_TRACE=1`: the page reports what a shared screen is sent as, printed below.
     let trace = std::env::var("WORKING_TRACE").is_ok_and(|value| value == "1");
-    let builder = WebViewBuilder::new()
-      .with_user_agent(USER_AGENT)
-      .with_autoplay(true)
-      .with_background_color((0x13, 0x13, 0x14, 255))
-      .with_initialization_script(if trace {
-        "window.__workingTrace = true;"
-      } else {
-        ""
-      })
-      // The page asks the app for a shared screen where the app can pick and capture one.
-      .with_initialization_script(if screen::available() {
-        "window.__workingShare = true;"
-      } else {
-        ""
-      })
-      .with_initialization_script(include_str!("call.js"))
-      .with_ipc_handler(move |request| {
-        let _ = report_tx.send(request.into_body());
-      });
-    let web = WebView::build(builder, window, cx).unwrap_or_else(|error| {
-      tracing::error!("failed to create the call webview: {error}");
-      std::process::exit(1);
-    });
-    let session_ready = session::install(web.raw());
+    let mut scripts = Vec::new();
+    if trace {
+      scripts.push("window.__workingTrace = true;");
+    }
+    // The page asks the app for a shared screen where the app can pick and capture one (the macOS picker, from
+    // macOS 14); elsewhere it keeps the webview's own capture.
+    #[cfg(target_os = "macos")]
+    if screen::available() {
+      scripts.push("window.__workingShare = true;");
+    }
+    scripts.push(include_str!("call.js"));
     // English labels: the script finds Meet's buttons by them.
     let separator = if url.contains('?') { '&' } else { '?' };
     let target = format!("{url}{separator}hl=en");
-    let web = cx.new(|_| web);
+    webview::build(
+      move |builder| {
+        #[cfg(not(target_os = "windows"))]
+        let builder = builder.with_user_agent(USER_AGENT);
+        builder
+          .with_autoplay(true)
+          .with_background_color((0x13, 0x13, 0x14, 255))
+          .with_ipc_handler(move |request| {
+            let _ = report_tx.send(request.into_body());
+          })
+      },
+      scripts,
+      None,
+      window,
+      cx,
+      move |this, web, _, cx| this.web_ready(web, target, cx),
+    );
 
     let reports = cx.spawn_in(window, async move |this, cx| {
-      // The first page load waits for the session, so Meet opens signed in.
-      let _ = session_ready.recv_async().await;
-      cx.update(|_, cx| this.update(cx, |this, cx| this.web.read(cx).raw().load_url(&target).ok()))
-        .ok();
       while let Ok(report) = report_rx.recv_async().await {
         if let Some(stats) = report.strip_prefix("stats|") {
           tracing::debug!("call stats: {stats}");
           continue;
         }
-        if let Some(capture) = report.strip_prefix("capture|") {
-          this.update(cx, |this, cx| this.on_capture(capture, cx)).ok();
-          continue;
+        #[cfg(target_os = "macos")]
+        {
+          if let Some(capture) = report.strip_prefix("capture|") {
+            this.update(cx, |this, cx| this.on_capture(capture, cx)).ok();
+            continue;
+          }
         }
         let Some(state) = CallState::parse(&report) else {
           continue;
@@ -166,7 +175,8 @@ impl CallView {
         cx.background_executor().timer(wait).await;
         wait = std::time::Duration::from_secs(30);
         let in_call = |this: &mut Self, cx: &mut Context<Self>| {
-          (this.state.phase == Phase::Call).then(|| session::read(this.web.read(cx).raw()))
+          let web = this.web.as_ref().filter(|_| this.state.phase == Phase::Call)?;
+          Some(session::read(web.read(cx).raw()))
         };
         let Ok(read) = this.update(cx, in_call) else {
           break;
@@ -199,12 +209,13 @@ impl CallView {
       voice: 0,
     };
     Self {
-      web,
+      web: None,
       url: url.to_string(),
       code: code.into(),
       copied: false,
       _copied_reset: None,
       state,
+      #[cfg(target_os = "macos")]
       share: None,
       _reports: reports,
       _session_sync: session_sync,
@@ -217,8 +228,26 @@ impl CallView {
     }
   }
 
+  /// The webview is there: the saved session goes into it, and the meeting at `target` loads once it is in, so
+  /// Meet opens signed in.
+  fn web_ready(&mut self, web: wry::Result<WebView>, target: String, cx: &mut Context<Self>) {
+    let web = web.unwrap_or_else(|error| {
+      tracing::error!("failed to create the call webview: {error}");
+      std::process::exit(1);
+    });
+    let session_ready = session::install(web.raw());
+    self.web = Some(cx.new(|_| web));
+    cx.spawn(async move |this, cx| {
+      let _ = session_ready.recv_async().await;
+      this.update(cx, |this, cx| this.with_web(|web| web.load_url(&target), cx)).ok();
+    })
+    .detach();
+    cx.notify();
+  }
+
   /// The page wants a screen to share (`pick|<request number>`), or its share is over (`stop`). What goes
   /// back to the page carries that number.
+  #[cfg(target_os = "macos")]
   fn on_capture(&mut self, request: &str, cx: &mut Context<Self>) {
     self.share = None;
     let Some(id) = request.strip_prefix("pick|").and_then(|id| id.parse::<u32>().ok()) else {
@@ -280,12 +309,17 @@ impl CallView {
 
   /// Calls one of the functions `call.js` exposes as `window.__working`.
   fn run(&self, call: &str, cx: &App) {
-    self
-      .web
-      .read(cx)
-      .raw()
-      .evaluate_script(&format!("window.__working && window.__working.{call};"))
-      .ok();
+    self.with_web(
+      |web| web.evaluate_script(&format!("window.__working && window.__working.{call};")),
+      cx,
+    );
+  }
+
+  /// Calls `f` on the webview, once it is there.
+  fn with_web(&self, f: impl FnOnce(&wry::WebView) -> wry::Result<()>, cx: &App) {
+    if let Some(web) = &self.web {
+      f(web.read(cx).raw()).ok();
+    }
   }
 
   fn control(id: &'static str, name: Icon, background: Tone) -> Stateful<Div> {
@@ -349,21 +383,13 @@ impl Render for CallView {
     let custom = state.custom;
 
     let bar = h_flex()
-      .h(px(TOP_BAR_HEIGHT))
       .w_full()
       .flex_shrink_0()
-      // Clear of the traffic lights.
-      .pl(px(84.))
+      // On macOS clear of the traffic lights.
+      .pl(px(chrome::inset(84.)))
       .pr_3()
       .gap_2()
       .items_center()
-      .on_mouse_down(MouseButton::Left, |event, window, _| {
-        if event.click_count == 2 {
-          window.titlebar_double_click();
-        } else {
-          window.start_window_move();
-        }
-      })
       .child(icon(Icon::Video, 16., ACCENT))
       .child(
         div()
@@ -377,6 +403,7 @@ impl Render for CallView {
       .child(
         div()
           .id("toggle-interface")
+          .occlude()
           .px_2()
           .rounded(px(6.))
           .bg(rgb(if custom { FIELD } else { ACCENT_BG }))
@@ -394,6 +421,7 @@ impl Render for CallView {
       .child(
         h_flex()
           .id("copy-link")
+          .occlude()
           .gap_1p5()
           .px_3()
           .py_1()
@@ -414,6 +442,7 @@ impl Render for CallView {
         let on = state.camera == Some(true);
         h_flex()
           .id("camera-switch")
+          .occlude()
           .gap_1p5()
           .px_3()
           .py_1()
@@ -475,8 +504,8 @@ impl Render for CallView {
       .size_full()
       .bg(rgb(BG))
       .font_family(theme::sans())
-      .child(bar)
-      .child(div().flex_1().min_h_0().w_full().child(self.web.clone()))
+      .child(chrome::top_bar(bar, TOP_BAR_HEIGHT))
+      .child(div().flex_1().min_h_0().w_full().children(self.web.clone()))
       .children(controls)
   }
 }
@@ -490,18 +519,13 @@ pub fn open(url: &str, cx: &mut App) {
   }
   let url = url.to_string();
   let fallback = url.clone();
-  let options = WindowOptions {
-    titlebar: Some(TitlebarOptions {
-      title: Some("Meeting".into()),
-      appears_transparent: true,
-      // The three 12px buttons, centered vertically in the top bar.
-      traffic_light_position: Some(point(px(16.), px((TOP_BAR_HEIGHT - 12.) / 2.))),
-    }),
+  let mut options = WindowOptions {
     window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1100.), px(720.)), cx))),
     window_min_size: Some(size(px(640.), px(420.))),
     ..Default::default()
   };
-  let opened = cx.open_window(options, move |window, cx| cx.new(|cx| CallView::new(&url, window, cx)));
+  chrome::set_title_bar(&mut options, "Meeting", TOP_BAR_HEIGHT);
+  let opened = open_window(options, cx, move |window, cx| cx.new(|cx| CallView::new(&url, window, cx)));
   if opened.is_err() {
     cx.open_url(&fallback);
   }

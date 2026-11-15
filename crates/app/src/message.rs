@@ -14,6 +14,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::emoji_font;
 use crate::emoji_picker;
 use crate::images::Images;
 use crate::menu::{self, MenuItem};
@@ -637,7 +638,7 @@ fn quick_reactions(msg: &Arc<Message>, core: &Core) -> Div {
           let add = !msg.reactions.iter().any(|reaction| reaction.mine && reaction.emoji == *emoji);
           react(&core, &msg.group, &msg.topic_id, &msg.id, emoji, add);
         })
-        .child(*emoji),
+        .child(emoji_font::text(*emoji)),
     );
   }
   pill
@@ -888,7 +889,11 @@ fn compact_highlights(
 
 fn marked_plain(text: &str, find: Option<&str>, current: Option<&Range<usize>>) -> AnyElement {
   let highlights = compact_highlights(text, find_highlights(text, 0..text.len(), find, current));
-  StyledText::new(text.to_string()).with_highlights(highlights).into_any_element()
+  let (highlights, fonts) = emoji_font::runs(text, highlights, Vec::new());
+  StyledText::new(text.to_string())
+    .with_highlights(highlights)
+    .with_font_family_overrides(fonts)
+    .into_any_element()
 }
 
 fn rich_text(
@@ -1087,6 +1092,7 @@ fn text_segment(
     .map(|(range, font)| (remap(range), font.clone()))
     .collect::<Vec<_>>();
   let link_ranges = link_ranges.iter().map(remap).collect::<Vec<_>>();
+  let (highlights, fonts) = emoji_font::runs(&shown, highlights, fonts);
 
   let styled = StyledText::new(shown)
     .with_highlights(highlights)
@@ -1620,7 +1626,7 @@ fn reactions_view(reactions: &[Reaction], msg: &Message, core: &Core) -> AnyElem
         .when(reaction.mine, |d| d.bg(rgb(ACCENT_BG)).border_color(rgb(ACCENT)))
         .when(!reaction.mine, |d| d.border_color(rgb(BORDER)).hover(|s| s.bg(rgb(ROW_HOVER))))
         .on_click(move |_, _, _| react(&core, &group, &topic, &id, &emoji, add))
-        .child(reaction.emoji.clone())
+        .child(emoji_font::text(reaction.emoji.clone()))
         .child(reaction.count.to_string()),
     );
   }

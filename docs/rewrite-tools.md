@@ -1,6 +1,6 @@
 # Rewrite tools
 
-The composer's Rewrite runs a coding CLI that is already installed on the Mac (`crates/app/src/rewrite.rs`). The CLI does one job: it reads the draft, applies the system prompt, and returns text. Anything else it loads costs time, can derail the answer, and puts the user's private setup into a chat message.
+The composer's Rewrite runs a coding CLI that is already installed on the computer (`crates/app/src/rewrite.rs`). The CLI does one job: it reads the draft, applies the system prompt, and returns text. Anything else it loads costs time, can derail the answer, and puts the user's private setup into a chat message.
 
 ## Rule
 

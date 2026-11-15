@@ -11,7 +11,10 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::keys;
+#[cfg(target_os = "macos")]
 use crate::notify;
+#[cfg(target_os = "macos")]
 use crate::permissions::{self, Media, Status};
 use crate::settings::{
   self, ActivityStatus, Appearance, DEFAULT_REWRITE_INSTRUCTION, Density, Layout, McpState, RewriteTool, Settings,
@@ -23,8 +26,11 @@ use crate::theme::{
 };
 use crate::ui::{Icon, icon, switch};
 
+#[cfg(target_os = "macos")]
 const CAMERA_PANE: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera";
+#[cfg(target_os = "macos")]
 const MICROPHONE_PANE: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
+#[cfg(target_os = "macos")]
 const NOTIFICATIONS_PANE: &str = "x-apple.systempreferences:com.apple.Notifications-Settings.extension";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -35,10 +41,13 @@ enum Section {
   Calls,
   Rewrite,
   Agents,
+  /// What macOS lets the app use. Other OSes keep no such list the app can read or open.
+  #[cfg(target_os = "macos")]
   Permissions,
 }
 
 impl Section {
+  #[cfg(target_os = "macos")]
   const ALL: [Self; 7] = [
     Self::Appearance,
     Self::Status,
@@ -47,6 +56,15 @@ impl Section {
     Self::Rewrite,
     Self::Agents,
     Self::Permissions,
+  ];
+  #[cfg(not(target_os = "macos"))]
+  const ALL: [Self; 6] = [
+    Self::Appearance,
+    Self::Status,
+    Self::Notifications,
+    Self::Calls,
+    Self::Rewrite,
+    Self::Agents,
   ];
 
   const fn title(self) -> &'static str {
@@ -57,6 +75,7 @@ impl Section {
       Self::Calls => "Calls",
       Self::Rewrite => "Rewrite",
       Self::Agents => "Agents",
+      #[cfg(target_os = "macos")]
       Self::Permissions => "Permissions",
     }
   }
@@ -69,6 +88,7 @@ impl Section {
       Self::Calls => Icon::Video,
       Self::Rewrite => Icon::Sparkles,
       Self::Agents => Icon::Bot,
+      #[cfg(target_os = "macos")]
       Self::Permissions => Icon::Shield,
     }
   }
@@ -102,6 +122,7 @@ impl Access {
 
 /// What macOS allows right now. `notifications` is `None` when the app runs outside its bundle, where macOS
 /// offers no notifications at all.
+#[cfg(target_os = "macos")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct Allowed {
   camera: Status,
@@ -116,6 +137,7 @@ pub enum SettingsEvent {
 pub struct SettingsView {
   core: Core,
   section: Section,
+  #[cfg(target_os = "macos")]
   allowed: Allowed,
   /// What was just copied: its button says so for a moment.
   copied: Option<Access>,
@@ -130,6 +152,7 @@ pub struct SettingsView {
   font: Entity<SelectState<SearchableVec<FontChoice>>>,
   mono_font: Entity<SelectState<SearchableVec<FontChoice>>>,
   _copied_reset: Option<Task<()>>,
+  #[cfg(target_os = "macos")]
   _refresh: Task<()>,
   _globals: [Subscription; 3],
   _rewrite_sub: Subscription,
@@ -144,6 +167,7 @@ impl SettingsView {
     // Google Chat is where the schedules live: show what it has now.
     core.send(Command::LoadDnd);
     // The user changes these in System Settings while this is open: keep the list current.
+    #[cfg(target_os = "macos")]
     let refresh = cx.spawn(async move |this, cx| {
       loop {
         let notifications = match notify::authorization().recv_async().await {
@@ -210,6 +234,7 @@ impl SettingsView {
     Self {
       core,
       section: Section::Appearance,
+      #[cfg(target_os = "macos")]
       allowed: Self::read_allowed(),
       copied: None,
       editing: None,
@@ -221,6 +246,7 @@ impl SettingsView {
       font,
       mono_font,
       _copied_reset: None,
+      #[cfg(target_os = "macos")]
       _refresh: refresh,
       _globals: [
         cx.observe_global::<McpState>(|_, cx| cx.notify()),
@@ -278,6 +304,7 @@ impl SettingsView {
   }
 
   /// Everything that can be read at once; notifications answer through a callback.
+  #[cfg(target_os = "macos")]
   fn read_allowed() -> Allowed {
     Allowed {
       camera: permissions::media(Media::Camera),
@@ -587,6 +614,7 @@ impl SettingsView {
 
   /// A line of the permissions list: its state, and a button that asks macOS or opens the right pane of
   /// System Settings.
+  #[cfg(target_os = "macos")]
   fn permission(
     id: &'static str,
     title: &'static str,
@@ -699,11 +727,11 @@ impl SettingsView {
     Self::group(
       "Fonts",
       Self::card()
-        .child(Self::row("Font", "System is the macOS system font.", true).child(field(&self.font, "font")))
+        .child(Self::row("Font", "System is the system's interface font.", true).child(field(&self.font, "font")))
         .child(
           Self::row(
             "Monospace font",
-            "Code in messages. System is the macOS monospaced font.",
+            "Code in messages. System is the system's monospaced font.",
             false,
           )
           .child(field(&self.mono_font, "mono-font")),
@@ -718,12 +746,16 @@ impl SettingsView {
         "Theme",
         Self::card()
           .child(
-            Self::row("Color mode", "System follows the macOS appearance.", true)
+            Self::row("Color mode", "System follows the system appearance.", true)
               .child(Self::appearance_picker(settings.appearance)),
           )
           .child(
-            Self::row("Dark theme", "⌘⇧T previews every theme before you pick.", false)
-              .child(Self::select_field(Select::new(&self.dark_theme).id("dark-theme"))),
+            Self::row(
+              "Dark theme",
+              format!("{} previews every theme before you pick.", keys::text("secondary-shift-t")),
+              false,
+            )
+            .child(Self::select_field(Select::new(&self.dark_theme).id("dark-theme"))),
           )
           .child(
             Self::row("Light theme", "Shown when the color mode is light.", false)
@@ -806,7 +838,10 @@ impl SettingsView {
           .child(
             Self::row(
               "Show Calendar",
-              "The Calendar button in the sidebar, the Chats header, or the rail. ⌘ 2 and the Go menu still open it.",
+              format!(
+                "The Calendar button in the sidebar, the Chats header, or the rail. {} and the Go menu still open it.",
+                keys::text("secondary-2")
+              ),
               false,
             )
             .child(
@@ -817,7 +852,10 @@ impl SettingsView {
           .child(
             Self::row(
               "Show Meet",
-              "The Meet button in the sidebar, the Chats header, or the rail. ⌘ 3 and the Go menu still open it.",
+              format!(
+                "The Meet button in the sidebar, the Chats header, or the rail. {} and the Go menu still open it.",
+                keys::text("secondary-3")
+              ),
               false,
             )
             .child(
@@ -829,27 +867,31 @@ impl SettingsView {
   }
 
   fn calls(settings: Settings) -> Div {
+    // Linux has no call window (meetings open in the browser there), so these switches do nothing on it.
+    let call_window = cfg!(not(target_os = "linux"));
     v_flex()
       .gap_5()
       .child(Self::group(
         "Meet",
         Self::card()
-          .child(
-            Self::row(
-              "Built-in Google Meet",
-              "Open meetings in Working. Off opens them in the browser.",
-              true,
+          .when(call_window, |card| {
+            card.child(
+              Self::row(
+                "Built-in Google Meet",
+                "Open meetings in Working. Off opens them in the browser.",
+                true,
+              )
+              .child(
+                Self::toggle("meet-builtin", settings.meet_builtin)
+                  .on_click(|_, _, cx| Settings::update(cx, |settings| settings.meet_builtin = !settings.meet_builtin)),
+              ),
             )
-            .child(
-              Self::toggle("meet-builtin", settings.meet_builtin)
-                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.meet_builtin = !settings.meet_builtin)),
-            ),
-          )
+          })
           .child(
             Self::row(
               "Open meetings automatically",
               "After you start a meeting, join it. Off only posts the link.",
-              false,
+              !call_window,
             )
             .child(
               Self::toggle("meet-auto-open", settings.meet_auto_open).on_click(|_, _, cx| {
@@ -858,20 +900,22 @@ impl SettingsView {
             ),
           ),
       ))
-      .child(Self::group(
-        "Camera",
-        Self::card().child(
-          Self::row(
-            "Camera always off",
-            "Calls never get the camera, and have no camera button.",
-            true,
-          )
-          .child(
-            Self::toggle("camera-off", settings.camera_off)
-              .on_click(|_, _, cx| Settings::update(cx, |settings| settings.camera_off = !settings.camera_off)),
+      .when(call_window, |calls| {
+        calls.child(Self::group(
+          "Camera",
+          Self::card().child(
+            Self::row(
+              "Camera always off",
+              "Calls never get the camera, and have no camera button.",
+              true,
+            )
+            .child(
+              Self::toggle("camera-off", settings.camera_off)
+                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.camera_off = !settings.camera_off)),
+            ),
           ),
-        ),
-      ))
+        ))
+      })
   }
 
   fn radio(selected: bool) -> Div {
@@ -920,7 +964,7 @@ impl SettingsView {
         ActivityStatus::Automatic,
         "status-automatic",
         "Automatic",
-        "Online while you use this Mac, away after 10 minutes without touching it.",
+        "Online while you use this computer, away after 10 minutes without touching it.",
       ),
       (
         ActivityStatus::AutomaticInHours,
@@ -965,11 +1009,13 @@ impl SettingsView {
       return out;
     }
     let hours = Self::card()
-      .child(Self::row("From", "Every day, in this Mac's time.", true).child(Self::stepper(
-        "hours-start",
-        settings.hours_start,
-        |minute, cx| Settings::update(cx, |settings| settings.hours_start = minute),
-      )))
+      .child(
+        Self::row("From", "Every day, in this computer's time.", true).child(Self::stepper(
+          "hours-start",
+          settings.hours_start,
+          |minute, cx| Settings::update(cx, |settings| settings.hours_start = minute),
+        )),
+      )
       .child(Self::row("To", "After this you show as away.", false).child(Self::stepper(
         "hours-end",
         settings.hours_end,
@@ -991,7 +1037,7 @@ impl SettingsView {
   fn notifications(&self, settings: Settings, cx: &mut Context<Self>) -> Div {
     let mut sounds = h_flex().flex_wrap().gap_2().py_3();
     for sound in Sound::ALL {
-      let selected = sound == settings.sound;
+      let selected = sound == settings.sound.resolved();
       sounds = sounds.child(
         div()
           .id(sound.label())
@@ -1014,6 +1060,7 @@ impl SettingsView {
           .hover(|button| button.opacity(0.85))
           .on_click(move |_, _, cx| {
             Settings::update(cx, |settings| settings.sound = sound);
+            #[cfg(target_os = "macos")]
             sound.preview();
           })
           .child(sound.label()),
@@ -1175,6 +1222,7 @@ impl SettingsView {
     )
   }
 
+  #[cfg(target_os = "macos")]
   fn permissions(&self) -> Div {
     let Allowed { camera, microphone, notifications } = self.allowed;
     let media = |media: Media, status: Status, pane: &'static str| {
@@ -1244,8 +1292,12 @@ impl SettingsView {
     let armed = self.reset_armed;
     Self::card()
       .child(
-        Self::row("Tool", "The CLI on this Mac that rewrites a draft. Off hides the button.", true)
-          .child(Self::rewrite_picker(settings.rewrite)),
+        Self::row(
+          "Tool",
+          "The CLI on this computer that rewrites a draft. Off hides the button.",
+          true,
+        )
+        .child(Self::rewrite_picker(settings.rewrite)),
       )
       .child(
         Self::row(
@@ -1326,7 +1378,7 @@ impl SettingsView {
       .child(
         Self::row(
           "MCP server",
-          "Lets AI agents on this Mac read your Google Chat through Working.",
+          "Lets AI agents on this computer read your Google Chat through Working.",
           true,
         )
         .child(
@@ -1351,13 +1403,17 @@ impl SettingsView {
     }
 
     let (color, state) = match &cx.global::<McpState>().0 {
-      McpStatus::Running { port } => (GREEN, format!("Running at http://127.0.0.1:{port}/mcp, for this Mac only.")),
+      McpStatus::Running { port } => (
+        GREEN,
+        format!("Running at http://127.0.0.1:{port}/mcp, for this computer only."),
+      ),
       McpStatus::Failed(error) => {
         let port = settings.mcp_port;
         (
           RED,
           format!(
-            "Could not listen on port {port}: {error}. Set another \"mcp_port\" in ~/.config/working/settings.json."
+            "Could not listen on port {port}: {error}. Set another \"mcp_port\" in {}.",
+            gchat_core::config_dir().join("settings.json").display()
           ),
         )
       },
@@ -1456,6 +1512,7 @@ impl Render for SettingsView {
       Section::Calls => Self::calls(settings),
       Section::Rewrite => self.rewrite(settings, cx),
       Section::Agents => self.agents(settings, cx),
+      #[cfg(target_os = "macos")]
       Section::Permissions => self.permissions(),
     };
     let content = v_flex()

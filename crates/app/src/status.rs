@@ -1,6 +1,6 @@
 //! When the user shows as online, and when notifications stay quiet: the activity status the settings ask
 //! for, turned into what the core tells Google Chat, and the do-not-disturb schedules Google Chat keeps.
-#![allow(unsafe_code, reason = "CoreGraphics idle-time FFI")]
+#![allow(unsafe_code, reason = "CoreGraphics (macOS) and Win32 (Windows) idle-time FFI")]
 
 use std::time::Duration;
 
@@ -10,17 +10,60 @@ use gpui_kit::*;
 
 use crate::settings::{ActivityStatus, Settings};
 
-/// Without a key or pointer event for this long, the user is not at the Mac (as Slack counts it).
+/// Without a key or pointer event for this long, the user is not at the computer (as Slack counts it).
 const IDLE_AFTER_SECS: f64 = 600.;
 
+#[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
   fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
 }
 
+#[cfg(target_os = "macos")]
 fn idle() -> bool {
   // SAFETY: a plain C call. 0 is the combined session state, all bits set is "any input event".
   unsafe { CGEventSourceSecondsSinceLastEventType(0, u32::MAX) >= IDLE_AFTER_SECS }
+}
+
+/// The X server's screen-saver extension, which counts the time since the last input of the whole session (the app
+/// runs on X11, see `main.rs`). Not idle when there is no X display or no such extension.
+#[cfg(target_os = "linux")]
+fn idle() -> bool {
+  use std::sync::LazyLock;
+
+  use x11rb::connection::Connection as _;
+  use x11rb::protocol::screensaver::ConnectionExt as _;
+  use x11rb::rust_connection::RustConnection;
+
+  /// The connection and the root window of its first screen, opened once.
+  static DISPLAY: LazyLock<Option<(RustConnection, u32)>> = LazyLock::new(|| {
+    let (connection, screen) = x11rb::connect(None).ok()?;
+    let root = connection.setup().roots.get(screen)?.root;
+    Some((connection, root))
+  });
+  let Some((connection, root)) = &*DISPLAY else {
+    return false;
+  };
+  connection
+    .screensaver_query_info(*root)
+    .ok()
+    .and_then(|cookie| cookie.reply().ok())
+    .is_some_and(|info| f64::from(info.ms_since_user_input) / 1000. >= IDLE_AFTER_SECS)
+}
+
+#[cfg(target_os = "windows")]
+fn idle() -> bool {
+  use windows_sys::Win32::System::SystemInformation::GetTickCount;
+  use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
+
+  let mut info = LASTINPUTINFO {
+    cbSize: size_of::<LASTINPUTINFO>() as u32,
+    dwTime: 0,
+  };
+  // SAFETY: `info` is a live LASTINPUTINFO with its size set, as the call requires; GetTickCount takes nothing.
+  let (read, now) = unsafe { (GetLastInputInfo(&raw mut info), GetTickCount()) };
+  // Both are milliseconds since boot that wrap after 49.7 days, so the wrapping difference is the idle time.
+  read != 0 && f64::from(now.wrapping_sub(info.dwTime)) / 1000. >= IDLE_AFTER_SECS
 }
 
 fn now_minute() -> u16 {

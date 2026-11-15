@@ -12,14 +12,18 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_webview::WebView;
-use wry::{NewWindowResponse, PageLoadEvent, WebViewBuilder};
+use wry::{NewWindowResponse, PageLoadEvent};
 
+use crate::chrome;
 use crate::root::TOP_BAR_HEIGHT;
 use crate::session;
 use crate::store::Store;
 use crate::theme::{ACCENT, ACCENT_BG, BG, FIELD, MUTED, TEXT, is_light, rgb};
+use crate::webview;
 
-/// Meet and Google account pages accept Safari; a Chrome UA in `WKWebView` is often refused.
+/// Meet and Google account pages accept Safari; a Chrome UA in a `WebKit` view (macOS `WKWebView`, Linux `WebKitGTK`)
+/// is often refused. Windows' `WebView2` is Chromium and keeps its own agent.
+#[cfg(not(target_os = "windows"))]
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15";
 const LOGIN_URL: &str = "https://accounts.google.com/ServiceLogin?continue=https://chat.google.com/&hl=en";
 
@@ -72,13 +76,13 @@ impl WelcomeView {
     }
   }
 
-  fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+  fn start(&mut self, window: &Window, cx: &mut Context<Self>) {
     if self.saving || self.phase == Phase::SignIn {
       return;
     }
     self.error = None;
     self.phase = Phase::SignIn;
-    self.open_login(window, cx);
+    Self::open_login(window, cx);
     cx.notify();
   }
 
@@ -92,41 +96,63 @@ impl WelcomeView {
     cx.notify();
   }
 
-  fn open_login(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+  fn open_login(window: &Window, cx: &mut Context<Self>) {
     let (nav_tx, nav_rx) = flume::unbounded::<Nav>();
     let (r, g, b) = if is_light() {
       (0xf0, 0xf4, 0xf9)
     } else {
       (0x13, 0x13, 0x14)
     };
-    let builder = WebViewBuilder::new()
-      .with_user_agent(USER_AGENT)
-      .with_background_color((r, g, b, 255))
-      .with_navigation_handler(|url| url.starts_with("https://") || url.starts_with("about:"))
-      .with_on_page_load_handler({
-        let nav_tx = nav_tx.clone();
-        move |event, url| {
-          if matches!(event, PageLoadEvent::Finished) {
-            let _ = nav_tx.send(Nav::Loaded(url));
-          }
-        }
-      })
-      .with_new_window_req_handler(move |url, _| {
-        let _ = nav_tx.send(Nav::Open(url));
-        NewWindowResponse::Deny
-      })
-      .with_url(LOGIN_URL);
-    let web = match WebView::build(builder, window, cx) {
+    webview::build(
+      move |builder| {
+        #[cfg(not(target_os = "windows"))]
+        let builder = builder.with_user_agent(USER_AGENT);
+        builder
+          .with_background_color((r, g, b, 255))
+          .with_navigation_handler(|url| url.starts_with("https://") || url.starts_with("about:"))
+          .with_on_page_load_handler({
+            let nav_tx = nav_tx.clone();
+            move |event, url| {
+              if matches!(event, PageLoadEvent::Finished) {
+                let _ = nav_tx.send(Nav::Loaded(url));
+              }
+            }
+          })
+          .with_new_window_req_handler(move |url, _| {
+            let _ = nav_tx.send(Nav::Open(url));
+            NewWindowResponse::Deny
+          })
+      },
+      Vec::new(),
+      Some(LOGIN_URL.to_owned()),
+      window,
+      cx,
+      move |this, web, window, cx| this.login_ready(web, nav_rx, window, cx),
+    );
+  }
+
+  fn login_ready(
+    &mut self,
+    web: wry::Result<WebView>,
+    nav_rx: flume::Receiver<Nav>,
+    window: &Window,
+    cx: &mut Context<Self>,
+  ) {
+    // Cancelled meanwhile, or a page from an earlier start is already there.
+    if self.phase != Phase::SignIn || self.web.is_some() {
+      return;
+    }
+    let web = match web {
       Ok(web) => web,
       Err(error) => {
         tracing::error!("failed to open the sign-in page: {error}");
         self.phase = Phase::Welcome;
         self.error = Some("Couldn't open the sign-in page.".into());
+        cx.notify();
         return;
       },
     };
-    let web = cx.new(|_| web);
-    self.web = Some(web);
+    self.web = Some(cx.new(|_| web));
     self._nav = Some(cx.spawn_in(window, async move |this, cx| {
       while let Ok(nav) = nav_rx.recv_async().await {
         let cont = this.update(cx, |this, cx| match nav {
@@ -148,6 +174,7 @@ impl WelcomeView {
         }
       }
     }));
+    cx.notify();
   }
 
   fn capture(&mut self, cx: &mut Context<Self>) {
@@ -191,23 +218,15 @@ impl WelcomeView {
     }));
   }
 
-  fn bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+  fn bar(&self, cx: &mut Context<Self>) -> AnyElement {
     let signing = self.phase == Phase::SignIn;
-    h_flex()
+    let row = h_flex()
       .id("welcome-bar")
-      .h(px(TOP_BAR_HEIGHT))
       .w_full()
       .flex_shrink_0()
-      .pl(px(92.))
+      .pl(px(chrome::inset(92.)))
       .pr_4()
       .items_center()
-      .on_mouse_down(MouseButton::Left, |event, window, _| {
-        if event.click_count == 2 {
-          window.titlebar_double_click();
-        } else {
-          window.start_window_move();
-        }
-      })
       .child(
         div()
           .text_size(px(15.))
@@ -220,6 +239,7 @@ impl WelcomeView {
         bar.child(
           div()
             .id("welcome-cancel")
+            .occlude()
             .px_3()
             .h(px(28.))
             .flex()
@@ -233,7 +253,8 @@ impl WelcomeView {
             .on_click(cx.listener(|this, _, _, cx| this.cancel(cx)))
             .child("Cancel"),
         )
-      })
+      });
+    chrome::top_bar(row, TOP_BAR_HEIGHT)
   }
 
   fn welcome_body(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -255,7 +276,12 @@ impl WelcomeView {
           .text_color(rgb(TEXT))
           .child("Working"),
       )
-      .child(div().text_size(px(14.)).text_color(rgb(MUTED)).child("Google Chat on your Mac"))
+      .child(
+        div()
+          .text_size(px(14.))
+          .text_color(rgb(MUTED))
+          .child("Google Chat on your desktop"),
+      )
       .child(
         div()
           .id("sign-in")

@@ -1,4 +1,7 @@
-//! Working: native macOS Google Chat client.
+//! Working: native Google Chat client for macOS, Linux, and Windows.
+// The release build is a GUI program on Windows, so no console window opens beside it; `console::attach` hands its
+// log to the terminal it was started from.
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 #![allow(
   clippy::unreadable_literal,
   clippy::needless_pass_by_ref_mut,
@@ -30,16 +33,30 @@
 mod calendar;
 mod calendar_grid;
 mod calendar_layout;
+#[cfg(not(target_os = "linux"))]
 mod call;
+/// `WebKitGTK` as Fedora builds it has no WebRTC (`RTCPeerConnection` stays undefined with the setting on), so a
+/// call window could never join: on Linux a meeting opens in the default browser.
+#[cfg(target_os = "linux")]
+mod call {
+  pub fn open(url: &str, cx: &mut gpui_kit::App) {
+    cx.open_url(url);
+  }
+}
+mod chrome;
 mod completion;
+#[cfg(target_os = "windows")]
+mod console;
 mod conv_list;
 mod conversation;
+mod emoji_font;
 mod emoji_picker;
 mod event_card;
 mod event_editor;
 mod format_logic;
 mod home;
 mod images;
+mod keys;
 mod meet;
 mod meet_body;
 mod meet_logic;
@@ -47,11 +64,13 @@ mod menu;
 mod message;
 mod new_chat;
 mod notify;
+#[cfg(target_os = "macos")]
 mod permissions;
 mod rail;
 mod receipt_logic;
 mod rewrite;
 mod root;
+#[cfg(target_os = "macos")]
 mod screen;
 mod session;
 mod settings;
@@ -69,34 +88,32 @@ mod ui;
 mod updater;
 mod util;
 mod viewer;
+mod webview;
 mod welcome;
 
 use gchat_core::Core;
 use gpui_kit::assets::Assets;
 use gpui_kit::component::TitleBar;
-use gpui_kit::component::input::Escape;
 use gpui_kit::*;
 
-use crate::conversation::{FormatBold, FormatBulletedList, FormatItalic, FormatStrikethrough};
 use crate::images::Images;
-use crate::root::{
-  FindInChat, FindNext, FindPrevious, GoBack, GoForward, GoHome, Hide, HideOthers, Minimize, NextConversation,
-  NextUnread, OpenSettings, OpenSwitcher, OpenThemePicker, PreviousConversation, Quit, RewriteDraft, RootView, ShowAll,
-  TOP_BAR_HEIGHT, ToggleSidebar, Zoom, menus,
-};
+use crate::root::{Quit, RootView, TOP_BAR_HEIGHT};
 use crate::settings::Settings;
 use crate::store::Store;
 
 /// What it takes to bring the main window back: the window itself, and what a new one is made from.
+#[cfg(target_os = "macos")]
 struct Main {
   window: AnyWindowHandle,
   core: Core,
   store: Entity<Store>,
 }
 
+#[cfg(target_os = "macos")]
 impl Global for Main {}
 
 /// A click on the Dock icon: the main window comes forward, or opens again after it was closed.
+#[cfg(target_os = "macos")]
 fn reopen(cx: &mut App) {
   let Some(main) = cx.try_global::<Main>() else {
     return;
@@ -112,6 +129,11 @@ fn reopen(cx: &mut App) {
 }
 
 fn main() {
+  #[cfg(target_os = "windows")]
+  {
+    console::attach();
+    notify::set_app_id();
+  }
   let filter = if std::env::var("WORKING_TRACE").is_ok_and(|value| value == "1") {
     "debug"
   } else {
@@ -123,10 +145,18 @@ fn main() {
     .try_init();
   let _ = std::fs::remove_dir_all(conversation::pasted_dir());
   let core = Core::start();
+  // The webviews (sign-in and Meet) are WebKitGTK, which runs on X11 only: a Wayland session runs the app through
+  // XWayland.
+  #[cfg(target_os = "linux")]
+  let app = gpui_kit::platform::linux(WindowingModes::X11).with_assets(Assets);
+  #[cfg(not(target_os = "linux"))]
   let app = application().with_assets(Assets);
+  #[cfg(target_os = "macos")]
   app.on_reopen(reopen);
   app.run(move |cx| {
     init(cx);
+    #[cfg(target_os = "linux")]
+    emoji_font::register(cx);
     cx.set_global(Settings::load());
     settings::apply_appearance(cx);
     settings::keep_mcp(core.clone(), cx);
@@ -134,76 +164,47 @@ fn main() {
     status::keep_presence(core.clone(), cx);
     cx.set_global(status::Mine::default());
 
-    cx.bind_keys([
-      KeyBinding::new("cmd-k", OpenSwitcher, None),
-      KeyBinding::new("cmd-shift-t", OpenThemePicker, None),
-      KeyBinding::new("cmd-n", crate::new_chat::OpenNewChat, None),
-      KeyBinding::new("cmd-1", GoHome, None),
-      KeyBinding::new("cmd-2", crate::calendar::OpenCalendar, None),
-      KeyBinding::new("cmd-3", crate::meet::OpenMeet, None),
-      // Safari's pair. The kit's text field binds the same keys to outdent and indent, which a chat composer has
-      // no use for: binding them again in its "Input" context, after `init`, takes them back.
-      KeyBinding::new("cmd-[", GoBack, None),
-      KeyBinding::new("cmd-]", GoForward, None),
-      KeyBinding::new("cmd-[", GoBack, Some("Input")),
-      KeyBinding::new("cmd-]", GoForward, Some("Input")),
-      // Between conversations, in the order the layout lists them. The Go menu shows the first key of each.
-      KeyBinding::new("alt-cmd-down", NextConversation, None),
-      KeyBinding::new("alt-cmd-up", PreviousConversation, None),
-      KeyBinding::new("ctrl-tab", NextConversation, None),
-      KeyBinding::new("ctrl-shift-tab", PreviousConversation, None),
-      KeyBinding::new("shift-alt-cmd-down", NextUnread, None),
-      KeyBinding::new("ctrl-cmd-s", ToggleSidebar, None),
-      // The kit's text field takes alt-cmd-up and alt-cmd-down to add a cursor: binding them again in its "Input"
-      // context, after `init`, takes them back, and the other conversation keys work in a composer too.
-      KeyBinding::new("alt-cmd-down", NextConversation, Some("Input")),
-      KeyBinding::new("alt-cmd-up", PreviousConversation, Some("Input")),
-      KeyBinding::new("ctrl-tab", NextConversation, Some("Input")),
-      KeyBinding::new("ctrl-shift-tab", PreviousConversation, Some("Input")),
-      KeyBinding::new("shift-alt-cmd-down", NextUnread, Some("Input")),
-      // The auto-hide sidebar's overlay is open (the root takes the "Overlay" context): Escape closes it even when
-      // no text field has the keyboard.
-      KeyBinding::new("escape", Escape, Some("Overlay")),
-      // The event editor closes on Escape from any of its controls, not only its text fields.
-      KeyBinding::new("escape", Escape, Some("EventEditor")),
-      KeyBinding::new("cmd-,", OpenSettings, None),
-      KeyBinding::new("cmd-shift-r", RewriteDraft, None),
-      // Formatting a draft, with Google Chat's keys. In the kit's "Input" context, so they are live while a text field
-      // has the keyboard; the conversation takes them only from its composers. macOS delivers Shift+8 as the key `*`
-      // with the shift folded into it, so that is how the bulleted list's key is written.
-      KeyBinding::new("cmd-b", FormatBold, Some("Input")),
-      KeyBinding::new("cmd-i", FormatItalic, Some("Input")),
-      KeyBinding::new("cmd-shift-x", FormatStrikethrough, Some("Input")),
-      KeyBinding::new("cmd-*", FormatBulletedList, Some("Input")),
-      KeyBinding::new("cmd-f", FindInChat, None),
-      KeyBinding::new("cmd-g", FindNext, None),
-      KeyBinding::new("cmd-shift-g", FindPrevious, None),
-      KeyBinding::new("cmd-q", Quit, None),
-      KeyBinding::new("cmd-h", Hide, None),
-      KeyBinding::new("alt-cmd-h", HideOthers, None),
-      KeyBinding::new("cmd-m", Minimize, None),
-    ]);
+    keys::bind(cx);
     cx.on_action(|_: &Quit, cx| cx.quit());
-    cx.on_action(|_: &Hide, cx| cx.hide());
-    cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
-    cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
-    cx.on_action(|_: &Minimize, cx| {
-      if let Some(window) = cx.active_window() {
-        let _ = window.update(cx, |_, window, _| window.minimize_window());
-      }
-    });
-    cx.on_action(|_: &Zoom, cx| {
-      if let Some(window) = cx.active_window() {
-        let _ = window.update(cx, |_, window, _| window.zoom_window());
-      }
-    });
-    cx.set_menus(menus());
+    #[cfg(target_os = "macos")]
+    {
+      use crate::root::{Hide, HideOthers, Minimize, ShowAll, Zoom, menus};
+      cx.on_action(|_: &Hide, cx| cx.hide());
+      cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
+      cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
+      cx.on_action(|_: &Minimize, cx| {
+        if let Some(window) = cx.active_window() {
+          let _ = window.update(cx, |_, window, _| window.minimize_window());
+        }
+      });
+      cx.on_action(|_: &Zoom, cx| {
+        if let Some(window) = cx.active_window() {
+          let _ = window.update(cx, |_, window, _| window.zoom_window());
+        }
+      });
+      // Only macOS has a menu bar of its own: elsewhere the main window's top bar has a button with these menus.
+      cx.set_menus(menus());
+    }
     updater::start(cx);
 
     let images = Images::new(core.clone(), cx);
     let store = cx.new(|_| Store::new(core.clone(), images));
-    let window = open_main(core.clone(), store.clone(), cx);
-    cx.set_global(Main { window, core, store });
+    #[cfg(target_os = "macos")]
+    {
+      let window = open_main(core.clone(), store.clone(), cx);
+      cx.set_global(Main { window, core, store });
+    }
+    // Only macOS brings a closed main window back (from the Dock): elsewhere closing it quits.
+    #[cfg(not(target_os = "macos"))]
+    {
+      let window = open_main(core, store, cx);
+      cx.on_window_closed(move |cx, closed| {
+        if closed == window.window_id() {
+          cx.quit();
+        }
+      })
+      .detach();
+    }
     // `Working https://meet.google.com/<code>` also opens that meeting.
     if let Some(url) = std::env::args()
       .nth(1)
@@ -217,12 +218,7 @@ fn main() {
 
 fn open_main(core: Core, store: Entity<Store>, cx: &mut App) -> AnyWindowHandle {
   let mut options = TitleBar::window_options();
-  options.titlebar = Some(TitlebarOptions {
-    title: Some("Working".into()),
-    appears_transparent: true,
-    // The three 12px buttons, centered vertically in the top bar.
-    traffic_light_position: Some(point(px(16.), px((TOP_BAR_HEIGHT - 12.) / 2.))),
-  });
+  chrome::set_title_bar(&mut options, "Working", TOP_BAR_HEIGHT);
   options.window_bounds = Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(800.)), cx)));
   options.window_min_size = Some(size(px(800.), px(500.)));
   open_window(options, cx, |window, cx| cx.new(|cx| RootView::new(core, store, window, cx)))

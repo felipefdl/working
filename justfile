@@ -63,21 +63,42 @@ login:
   ./scripts/login.sh
 
 # Build optimized, wrap as Working.app, and open it.
+[macos]
 run:
   ./scripts/bundle.sh
   open target/release/Working.app
 
+# Build optimized and run the binary.
+[linux]
+run:
+  cargo build --release -p working
+  target/release/working
+
 # Run without writing to the account: no sends, read marks, reactions, or typing notices.
+[macos]
 run-readonly:
   ./scripts/bundle.sh
   WORKING_READONLY=1 target/release/Working.app/Contents/MacOS/Working
 
+# Run without writing to the account: no sends, read marks, reactions, or typing notices.
+[linux]
+run-readonly:
+  cargo build --release -p working
+  WORKING_READONLY=1 target/release/working
+
 # Run with a made-up workspace instead of a Google account: no sign-in, no network, no real cache or settings.
+[macos]
 demo:
   ./scripts/bundle.sh
   WORKING_DEMO=1 target/release/Working.app/Contents/MacOS/Working
 
-# Rebuild the top-bar logo (needs resvg) and the README icon (needs Xcode).
+# Run with a made-up workspace instead of a Google account: no sign-in, no network, no real cache or settings.
+[linux]
+demo:
+  cargo build --release -p working
+  WORKING_DEMO=1 target/release/working
+
+# Rebuild the top-bar logo (needs resvg), the README icon (needs Xcode), and the Windows icon (needs ImageMagick).
 logo:
   ./scripts/logo.sh
 
@@ -85,9 +106,9 @@ logo:
 probe seconds="20":
   WORKING_READONLY=1 WORKING_TRACE=1 cargo run -p gchat-core --example probe -- {{seconds}}
 
-# Bump the version, commit, tag, and push. The tag runs .github/workflows/publish.yml: build, sign, notarize, write
-# the notes from the commits, publish the release, and update the Homebrew cask. A version with a "-" (0.0.7-rc1)
-# becomes a draft prerelease instead, with no cask update.
+# Bump the version, commit, tag, and push. The tag runs .github/workflows/publish.yml: build and sign for macOS,
+# Linux, and Windows, notarize the Mac build, write the notes from the commits, publish the release, and update the
+# Homebrew cask. A version with a "-" (0.0.7-rc1) becomes a draft prerelease instead, with no cask update.
 release version:
   #!/usr/bin/env bash
   set -euo pipefail
@@ -103,7 +124,9 @@ release version:
     echo "commit or stash changes first" >&2
     exit 1
   fi
-  sed -i '' 's/^version = "[^"]*"/version = "{{version}}"/' Cargo.toml
+  # -i with a suffix reads the same to BSD and GNU sed.
+  sed -i.bak 's/^version = "[^"]*"/version = "{{version}}"/' Cargo.toml
+  rm Cargo.toml.bak
   cargo update -w
   git add Cargo.toml Cargo.lock
   git commit -m "chore(release): v{{version}}"

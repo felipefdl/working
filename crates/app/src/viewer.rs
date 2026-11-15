@@ -13,12 +13,12 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_webview::WebView;
-use wry::WebViewBuilder;
 
 use crate::images::{self, Images};
 use crate::menu::{self, MenuItem};
 use crate::theme::{ACCENT, ACCENT_BG, BORDER, MUTED, PANEL, ROW_HOVER, TEXT, WHITE, rgb};
 use crate::ui::{Icon, icon};
+use crate::webview;
 
 /// Same height as the top bar, so the name sits beside the traffic lights.
 const TOOLBAR_HEIGHT: f32 = crate::root::TOP_BAR_HEIGHT;
@@ -200,10 +200,7 @@ pub fn copy_image(core: &Core, att: &Attachment, cx: &mut App) {
 
 /// Asks where to save with the native panel (named after the attachment), then writes the file.
 pub fn save_attachment(core: &Core, att: &Attachment, cx: &mut App) {
-  let downloads = std::env::var_os("HOME")
-    .map(PathBuf::from)
-    .unwrap_or_default()
-    .join("Downloads");
+  let downloads = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_default();
   let name = if att.name.is_empty() {
     "attachment".to_string()
   } else {
@@ -392,8 +389,9 @@ enum FileState {
   Info {
     len: u64,
   },
+  /// `web` is empty until the webview is built.
   Preview {
-    web: Entity<WebView>,
+    web: Option<Entity<WebView>>,
     _escape: Task<()>,
   },
 }
@@ -471,7 +469,7 @@ impl Viewer {
     let Some(open) = self.state.take() else {
       return;
     };
-    if let Body::File(FileState::Preview { web, .. }) = &open.body {
+    if let Body::File(FileState::Preview { web: Some(web), .. }) = &open.body {
       let raw = web.read(cx).raw();
       raw.evaluate_script("document.querySelectorAll('video,audio').forEach(function(m){m.pause();m.removeAttribute('src');m.load();});").ok();
       raw.load_url("about:blank").ok();
@@ -587,13 +585,7 @@ impl Viewer {
         open.temp = Some(path.clone());
         match classify(&open.att) {
           Class::Other => FileState::Info { len },
-          class => match self.preview(&path, len, class, window, cx) {
-            Ok(state) => state,
-            Err(err) => {
-              tracing::warn!("web view preview failed: {err}");
-              FileState::Info { len }
-            },
-          },
+          class => self.preview(&path, len, class, window, cx),
         }
       },
     };
@@ -603,17 +595,13 @@ impl Viewer {
     cx.notify();
   }
 
-  fn preview(
-    &self,
-    path: &Path,
-    len: u64,
-    class: Class,
-    window: &mut Window,
-    cx: &mut Context<Self>,
-  ) -> Result<FileState, String> {
+  /// Starts building the preview's webview; the state stays a preview without one until it is there, or becomes
+  /// `Info` when it cannot be built.
+  fn preview(&self, path: &Path, len: u64, class: Class, window: &Window, cx: &mut Context<Self>) -> FileState {
     let Some(open) = &self.state else {
-      return Err("closed".into());
+      return FileState::Info { len };
     };
+    let generation = open.generation;
     let page = match class {
       Class::Video | Class::Audio => Some(media_page(class)),
       _ => None,
@@ -624,26 +612,58 @@ impl Viewer {
       "media://localhost/media"
     };
     let (escape_tx, escape_rx) = flume::unbounded::<()>();
-    let builder = WebViewBuilder::new()
-      .with_autoplay(true)
-      .with_background_color((0, 0, 0, 255))
-      .with_custom_protocol("media".into(), serve(path.to_path_buf(), len, content_type(&open.att), page))
-      .with_initialization_script(
+    let serve = serve(path.to_path_buf(), len, content_type(&open.att), page);
+    webview::build(
+      move |builder| {
+        builder
+          .with_autoplay(true)
+          .with_background_color((0, 0, 0, 255))
+          .with_custom_protocol("media".into(), serve)
+          .with_ipc_handler(move |_| {
+            let _ = escape_tx.send(());
+          })
+      },
+      vec![
         "window.addEventListener('keydown',function(e){if(e.key==='Escape'){window.ipc.postMessage('close');}},true);",
-      )
-      .with_ipc_handler(move |_| {
-        let _ = escape_tx.send(());
-      })
-      .with_url(url);
-    let web = WebView::build(builder, window, cx).map_err(|err| err.to_string())?;
-    web.set_theme(wry::Theme::Dark).ok();
-    let web = cx.new(|_| web);
+      ],
+      Some(url.to_owned()),
+      window,
+      cx,
+      move |this, web, _, cx| this.preview_ready(generation, len, web, cx),
+    );
     let escape = cx.spawn_in(window, async move |this, cx| {
       while escape_rx.recv_async().await.is_ok() {
         cx.update(|window, cx| this.update(cx, |this, cx| this.close(window, cx))).ok();
       }
     });
-    Ok(FileState::Preview { web, _escape: escape })
+    FileState::Preview { web: None, _escape: escape }
+  }
+
+  fn preview_ready(&mut self, generation: u64, len: u64, web: wry::Result<WebView>, cx: &mut Context<Self>) {
+    let Some(Open {
+      generation: current,
+      body: Body::File(state @ FileState::Preview { web: None, .. }),
+      ..
+    }) = &mut self.state
+    else {
+      return;
+    };
+    if *current != generation {
+      return;
+    }
+    match web {
+      Ok(web) => {
+        web.set_theme(wry::Theme::Dark).ok();
+        if let FileState::Preview { web: slot, .. } = state {
+          *slot = Some(cx.new(|_| web));
+        }
+      },
+      Err(err) => {
+        tracing::warn!("web view preview failed: {err}");
+        *state = FileState::Info { len };
+      },
+    }
+    cx.notify();
   }
 
   // Zoom.
@@ -1061,7 +1081,7 @@ impl Viewer {
         };
         centered(card(format!("{mime} · {}\nNo preview available.", human_size(*len)), true)).into_any_element()
       },
-      FileState::Preview { web, .. } => div().size_full().child(web.clone()).into_any_element(),
+      FileState::Preview { web, .. } => div().size_full().children(web.clone()).into_any_element(),
     };
     let backdrop_close = !matches!(state, FileState::Preview { .. });
     div()

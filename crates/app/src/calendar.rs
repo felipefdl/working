@@ -718,6 +718,11 @@ pub fn round_button(id: &'static str, glyph: Icon) -> Stateful<Div> {
 
 /// An outlined button with a label.
 pub fn pill(id: &'static str) -> Stateful<Div> {
+  idle_pill(id).cursor_pointer().hover(|style| style.bg(rgb(ROW_HOVER)))
+}
+
+/// The pill's shape alone, with no pointer or hover: for one that cannot be pressed yet.
+pub fn idle_pill(id: &'static str) -> Stateful<Div> {
   h_flex()
     .id(id)
     .h(px(32.))
@@ -729,8 +734,6 @@ pub fn pill(id: &'static str) -> Stateful<Div> {
     .border_color(rgb(BORDER))
     .text_size(px(13.))
     .text_color(rgb(TEXT))
-    .cursor_pointer()
-    .hover(|style| style.bg(rgb(ROW_HOVER)))
 }
 
 impl Render for CalendarView {

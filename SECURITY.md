@@ -1,10 +1,10 @@
 # Security Policy
 
-Working holds a Google Chat web session on this Mac. Treat the machine and the files under `~/.config/working` as the account.
+Working holds a Google Chat web session on this computer. Treat the machine and the files in its settings folder (`~/.config/working` on macOS, `$XDG_CONFIG_HOME/working` on Linux, `%APPDATA%\working` on Windows) as the account.
 
 ## Trust model
 
-- Session cookies live in `~/.config/working/cookies.json` (mode `0600`). The MCP secret lives in `~/.config/working/mcp-token`.
+- Session cookies live in `cookies.json` in that folder (mode `0600` on macOS and Linux; on Windows it takes the access list of the user's profile). The MCP secret lives in `mcp-token` beside it. The in-app web views keep their own cookie stores too (on Windows in `%LOCALAPPDATA%\dev.felipefdl.working\WebView2`).
 - The app speaks Google Chat as the signed-in user. Sends, read marks, reactions, typing, presence, and DND writes change that account unless `WORKING_READONLY=1`.
 - MCP listens on loopback only. A local agent that has the token can read chat, and can send when sending is enabled in Settings.
 

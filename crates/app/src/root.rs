@@ -7,13 +7,23 @@ use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(not(target_os = "macos"))]
+use gpui_kit::component::button::{Button, ButtonCustomVariant, ButtonVariants as _};
+#[cfg(not(target_os = "macos"))]
+use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+#[cfg(not(target_os = "macos"))]
+use std::cell::RefCell;
+#[cfg(not(target_os = "macos"))]
+use std::rc::Rc;
 
 use crate::calendar::{CalendarView, OpenCalendar};
+use crate::chrome;
 use crate::conv_list::ConvList;
+use crate::emoji_font;
 use crate::emoji_picker::{EmojiHandle, EmojiPicker};
 use crate::home::HomeView;
 use crate::meet::{MeetEvent, MeetView, OpenMeet};
@@ -43,11 +53,6 @@ actions!(
     OpenSettings,
     GoHome,
     Quit,
-    Hide,
-    HideOthers,
-    ShowAll,
-    Minimize,
-    Zoom,
     RewriteDraft,
     FindInChat,
     FindNext,
@@ -61,7 +66,12 @@ actions!(
   ]
 );
 
-/// Height of the top bar. The traffic lights are centered in it (see `main.rs`).
+// The app and window commands of the macOS menu bar. Elsewhere the title bar has the window's buttons, and hiding apps
+// is not there (Windows' platform panics on it).
+#[cfg(target_os = "macos")]
+actions!(working, [Hide, HideOthers, ShowAll, Minimize, Zoom]);
+
+/// Height of the top bar. On macOS the traffic lights are centered in it (see `chrome::set_title_bar`).
 pub const TOP_BAR_HEIGHT: f32 = 52.0;
 
 /// How long the floating sidebar takes to come in or go away, as gpui-kit's own sidebar does.
@@ -83,22 +93,30 @@ const HOT_ZONE_WIDTH: f32 = 12.0;
 /// Width of the grab area on a column's inner edge.
 const RESIZE_HANDLE_WIDTH: f32 = 8.0;
 
-/// The application menu in the macOS menu bar.
+/// The application menus: the macOS menu bar, and on Linux and Windows the submenus of the top bar's menu button.
 pub fn menus() -> Vec<Menu> {
-  vec![
+  let mut app = vec![
+    MenuItem::action("Settings...", OpenSettings),
+    MenuItem::action("Color Theme…", OpenThemePicker),
+    MenuItem::separator(),
+  ];
+  #[cfg(target_os = "macos")]
+  app.extend([
+    MenuItem::action("Hide Working", Hide),
+    MenuItem::action("Hide Others", HideOthers),
+    MenuItem::action("Show All", ShowAll),
+    MenuItem::separator(),
+  ]);
+  app.push(MenuItem::action("Quit Working", Quit));
+  #[cfg_attr(
+    not(target_os = "macos"),
+    expect(unused_mut, reason = "only macOS adds the Window menu")
+  )]
+  let mut menus = vec![
     Menu {
       name: "Working".into(),
       disabled: false,
-      items: vec![
-        MenuItem::action("Settings...", OpenSettings),
-        MenuItem::action("Color Theme…", OpenThemePicker),
-        MenuItem::separator(),
-        MenuItem::action("Hide Working", Hide),
-        MenuItem::action("Hide Others", HideOthers),
-        MenuItem::action("Show All", ShowAll),
-        MenuItem::separator(),
-        MenuItem::action("Quit Working", Quit),
-      ],
+      items: app,
     },
     Menu {
       name: "Edit".into(),
@@ -142,12 +160,43 @@ pub fn menus() -> Vec<Menu> {
         MenuItem::action("Next Unread", NextUnread),
       ],
     },
-    Menu {
-      name: "Window".into(),
-      disabled: false,
-      items: vec![MenuItem::action("Minimize", Minimize), MenuItem::action("Zoom", Zoom)],
-    },
-  ]
+  ];
+  #[cfg(target_os = "macos")]
+  menus.push(Menu {
+    name: "Window".into(),
+    disabled: false,
+    items: vec![MenuItem::action("Minimize", Minimize), MenuItem::action("Zoom", Zoom)],
+  });
+  menus
+}
+
+/// Off macOS: `items` added to `popup`, a submenu as a submenu beside it. The system menus are macOS's alone.
+#[cfg(not(target_os = "macos"))]
+fn fill_menu(
+  mut popup: PopupMenu,
+  items: &[OwnedMenuItem],
+  window: &mut Window,
+  cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+  for item in items {
+    popup = match item {
+      OwnedMenuItem::Action { name, action, checked, disabled, .. } => popup.item(
+        PopupMenuItem::new(name.clone())
+          .action(action.boxed_clone())
+          .checked(*checked)
+          .disabled(*disabled),
+      ),
+      OwnedMenuItem::Separator => popup.separator(),
+      OwnedMenuItem::Submenu(menu) => {
+        let items = menu.items.clone();
+        popup.submenu(menu.name.clone(), window, cx, move |popup, window, cx| {
+          fill_menu(popup, &items, window, cx)
+        })
+      },
+      OwnedMenuItem::SystemMenu(_) => popup,
+    };
+  }
+  popup
 }
 
 pub struct RootView {
@@ -163,6 +212,10 @@ pub struct RootView {
   focus: FocusHandle,
   /// The top-bar mark, for the dark look and for the light one.
   logo: [Arc<Image>; 2],
+  /// Off macOS, where the system has no menu bar: what had focus when the menu button was pressed, so the menu's
+  /// Edit commands reach that field.
+  #[cfg(not(target_os = "macos"))]
+  menu_target: Rc<RefCell<Option<FocusHandle>>>,
   viewer: Entity<Viewer>,
   menu: Entity<ContextMenu>,
   text_panel: Entity<TextPanel>,
@@ -234,7 +287,7 @@ impl RootView {
         // The panel shows the store's view: a key that opens a conversation repaints nothing else.
         cx.notify();
       }),
-      // "System" appearance follows macOS as it changes.
+      // "System" appearance follows the system's as it changes.
       cx.observe_window_appearance(window, |_, _, cx| settings::apply_appearance(cx)),
       // The layout rearranges the window: the Rail's list may need its messages. The sort orders and the auto-hide
       // switch follow the settings too.
@@ -310,6 +363,8 @@ impl RootView {
       shortcuts,
       calendar,
       meet,
+      #[cfg(not(target_os = "macos"))]
+      menu_target: Rc::default(),
       logo,
       viewer,
       menu,
@@ -754,7 +809,7 @@ impl RootView {
     true
   }
 
-  /// Back and Forward through the views (Cmd+[ and Cmd+], and the Go menu).
+  /// Back and Forward through the views (Cmd+[ and Cmd+] on macOS, Ctrl elsewhere, and the Go menu).
   fn step(&mut self, back: bool, window: &mut Window, cx: &mut Context<Self>) {
     if !self.can_navigate(window, cx) {
       return;
@@ -790,7 +845,7 @@ impl RootView {
     self.store.update(cx, |store, cx| store.open_next_unread(window, cx));
   }
 
-  /// The sidebar button's click and ⌃⌘S: open closes, closed or auto-hide opens.
+  /// The sidebar button's click and its key (`keys::TOGGLE_SIDEBAR`): open closes, closed or auto-hide opens.
   fn toggle_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     if !self.can_navigate(window, cx) {
       return;
@@ -814,6 +869,7 @@ impl RootView {
     };
     div()
       .id("sidebar-button")
+      .occlude()
       .size(px(30.))
       .flex_shrink_0()
       .flex()
@@ -918,6 +974,7 @@ impl RootView {
     let (color, text) = status_menu::button(connection, &mine, settings.away, &settings);
     h_flex()
       .id("status-button")
+      .occlude()
       .gap_1p5()
       .px_2()
       .py_1()
@@ -938,6 +995,36 @@ impl RootView {
       )
       .child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(rgb(color)))
       .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(text))
+  }
+
+  /// The app's menus off macOS, where the system has no menu bar: a button whose dropdown has each of [`menus`] as a
+  /// submenu, with the shortcuts as this OS writes them.
+  #[cfg(not(target_os = "macos"))]
+  fn menu_button(&self, cx: &App) -> impl IntoElement {
+    let pressed = self.menu_target.clone();
+    let target = self.menu_target.clone();
+    let hover = rgb(ROW_HOVER).into();
+    div()
+      .flex_shrink_0()
+      .occlude()
+      // The menu takes focus as it opens: remember the field that had it first.
+      .capture_any_mouse_down(move |_, window, cx| *pressed.borrow_mut() = window.focused(cx))
+      .child(
+        Button::new("app-menu")
+          .custom(ButtonCustomVariant::new(cx).hover(hover).active(hover))
+          .size(px(30.))
+          .rounded(px(15.))
+          .tooltip("Menu")
+          .child(icon(Icon::More, 17., TEXT))
+          .dropdown_menu_with_anchor(Anchor::TopRight, move |popup, window, cx| {
+            let popup = match target.borrow().clone() {
+              Some(focus) => popup.action_context(focus),
+              None => popup,
+            };
+            let menus: Vec<OwnedMenuItem> = menus().into_iter().map(|menu| OwnedMenuItem::Submenu(menu.owned())).collect();
+            fill_menu(popup, &menus, window, cx)
+          }),
+      )
   }
 }
 
@@ -998,21 +1085,13 @@ impl Render for RootView {
     // same 80px reserved on both sides so the field sits in the middle of the window.
     let bar = h_flex()
       .id("top-bar")
-      .h(px(TOP_BAR_HEIGHT))
       .w_full()
       .flex_shrink_0()
-      // Clear of the traffic lights, with a visible gap before the mark.
-      .pl(px(92.))
+      // On macOS clear of the traffic lights, with a visible gap before the mark.
+      .pl(px(chrome::inset(92.)))
       .pr_4()
       .gap_3()
       .items_center()
-      .on_mouse_down(MouseButton::Left, |event, window, _| {
-        if event.click_count == 2 {
-          window.titlebar_double_click();
-        } else {
-          window.start_window_move();
-        }
-      })
       .when(Self::sidebar_side(cx) == SidebarSide::Left, |bar| bar.child(Self::sidebar_button(cx)))
       .child(
         h_flex()
@@ -1044,25 +1123,28 @@ impl Render for RootView {
             .items_center()
             .rounded_full()
             .bg(rgb(FIELD))
+            .occlude()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(icon(Icon::Search, 15., MUTED))
-            .child(
-              div()
-                .flex_1()
-                .child(Input::new(&self.search).appearance(false).bordered(false)),
-            ),
+            .child(div().flex_1().child(Input::new(&self.search).appearance(false).bordered(false))),
         ),
-      )
-      .child(
-        h_flex()
-          .min_w(px(252.))
-          .flex_shrink_0()
-          .gap_2()
-          .items_center()
-          .justify_end()
-          .child(self.indicator(cx))
-          .when(Self::sidebar_side(cx) == SidebarSide::Right, |group| group.child(Self::sidebar_button(cx))),
       );
+    let group = h_flex()
+      // Off macOS the kit's three 34px window buttons (102px) follow this group in the bar, so it reserves that much
+      // less: the field stays centered, and at the window's minimum width the buttons stay inside it.
+      .min_w(px(if cfg!(target_os = "macos") { 252. } else { 150. }))
+      .flex_shrink_0()
+      .gap_2()
+      .items_center()
+      .justify_end()
+      .child(self.indicator(cx))
+      .when(Self::sidebar_side(cx) == SidebarSide::Right, |group| {
+        group.child(Self::sidebar_button(cx))
+      });
+    // Off macOS the system has no menu bar for the app: its menus are behind the bar's last button.
+    #[cfg(not(target_os = "macos"))]
+    let group = group.child(self.menu_button(cx));
+    let bar = bar.child(group);
 
     let hidden = Self::sidebar_mode(cx) != SidebarMode::Open;
     let right = Self::sidebar_side(cx) == SidebarSide::Right;
@@ -1081,7 +1163,7 @@ impl Render for RootView {
       "Root"
     };
 
-    v_flex()
+    emoji_font::fallback(v_flex())
       .size_full()
       .bg(rgb(BG))
       .text_color(rgb(TEXT))
@@ -1141,7 +1223,7 @@ impl Render for RootView {
         };
         conv.update(cx, |conv, cx| conv.find_prev(window, cx));
       }))
-      .child(bar)
+      .child(chrome::top_bar(bar, TOP_BAR_HEIGHT))
       .child(
         h_flex()
           .relative()

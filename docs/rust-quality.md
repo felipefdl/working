@@ -8,7 +8,7 @@ This document is the human-readable contract. Machine configuration lives in:
 |------|------|
 | `rustfmt.toml` | Format, edition 2024, 120 columns, 2 spaces |
 | `clippy.toml` | Clippy thresholds, test allows, disallowed methods, MSRV |
-| `deny.toml` | Advisories, licenses, bans, sources |
+| `deny.toml` | Advisories, licenses, bans, sources, for the macOS, Linux, and Windows targets on x86_64 and aarch64 |
 | `.cargo/config.toml` | Cargo aliases |
 | Root `Cargo.toml` `[workspace.lints]` | Rust and Clippy levels, added with the workspace |
 
@@ -29,7 +29,7 @@ This document is the human-readable contract. Machine configuration lives in:
 
 Configured in root `Cargo.toml` `[workspace.lints]` and `clippy.toml`.
 
-- `unsafe_code = deny`. Production logic is safe Rust. The only `unsafe` is macOS FFI in `crates/app` (`call.rs`, `notify.rs`, `permissions.rs`, `screen.rs`, `status.rs`), each site marked `#[expect(unsafe_code, reason = "...")]`. Third-party crates sit outside this boundary; their unsafe code does not permit unsafe in owned logic.
+- `unsafe_code = deny`. Production logic is safe Rust. The only `unsafe` is platform FFI in `crates/app`: macOS in `notify/macos.rs`, `session/macos.rs`, `permissions.rs`, `screen.rs`, and `status.rs`, and Windows in `notify/windows.rs`, `session/windows.rs`, `console.rs`, and `status.rs`; each file allows it with a `reason`. Third-party crates sit outside this boundary; their unsafe code does not permit unsafe in owned logic.
 - Clippy groups `all`, `pedantic`, `nursery`, and `cargo` at **deny**, with a short allow-list for known noise without safety value
 - The full Clippy `restriction` group is not enabled. Selected panic and silent-fail lints are denied individually, including:
   - `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `unreachable`
@@ -146,6 +146,10 @@ That recipe is the gate. It covers the format check, workspace lint inheritance,
 There is no `cargo test` fallback for the required nextest gate. An environment without nextest is not ready to run the full gate.
 
 While a change is still in progress, verify the packages it touches with `just task <package>` (clippy plus nextest for one crate) or `just t '<nextest filter>'`. Neither replaces the gate: completion claims still require `just check`.
+
+Clippy and the tests build for the host only. Code behind `#[cfg(target_os = "...")]` compiles on that OS alone, so a change to it also needs a clippy and nextest run on that OS: `just task <package>` on macOS and Linux, and on Windows the same two commands through cargo (`cargo clippy -p <package> --all-targets -- -D warnings`, `cargo nextest run -p <package>`).
+
+`.github/workflows/ci.yml` does this on every push to `main` and every pull request: the full gate on macOS, and clippy plus the tests on Linux and Windows.
 
 On macOS, the first execution of every freshly linked test binary is scanned by XProtect, which costs more than the compile itself on a large test suite and does not appear in cargo timings. Adding the terminal application under System Settings, Privacy and Security, Developer Tools exempts the binaries it spawns. That is a local machine trade-off between build speed and an operating system security feature, so it stays a per-developer choice and never a gate requirement. See the [cargo-nextest macOS notes](https://nexte.st/docs/installation/macos/).
 

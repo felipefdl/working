@@ -1012,7 +1012,7 @@ impl Render for EventEditor {
           .overflow_hidden()
           .capture_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
             let stroke = &event.keystroke;
-            if stroke.key == "enter" && stroke.modifiers.platform {
+            if stroke.key == "enter" && stroke.modifiers.secondary(cx) {
               this.save(cx);
               cx.stop_propagation();
             }

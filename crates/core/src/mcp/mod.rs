@@ -1,4 +1,4 @@
-//! The MCP server: lets AI agents on this Mac use the signed-in chat through a few tools.
+//! The MCP server: lets AI agents on this computer use the signed-in chat through a few tools.
 //!
 //! It speaks two MCP revisions over Streamable HTTP, both without sessions: each request is one POST answered
 //! with one JSON object. Revision 2026-07-28 has no handshake and carries its protocol version in every
@@ -52,7 +52,7 @@ fn token_path() -> PathBuf {
   crate::config_dir().join("mcp-token")
 }
 
-/// The secret agents present to the server. Made on first use and kept in `~/.config/working/mcp-token`.
+/// The secret agents present to the server. Made on first use and kept in `mcp-token` in [`crate::config_dir`].
 pub fn token() -> std::io::Result<String> {
   match std::fs::read_to_string(token_path()) {
     Ok(saved) if !saved.trim().is_empty() => Ok(saved.trim().to_string()),
@@ -63,20 +63,12 @@ pub fn token() -> std::io::Result<String> {
 /// Replaces the secret: whatever was connected with the old one is refused from the next restart of the server.
 pub fn rotate_token() -> std::io::Result<String> {
   use std::io::Write;
-  use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
   let secret: [u8; 32] = rand::random();
   let token = format!("wk_{}", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret));
   let path = token_path();
   std::fs::create_dir_all(crate::config_dir())?;
-  let mut file = std::fs::OpenOptions::new()
-    .write(true)
-    .create(true)
-    .truncate(true)
-    .mode(0o600)
-    .open(&path)?;
-  // `mode` only applies to a file this call creates.
-  file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+  let mut file = crate::paths::create_private(&path)?;
   file.write_all(token.as_bytes())?;
   Ok(token)
 }

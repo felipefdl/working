@@ -10,6 +10,7 @@ use gpui_kit::component::{h_flex, v_flex};
 
 use gpui_kit::*;
 
+use crate::emoji_font;
 use crate::emoji_picker;
 use crate::menu::{self, MenuItem};
 use crate::settings::Settings;
@@ -250,7 +251,7 @@ impl Render for StatusComposer {
                   let _ = this;
                 }),
               )
-              .child(emoji),
+              .child(emoji_font::text(emoji)),
           )
           .child(div().flex_1().child(Input::new(&self.text).appearance(false).bordered(false))),
       )

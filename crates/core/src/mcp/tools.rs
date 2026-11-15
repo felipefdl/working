@@ -32,10 +32,10 @@ use crate::fuzzy::Fuzzy;
 use crate::model::{AttachmentKind, Group, GroupId, GroupKind, Message, Micros, Notify, SpanKind};
 
 /// System prompt for MCP clients: how to name conversations and that reads do not mark messages read.
-pub const INSTRUCTIONS: &str = "Google Chat of the person signed in to the Working app on this Mac. \
+pub const INSTRUCTIONS: &str = "Google Chat of the person signed in to the Working app on this computer. \
 Catch up with inbox. To answer someone the user did not name, start with recent_activity. Find a chat with find_conversations, read it with read_conversation, and find a word or \
 topic across every chat with search_messages. Wherever a `conversation` is asked for, a name (\"Jordan Park\"), \
-part of one, or an id (dm/…, space/…) works. Times are this Mac's local time. Reading changes nothing: \
+part of one, or an id (dm/…, space/…) works. Times are this computer's local time. Reading changes nothing: \
 messages stay unread.";
 
 /// Longest answer of a tool, in bytes: about 12,000 tokens.
@@ -184,7 +184,7 @@ pub fn list(allow_send: bool) -> Vec<Value> {
     tools.push(json!({
       "name": "send_message",
       "title": "Send a message",
-      "description": "Send a message as the user to one conversation, with text, files from this Mac, or both. \
+      "description": "Send a message as the user to one conversation, with text, files from this computer, or both. \
 It is posted for real and the people there see it at once: send only what the user asked for. `conversation` \
 has to be an id or a full name; with anything less nothing is sent and the matching conversations are listed. \
 With `thread` the message is a reply inside that thread of a space; without it, it goes to the main conversation. \
@@ -194,7 +194,7 @@ Read the conversation with read_conversation first: a send to a conversation not
         "properties": {
           "conversation": { "type": "string", "description": "The conversation's id (dm/… or space/…) or its full name." },
           "text": { "type": "string", "description": "The message. Google Chat formatting works: *bold*, _italic_, `code`." },
-          "files": { "type": "array", "items": { "type": "string" }, "description": "Files to attach: absolute paths on this Mac (~ works), such as /Users/me/report.pdf." },
+          "files": { "type": "array", "items": { "type": "string" }, "description": "Files to attach: absolute paths on this computer (~ works), such as ~/Documents/report.pdf." },
           "thread": { "type": "string", "description": "Reply in a thread: the #id that ends a top-level message in read_conversation." }
         },
         "required": ["conversation"],
@@ -1270,8 +1270,8 @@ async fn send_message(engine: &Arc<Engine>, reads: &Reads, arguments: Value) -> 
   }
   let mut files = Vec::with_capacity(args.files.len());
   for file in &args.files {
-    let path = match (file.strip_prefix("~/"), std::env::var_os("HOME")) {
-      (Some(rest), Some(home)) => PathBuf::from(home).join(rest),
+    let path = match (file.strip_prefix("~/"), dirs::home_dir()) {
+      (Some(rest), Some(home)) => home.join(rest),
       _ => PathBuf::from(file),
     };
     if !path.is_absolute() {

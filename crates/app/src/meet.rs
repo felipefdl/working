@@ -14,7 +14,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::calendar::{TOOLBAR_HEIGHT, pill};
+use crate::calendar::{TOOLBAR_HEIGHT, idle_pill, pill};
 use crate::calendar_layout::today;
 use crate::meet_logic::{Meeting, day_range, meeting_link, meetings_on, shift_week};
 use crate::menu::{self, MenuItem};
@@ -511,17 +511,13 @@ impl MeetView {
 
   /// Join: it waits for something to join.
   fn join_button(&self, cx: &Context<Self>) -> Stateful<Div> {
-    let ready = !self.code.read(cx).value().trim().is_empty();
+    if self.code.read(cx).value().trim().is_empty() {
+      return idle_pill("meet-join").child("Join").text_color(rgb(MUTED)).opacity(0.6);
+    }
     pill("meet-join")
       .child("Join")
-      .when(ready, |button| {
-        button
-          .text_color(rgb(ACCENT))
-          .on_click(cx.listener(|this, _, window, cx| this.join(window, cx)))
-      })
-      .when(!ready, |button| {
-        button.text_color(rgb(MUTED)).opacity(0.6).cursor_default().hover(|style| style)
-      })
+      .text_color(rgb(ACCENT))
+      .on_click(cx.listener(|this, _, window, cx| this.join(window, cx)))
   }
 }
 

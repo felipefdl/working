@@ -1,7 +1,10 @@
 //! Rewrites a composer draft by running the user's local coding CLI with no tools.
 
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
@@ -10,6 +13,10 @@ use std::time::Duration;
 use crate::settings::RewriteTool;
 
 const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Windows' `CREATE_NO_WINDOW`: a CLI started from a windowed app opens no console window.
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 const SYSTEM: &str = "\
 The text is a Google Chat message, not email or a document. Keep it a Chat message.
@@ -26,7 +33,7 @@ pub fn run(tool: RewriteTool, extra: &str, draft: &str) -> Result<String, String
   let tmp = unique_tmp()?;
   let system = system_prompt(extra);
   let inv = invocation(tool, &system, draft, &tmp);
-  let mut cmd = Command::new(&bin);
+  let mut cmd = command(&bin);
   cmd.args(&inv.args).current_dir(&tmp).env("PATH", enriched_path());
   let output = run_cmd(&mut cmd, inv.stdin.as_deref());
   let last = inv.last_message.as_ref().and_then(|path| std::fs::read_to_string(path).ok());
@@ -186,8 +193,12 @@ fn run_cmd(cmd: &mut Command, stdin: Option<&str>) -> Result<Output, String> {
     })
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
-  // The CLI may spawn helpers. Timeout kills the group, not only the parent.
+  // The CLI may spawn helpers: the timeout kills them too, not only the parent. On macOS and Linux it leads a process
+  // group of its own for that.
+  #[cfg(unix)]
   cmd.process_group(0);
+  #[cfg(target_os = "windows")]
+  cmd.creation_flags(CREATE_NO_WINDOW);
   let mut child = cmd.spawn().map_err(|error| error.to_string())?;
   if let Some(text) = stdin
     && let Some(mut pipe) = child.stdin.take()
@@ -203,40 +214,180 @@ fn run_cmd(cmd: &mut Command, stdin: Option<&str>) -> Result<Output, String> {
     Ok(Ok(output)) => Ok(output),
     Ok(Err(error)) => Err(error.to_string()),
     Err(_) => {
-      let _ = Command::new("/bin/kill").args(["-9", &format!("-{pid}")]).status();
+      kill_tree(pid);
       Err("timed out.".into())
     },
   }
 }
 
-fn resolve(name: &str) -> Option<PathBuf> {
-  for dir in path_dirs() {
-    let candidate = dir.join(name);
-    if candidate.is_file() {
-      return Some(candidate);
-    }
+/// Kills the CLI started as `pid` and every process it started.
+#[cfg(unix)]
+fn kill_tree(pid: u32) {
+  #[cfg(target_os = "macos")]
+  let kill = "/bin/kill";
+  #[cfg(not(target_os = "macos"))]
+  let kill = "kill";
+  // A negative pid is the process group the CLI leads.
+  let _ = Command::new(kill).args(["-9", &format!("-{pid}")]).status();
+}
+
+/// Kills the CLI started as `pid` and every process it started.
+#[cfg(target_os = "windows")]
+fn kill_tree(pid: u32) {
+  let _ = Command::new("taskkill")
+    .args(["/PID", &pid.to_string(), "/T", "/F"])
+    .creation_flags(CREATE_NO_WINDOW)
+    .status();
+}
+
+/// What runs the CLI at `bin`.
+#[cfg(unix)]
+fn command(bin: &Path) -> Command {
+  Command::new(bin)
+}
+
+/// What runs the CLI at `bin`: the program itself, or for an npm launcher (`.cmd`) the Node script it starts. Windows
+/// passes a batch file's arguments through `cmd.exe`, which cannot carry the multi-line system prompt (Rust refuses
+/// arguments with line breaks there), so the launcher is skipped for the `node` it would call.
+#[cfg(target_os = "windows")]
+fn command(bin: &Path) -> Command {
+  let batch = bin
+    .extension()
+    .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+  if batch && let Some((node, script)) = npm_launcher(bin) {
+    let mut command = Command::new(node);
+    command.arg(script);
+    return command;
   }
-  let output = Command::new("/bin/zsh")
-    .args(["-lc", &format!("command -v {name}")])
-    .output()
-    .ok()?;
+  Command::new(bin)
+}
+
+/// The `node` and the script an npm launcher at `bin` runs. `node.exe` beside the launcher when there is one, as the
+/// launcher itself prefers, else the one on the PATH. `None` for a launcher of anything but a Node script.
+#[cfg(target_os = "windows")]
+fn npm_launcher(bin: &Path) -> Option<(PathBuf, PathBuf)> {
+  let dir = bin.parent()?;
+  let text = std::fs::read_to_string(bin).ok()?;
+  let script = dir.join(launcher_script(&text)?);
+  if !script.is_file() {
+    return None;
+  }
+  let beside = dir.join("node.exe");
+  let node = if beside.is_file() {
+    beside
+  } else {
+    resolve("node")?
+  };
+  Some((node, script))
+}
+
+/// The script path, relative to the launcher's folder, in an npm (or pnpm) launcher whose program is `node`. Its last
+/// line runs `"%_prog%"  "%dp0%\node_modules\<package>\<script>" %*` (pnpm writes `%~dp0` for `%dp0%`).
+#[cfg(target_os = "windows")]
+fn launcher_script(text: &str) -> Option<&str> {
+  if !text.contains("SET \"_prog=node\"") {
+    return None;
+  }
+  let (_, run) = text.rsplit_once("\"%_prog%\"")?;
+  let run = run.trim_start();
+  let rest = run.strip_prefix("\"%dp0%\\").or_else(|| run.strip_prefix("\"%~dp0\\"))?;
+  rest.split_once('"').map(|(script, _)| script)
+}
+
+/// Where `name` is installed: the first match on the PATH and the folders CLI installers use, else what the user's
+/// login shell finds.
+fn resolve(name: &str) -> Option<PathBuf> {
+  if let Some(found) = path_dirs().iter().find_map(|dir| program_in(dir, name)) {
+    return Some(found);
+  }
+  // A login shell reads the profile that sets the PATH, which an app started from the desktop never sees.
+  #[cfg(unix)]
+  {
+    from_login_shell(name)
+  }
+  #[cfg(target_os = "windows")]
+  {
+    None
+  }
+}
+
+/// `name` as a program in `dir`.
+#[cfg(unix)]
+fn program_in(dir: &Path, name: &str) -> Option<PathBuf> {
+  let candidate = dir.join(name);
+  candidate.is_file().then_some(candidate)
+}
+
+/// `name` as a program in `dir`: the first of the `PATHEXT` extensions that names a file there. npm installs `.cmd`
+/// launchers, and a bare `name` beside them is a shell script for other systems.
+#[cfg(target_os = "windows")]
+fn program_in(dir: &Path, name: &str) -> Option<PathBuf> {
+  let extensions = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+  extensions
+    .split(';')
+    .filter(|extension| !extension.is_empty())
+    .map(|extension| dir.join(format!("{name}{extension}")))
+    .find(|candidate| candidate.is_file())
+}
+
+/// `command -v name` in the user's login shell (`$SHELL`, else `/bin/sh`).
+#[cfg(unix)]
+fn from_login_shell(name: &str) -> Option<PathBuf> {
+  let shell = std::env::var_os("SHELL")
+    .filter(|shell| !shell.is_empty())
+    .unwrap_or_else(|| "/bin/sh".into());
+  let output = Command::new(shell).args(["-lc", &format!("command -v {name}")]).output().ok()?;
   let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
   (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
 fn path_dirs() -> Vec<PathBuf> {
-  let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
-  let mut dirs = vec![
+  let mut found = install_dirs();
+  if let Some(path) = std::env::var_os("PATH") {
+    found.extend(std::env::split_paths(&path));
+  }
+  found
+}
+
+/// Where the CLIs' own installers put them, which the PATH of an app started from the desktop often leaves out.
+#[cfg(target_os = "macos")]
+fn install_dirs() -> Vec<PathBuf> {
+  let home = dirs::home_dir().unwrap_or_default();
+  vec![
     home.join(".local/bin"),
     home.join(".bun/bin"),
     home.join(".vite-plus/bin"),
     PathBuf::from("/opt/homebrew/bin"),
     PathBuf::from("/usr/local/bin"),
+  ]
+}
+
+/// Where the CLIs' own installers put them, which the PATH of an app started from the desktop often leaves out.
+#[cfg(target_os = "linux")]
+fn install_dirs() -> Vec<PathBuf> {
+  let home = dirs::home_dir().unwrap_or_default();
+  vec![
+    home.join(".local/bin"),
+    home.join(".bun/bin"),
+    home.join(".vite-plus/bin"),
+    home.join(".npm-global/bin"),
+    PathBuf::from("/home/linuxbrew/.linuxbrew/bin"),
+    PathBuf::from("/usr/local/bin"),
+  ]
+}
+
+/// Where the CLIs' own installers put them, which the PATH of an app started from the desktop often leaves out, and
+/// npm's global folder (`%APPDATA%\npm`), where `npm install -g` puts its launchers.
+#[cfg(target_os = "windows")]
+fn install_dirs() -> Vec<PathBuf> {
+  let home = dirs::home_dir().unwrap_or_default();
+  let mut found = vec![
+    home.join(".local").join("bin"),
+    home.join(".bun").join("bin"),
+    home.join(".vite-plus").join("bin"),
   ];
-  if let Some(path) = std::env::var_os("PATH") {
-    dirs.extend(std::env::split_paths(&path));
-  }
-  dirs
+  found.extend(dirs::data_dir().map(|roaming| roaming.join("npm")));
+  found
 }
 
 fn enriched_path() -> std::ffi::OsString {
@@ -323,5 +474,85 @@ mod tests {
     assert_eq!(clean("```markdown\nHi\n```"), "Hi");
     assert_eq!(clean("  already clean  "), "already clean");
     assert_eq!(clean("```\nstill open"), "still open");
+  }
+
+  /// An npm launcher (`npm install -g` writes one per CLI) for `example-cli`.
+  #[cfg(target_os = "windows")]
+  const NPM_LAUNCHER: &str = "@ECHO off\r\nGOTO start\r\n:find_dp0\r\nSET dp0=%~dp0\r\nEXIT /b\r\n:start\r\nSETLOCAL\r\n\
+CALL :find_dp0\r\n\r\nIF EXIST \"%dp0%\\node.exe\" (\r\n  SET \"_prog=%dp0%\\node.exe\"\r\n) ELSE (\r\n  SET \"_prog=node\"\r\n  \
+SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & \"%_prog%\"  \
+\"%dp0%\\node_modules\\example-cli\\bin\\cli.js\" %*\r\n";
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn npm_launcher_runs_its_node_script() {
+    assert_eq!(launcher_script(NPM_LAUNCHER), Some("node_modules\\example-cli\\bin\\cli.js"));
+    let shell = NPM_LAUNCHER.replace("SET \"_prog=node\"", "SET \"_prog=/bin/sh\"");
+    assert_eq!(launcher_script(&shell), None);
+  }
+
+  /// A folder of its own under the temp dir, emptied first.
+  #[cfg(target_os = "windows")]
+  fn scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("working-rewrite-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn programs_resolve_through_pathext() {
+    let dir = scratch("pathext");
+    // The file found, as its name in lower case: it takes the case `PATHEXT` spells the extension in (`.CMD`).
+    let found = |name| program_in(&dir, name).map(|path| path.to_string_lossy().to_lowercase());
+    let named = |file: &str| Some(dir.join(file).to_string_lossy().to_lowercase());
+    // A bare `example` beside the launcher is npm's shell script for other systems, never the program.
+    std::fs::write(dir.join("example"), "#!/bin/sh\n").unwrap();
+    std::fs::write(dir.join("example.cmd"), NPM_LAUNCHER).unwrap();
+    assert_eq!(found("example"), named("example.cmd"));
+    // `PATHEXT` lists `.EXE` before `.CMD`.
+    std::fs::write(dir.join("example.exe"), "").unwrap();
+    assert_eq!(found("example"), named("example.exe"));
+    assert_eq!(found("missing"), None);
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn npm_launcher_is_skipped_for_node() {
+    let dir = scratch("launcher");
+    let script = dir.join("node_modules").join("example-cli").join("bin");
+    std::fs::create_dir_all(&script).unwrap();
+    std::fs::write(script.join("cli.js"), "").unwrap();
+    std::fs::write(dir.join("node.exe"), "").unwrap();
+    let launcher = dir.join("example.cmd");
+    std::fs::write(&launcher, NPM_LAUNCHER).unwrap();
+    let node = command(&launcher);
+    assert_eq!(Path::new(node.get_program()), dir.join("node.exe"));
+    let args: Vec<_> = node.get_args().map(PathBuf::from).collect();
+    assert_eq!(args, [dir.join("node_modules\\example-cli\\bin\\cli.js")]);
+    // Without its script the launcher runs as it is.
+    std::fs::remove_dir_all(dir.join("node_modules")).unwrap();
+    assert_eq!(Path::new(command(&launcher).get_program()), launcher);
+    std::fs::remove_dir_all(&dir).unwrap();
+  }
+
+  #[cfg(target_os = "windows")]
+  #[test]
+  fn timeout_kills_the_whole_tree() {
+    // `cmd` starts `ping` for half a minute; both hold the stdout pipe, so reading it ends only once both are gone.
+    let mut cmd = Command::new("cmd.exe");
+    cmd.args(["/c", "ping -n 30 127.0.0.1"]).creation_flags(CREATE_NO_WINDOW);
+    let child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+      let _ = tx.send(child.wait_with_output());
+    });
+    std::thread::sleep(Duration::from_millis(500));
+    kill_tree(pid);
+    let output = rx.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+    assert!(!output.status.success());
   }
 }

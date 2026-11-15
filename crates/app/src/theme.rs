@@ -35,6 +35,10 @@ pub struct Colors {
   /// Background of the words a search matched.
   mark: u32,
   /// Background of a microphone or camera button that is off.
+  #[cfg_attr(
+    target_os = "linux",
+    expect(dead_code, reason = "only the call window reads it, and Linux has none")
+  )]
   off_bg: u32,
   green: u32,
   amber: u32,
@@ -129,6 +133,7 @@ pub const BUBBLE_OWN: Tone = Tone(|c| c.bubble_own);
 pub const CODE_BG: Tone = Tone(|c| c.code_bg);
 pub const PLACEHOLDER: Tone = Tone(|c| c.placeholder);
 pub const MARK: Tone = Tone(|c| c.mark);
+#[cfg(not(target_os = "linux"))]
 pub const OFF_BG: Tone = Tone(|c| c.off_bg);
 pub const GREEN: Tone = Tone(|c| c.green);
 pub const AMBER: Tone = Tone(|c| c.amber);
@@ -139,15 +144,77 @@ pub const TEXT_DIM: Tone = Tone(|c| c.text_dim);
 pub const WHITE: Tone = Tone(|_| 0xffffff);
 /// The call window's hang-up button: a solid red under a white icon in every theme, as Meet's own. A theme's
 /// `red` is tuned for text and reads washed out as a fill.
+#[cfg(not(target_os = "linux"))]
 pub const HANGUP: Tone = Tone(|_| 0xc5221f);
 
-/// The interface font when the user has not picked one: GPUI's name for the macOS system font, which it already uses
-/// where no family is set.
+/// The interface font when the user has not picked one: GPUI's name for the system interface font, which it already
+/// uses where no family is set. macOS resolves it to the system font and Windows to the icon-title font (Segoe UI).
+/// Linux names the first installed of `SYSTEM_SANS` instead (`settings::show_theme`), and keeps this name only when
+/// none is.
 pub const SYSTEM_FONT: &str = ".SystemUIFont";
+
+/// The interface families tried, in order, when the user has not picked one: GPUI's own Linux choices for
+/// [`SYSTEM_FONT`]. GPUI resolves that name to the first one installed but drops the font's fallback families on the
+/// way, so the emoji fallback (`emoji_font::fallback`) reaches inputs only when the family is named.
+#[cfg(target_os = "linux")]
+const SYSTEM_SANS: [&str; 6] = [
+  "IBM Plex Sans",
+  "Ubuntu",
+  "Adwaita Sans",
+  "Cantarell",
+  "Noto Sans",
+  "DejaVu Sans",
+];
 
 /// The monospace font when the user has not picked one: the macOS system monospaced font (SF Mono), which Core Text
 /// reaches under this name whether or not the SF Mono family is installed in Font Book.
+#[cfg(target_os = "macos")]
 pub const SYSTEM_MONO: &str = ".AppleSystemUIFontMonospaced";
+
+/// The monospace families tried, in order, when the user has not picked one; `settings::show_theme` names the first
+/// one installed. GPUI matches family names exactly on Linux, so fontconfig's `monospace` alias reads as missing, and
+/// distributions install different families: `DejaVu Sans Mono` (Debian, Ubuntu, Arch), `Noto Sans Mono` (Fedora,
+/// KDE), `Adwaita Mono` (GNOME), `Liberation Mono`, `Ubuntu Mono`.
+#[cfg(target_os = "linux")]
+const SYSTEM_MONOS: [&str; 5] = [
+  "DejaVu Sans Mono",
+  "Noto Sans Mono",
+  "Adwaita Mono",
+  "Liberation Mono",
+  "Ubuntu Mono",
+];
+
+/// The monospace font when none of [`SYSTEM_MONOS`] is installed: the interface font, which GPUI always resolves.
+/// A missing family would be drawn with GPUI's fallback stack instead, a proportional font in most systems.
+#[cfg(target_os = "linux")]
+pub const SYSTEM_MONO: &str = SYSTEM_FONT;
+
+/// The first of `candidates` that `installed` (sorted) has.
+#[cfg(target_os = "linux")]
+fn first_installed(candidates: &[&'static str], installed: &[String]) -> Option<SharedString> {
+  candidates
+    .iter()
+    .copied()
+    .find(|family| installed.binary_search_by(|name| name.as_str().cmp(family)).is_ok())
+    .map(SharedString::new_static)
+}
+
+/// The first of [`SYSTEM_SANS`] that `installed` (sorted) has.
+#[cfg(target_os = "linux")]
+pub fn installed_sans(installed: &[String]) -> Option<SharedString> {
+  first_installed(&SYSTEM_SANS, installed)
+}
+
+/// The first of [`SYSTEM_MONOS`] that `installed` (sorted) has.
+#[cfg(target_os = "linux")]
+pub fn installed_mono(installed: &[String]) -> Option<SharedString> {
+  first_installed(&SYSTEM_MONOS, installed)
+}
+
+/// The monospace font when the user has not picked one: Consolas, which every Windows since Vista installs and the
+/// kit's own default on Windows.
+#[cfg(target_os = "windows")]
+pub const SYSTEM_MONO: &str = "Consolas";
 
 /// The families the user picked in Settings, `None` for System. Set with the theme, see `settings::show_theme`.
 static FONTS: RwLock<(Option<SharedString>, Option<SharedString>)> = RwLock::new((None, None));
@@ -994,5 +1061,20 @@ mod tests {
     assert_eq!(THEMES[find("gone", false)].id, DEFAULT_LIGHT);
     assert_eq!(THEMES[find("dracula", false)].id, DEFAULT_LIGHT);
     assert_eq!(THEMES[find("dracula", true)].id, "dracula");
+  }
+
+  #[cfg(target_os = "linux")]
+  #[test]
+  fn system_fonts_are_the_first_installed_candidates() {
+    use super::{installed_mono, installed_sans};
+    let installed = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let fedora = installed(&["Adwaita Mono", "Adwaita Sans", "Noto Sans", "Noto Sans Mono"]);
+    assert_eq!(installed_mono(&fedora).as_deref(), Some("Noto Sans Mono"));
+    assert_eq!(installed_sans(&fedora).as_deref(), Some("Adwaita Sans"));
+    let ubuntu = installed(&["DejaVu Sans", "DejaVu Sans Mono", "Noto Sans Mono", "Ubuntu"]);
+    assert_eq!(installed_mono(&ubuntu).as_deref(), Some("DejaVu Sans Mono"));
+    assert_eq!(installed_sans(&ubuntu).as_deref(), Some("Ubuntu"));
+    assert_eq!(installed_mono(&installed(&["Cantarell"])), None);
+    assert_eq!(installed_sans(&installed(&["Lilex"])), None);
   }
 }

@@ -1,4 +1,4 @@
-//! The user's settings: kept in `~/.config/working/settings.json` and held as a GPUI global, so views that
+//! The user's settings: kept in `settings.json` in `gchat_core::config_dir` and held as a GPUI global, so views that
 //! read them are redrawn when they change.
 
 use std::collections::BTreeMap;
@@ -16,7 +16,7 @@ const MCP_PORT: u16 = 3021;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Appearance {
-  /// Follows macOS.
+  /// Follows the system appearance.
   #[default]
   System,
   Light,
@@ -122,7 +122,7 @@ impl Sort {
 /// When the user shows as online to other people.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ActivityStatus {
-  /// Online while the Mac is in use, away after a while without input.
+  /// Online while the computer is in use, away after a while without input.
   #[default]
   Automatic,
   /// As `Automatic` inside the set hours; away outside them.
@@ -136,7 +136,7 @@ pub enum ActivityStatus {
 /// What a notification sounds like.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sound {
-  /// The sound macOS is set to use for alerts.
+  /// The sound the system is set to use for alerts.
   #[default]
   Default,
   None,
@@ -151,6 +151,9 @@ pub enum Sound {
 }
 
 impl Sound {
+  /// The sounds this OS plays: macOS has its named system sounds; elsewhere a notification plays the system's own
+  /// sound or none.
+  #[cfg(target_os = "macos")]
   pub const ALL: [Self; 10] = [
     Self::Default,
     Self::None,
@@ -163,6 +166,19 @@ impl Sound {
     Self::Purr,
     Self::Funk,
   ];
+  /// The sounds this OS plays: macOS has its named system sounds; elsewhere a notification plays the system's own
+  /// sound or none.
+  #[cfg(not(target_os = "macos"))]
+  pub const ALL: [Self; 2] = [Self::Default, Self::None];
+
+  /// The sound that plays, one of [`Self::ALL`]: off macOS a named sound (saved on a Mac) is the system default.
+  pub const fn resolved(self) -> Self {
+    if cfg!(target_os = "macos") || matches!(self, Self::None) {
+      self
+    } else {
+      Self::Default
+    }
+  }
 
   pub const fn label(self) -> &'static str {
     match self {
@@ -181,11 +197,13 @@ impl Sound {
 
   /// The sound's file: one of the macOS system sounds, which `scripts/bundle.sh` copies into the app so
   /// notifications can play it. `None` for the two that are not a file.
+  #[cfg(target_os = "macos")]
   pub fn file(self) -> Option<String> {
     (!matches!(self, Self::Default | Self::None)).then(|| format!("{}.aiff", self.label()))
   }
 
   /// Plays the sound once, for the user picking one.
+  #[cfg(target_os = "macos")]
   pub fn preview(self) {
     if let Some(file) = self.file() {
       let _ = std::process::Command::new("afplay")
@@ -253,10 +271,11 @@ pub struct Settings {
   /// Theme ids in `theme::THEMES`, one for each appearance.
   pub dark_theme: String,
   pub light_theme: String,
-  /// The interface font, by family name. Absent is the macOS system font. A family that is no longer installed
-  /// reads as absent.
+  /// The interface font, by family name. Absent is the system font (`theme::SYSTEM_FONT`). A family that is no
+  /// longer installed reads as absent.
   pub font: Option<String>,
-  /// The font of code spans and code blocks, by family name. Absent is the macOS system monospaced font.
+  /// The font of code spans and code blocks, by family name. Absent is the system monospaced font
+  /// (`theme::SYSTEM_MONO`).
   pub mono_font: Option<String>,
   pub density: Density,
   pub layout: Layout,
@@ -266,9 +285,11 @@ pub struct Settings {
   pub show_mentions: bool,
   /// The Starred button of every layout. Off removes only the button: the view still opens from anywhere else.
   pub show_starred: bool,
-  /// The Calendar button of every layout. Off removes only the button: `Cmd+2` and the Go menu still open the view.
+  /// The Calendar button of every layout. Off removes only the button: its key (`secondary-2`) and the Go menu still
+  /// open the view.
   pub show_calendar: bool,
-  /// The Meet button of every layout. Off removes only the button: `Cmd+3` and the Go menu still open the view.
+  /// The Meet button of every layout. Off removes only the button: its key (`secondary-3`) and the Go menu still open
+  /// the view.
   pub show_meet: bool,
   /// Dragged widths of each layout's resizable column; a layout without an entry uses `Layout::default_width`.
   pub column_widths: BTreeMap<Layout, f32>,
@@ -288,7 +309,7 @@ pub struct Settings {
   pub hours_start: u16,
   pub hours_end: u16,
   pub sound: Sound,
-  /// Serve the MCP tools to AI agents on this Mac.
+  /// Serve the MCP tools to AI agents on this computer.
   pub mcp: bool,
   pub mcp_port: u16,
   /// Agents may send messages, not only read.
@@ -473,7 +494,7 @@ impl Settings {
   }
 
   /// Keeps the theme at `index` for its appearance. A pinned appearance of the other kind switches over to it, so
-  /// the pick shows; System keeps following macOS.
+  /// the pick shows; System keeps following the system appearance.
   pub fn pick_theme(&mut self, index: usize) {
     let Some(picked) = THEMES.get(index) else {
       return;
@@ -493,11 +514,15 @@ impl Settings {
   }
 }
 
-/// The font families installed on the Mac, sorted, listed once: asking Core Text costs around a hundred milliseconds
-/// and the answer does not change while the app runs.
+/// The font families installed on the computer, sorted, listed once: asking the text system costs around a hundred
+/// milliseconds and the answer does not change while the app runs. The bundled emoji font is not one to pick.
 pub fn installed_fonts(cx: &App) -> &'static [String] {
   static NAMES: OnceLock<Vec<String>> = OnceLock::new();
-  NAMES.get_or_init(|| cx.text_system().all_font_names())
+  NAMES.get_or_init(|| {
+    let mut names = cx.text_system().all_font_names();
+    names.retain(|name| !crate::emoji_font::is_bundled(name));
+    names
+  })
 }
 
 /// `saved` when `installed` has it. GPUI panics on the first line it lays out in a family it cannot find, so a
@@ -547,6 +572,13 @@ pub fn show_theme(index: usize, cx: &mut App) {
   theme::set(index);
   let settings = cx.global::<Settings>();
   let (sans, mono) = (settings.shown_font(cx), settings.shown_mono_font(cx));
+  // Linux has no one interface or monospace family every distribution installs: System is the first one this
+  // computer has.
+  #[cfg(target_os = "linux")]
+  let (sans, mono) = (
+    sans.or_else(|| theme::installed_sans(installed_fonts(cx))),
+    mono.or_else(|| theme::installed_mono(installed_fonts(cx))),
+  );
   theme::set_fonts(sans, mono);
   Theme::change(
     if theme::is_light() {
@@ -591,11 +623,26 @@ mod tests {
     assert_eq!(tool, super::RewriteTool::Off);
   }
 
+  #[cfg(target_os = "macos")]
   #[test]
   fn notification_sound_files() {
     assert_eq!(Sound::Glass.file().as_deref(), Some("Glass.aiff"));
     assert_eq!(Sound::Default.file(), None);
     assert_eq!(Sound::None.file(), None);
+  }
+
+  #[test]
+  fn every_offered_sound_plays_as_itself() {
+    for sound in Sound::ALL {
+      assert_eq!(sound.resolved(), sound);
+    }
+    assert_eq!(Sound::None.resolved(), Sound::None);
+    let glass = if cfg!(target_os = "macos") {
+      Sound::Glass
+    } else {
+      Sound::Default
+    };
+    assert_eq!(Sound::Glass.resolved(), glass);
   }
 
   #[test]

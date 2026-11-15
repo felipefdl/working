@@ -1,4 +1,4 @@
-//! Cmd+K quick switcher: fzf-style search over conversation names, recent first when empty.
+//! The quick switcher (`secondary-k`): fzf-style search over conversation names, recent first when empty.
 
 use std::sync::Arc;
 

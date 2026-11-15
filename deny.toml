@@ -4,6 +4,10 @@
 targets = [
   "aarch64-apple-darwin",
   "x86_64-apple-darwin",
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
+  "aarch64-pc-windows-msvc",
 ]
 all-features = true
 no-default-features = false
@@ -14,7 +18,11 @@ feature-depth = 1
 [advisories]
 # cargo-deny 0.20+: vulnerabilities always error; configure unmaintained/yanked/unsound.
 # Docs: https://embarkstudios.github.io/cargo-deny/checks/advisories/cfg.html
-ignore = []
+ignore = [
+  # gtk3-rs is archived and pins glib 0.18; the fix is in glib 0.20, which no GTK 3 binding uses. Drop this when
+  # wry moves to GTK 4.
+  { id = "RUSTSEC-2024-0429", reason = "glib 0.18.5 is pinned by gtk3-rs 0.18 through lb-wry and webkit2gtk on Linux; VariantStrIter is unused" },
+]
 yanked = "deny"
 unmaintained = "workspace"
 unsound = "all"

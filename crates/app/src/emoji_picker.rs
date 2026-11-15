@@ -7,6 +7,7 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::*;
 
+use crate::emoji_font;
 use crate::theme::{BORDER, FIELD, MUTED, POPOVER, ROW_HOVER, TEXT, rgb};
 
 const COLUMNS: usize = 8;
@@ -133,7 +134,7 @@ impl EmojiPicker {
               .cursor_pointer()
               .hover(|s| s.bg(rgb(ROW_HOVER)))
               .on_click(cx.listener(move |this, _, window, cx| this.pick(ix, window, cx)))
-              .child(self.results[ix].as_str()),
+              .child(emoji_font::text(self.results[ix].as_str())),
           );
         }
         line.into_any_element()
