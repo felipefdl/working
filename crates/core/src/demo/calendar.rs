@@ -42,11 +42,7 @@ fn at(date: NaiveDate, hour: u32, minute: u32) -> Micros {
 }
 
 fn date_of(time: Micros) -> NaiveDate {
-  Local
-    .timestamp_micros(time)
-    .single()
-    .map(|time| time.date_naive())
-    .unwrap_or_default()
+  Local.timestamp_micros(time).single().map_or_default(|time| time.date_naive())
 }
 
 fn event(id: &str, calendar_id: &str, title: &str, start: Micros, end: Micros) -> CalendarEvent {

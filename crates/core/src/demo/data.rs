@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::image::{BEANS, HERO_DARK, HERO_LIGHT, Photo, RAMEN};
 use crate::model::{
   Attachment, AttachmentKind, Card, CardAction, CardButton, CardSection, Group, GroupId, GroupKind, Message, Micros,
   Notify, Placement, Quote, Reaction, SlashCommand, Snippet, Span, SpanKind, User,
@@ -81,17 +82,17 @@ pub fn users() -> Vec<User> {
   ]
 }
 
-/// An image the demo draws itself: `Core::fetch` answers this URL with a gradient of that size.
-pub fn image(hue: u16, width: u32, height: u32, name: &str) -> Attachment {
-  let url = format!("demo:image/{hue}/{width}/{height}");
+/// An image attachment showing one of the demo's photos, at the photo's own size.
+fn image(photo: &Photo, name: &str) -> Attachment {
+  let url = photo.url();
   Attachment {
     kind: AttachmentKind::Image,
     name: name.into(),
-    mime: "image/bmp".into(),
+    mime: "image/jpeg".into(),
     url: url.clone(),
     thumb_url: Some(url),
-    width: Some(width),
-    height: Some(height),
+    width: Some(photo.width),
+    height: Some(photo.height),
   }
 }
 
@@ -116,15 +117,15 @@ pub fn file_body(name: &str) -> String {
   )
 }
 
-fn link(url: &str, title: &str, hue: u16) -> Attachment {
+fn link(url: &str, title: &str, photo: &Photo) -> Attachment {
   Attachment {
     kind: AttachmentKind::LinkPreview,
     name: title.into(),
     mime: String::new(),
     url: url.into(),
-    thumb_url: Some(format!("demo:image/{hue}/800/420")),
-    width: Some(800),
-    height: Some(420),
+    thumb_url: Some(photo.url()),
+    width: Some(photo.width),
+    height: Some(photo.height),
   }
 }
 
@@ -515,7 +516,7 @@ fn riley(b: &mut Builder) {
   chat.say(&riley, 3 * DAY, "Lunch Friday?");
   chat.say(&me, 3 * DAY - 10 * MINUTE, "Sure, the ramen place?");
   let mut photo = chat.post(&riley, 3 * DAY - 12 * MINUTE, "Yes! This is what I'm getting");
-  photo.attachments = vec![image(28, 640, 480, "ramen.bmp")];
+  photo.attachments = vec![image(&RAMEN, "ramen.jpg")];
   photo.reactions = vec![react("🍜", 1, true), react("😋", 1, false)];
   chat.add(photo);
   let mut code = chat.post(
@@ -627,13 +628,13 @@ fn launch(b: &mut Builder) {
   preview.attachments = vec![link(
     "https://staging.example.com/launch",
     "Example Co: meet the new dashboard",
-    210,
+    &HERO_LIGHT,
   )];
   preview.reactions = vec![react("😍", 3, false)];
   chat.add(preview);
 
   let mut shots = chat.post(&mei, DAY + 2 * HOUR, "And the hero images, light and dark:");
-  shots.attachments = vec![image(200, 960, 600, "hero-light.bmp"), image(260, 960, 600, "hero-dark.bmp")];
+  shots.attachments = vec![image(&HERO_LIGHT, "hero-light.jpg"), image(&HERO_DARK, "hero-dark.jpg")];
   chat.add(shots);
 
   let mut mention = chat.post(&jordan, 5 * HOUR, "@Avery Morgan can you confirm the press embargo time?");
@@ -698,7 +699,7 @@ fn coffee(b: &mut Builder) {
     name: "Social".into(),
   };
   let mut beans = chat.post(&mei, 30 * HOUR, "New beans in the kitchen, a washed Ethiopian. Very bright.");
-  beans.attachments = vec![image(35, 600, 800, "beans.bmp")];
+  beans.attachments = vec![image(&BEANS, "coffee-beans.jpg")];
   chat.add(beans);
   chat.say(&noah, 29 * HOUR, "Tried it, it tastes like blueberries ☕");
   b.group(group, &["demo-mei", "demo-noah"], chat, 0);

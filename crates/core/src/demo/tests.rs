@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use super::data::{APPROVE, BUILD_BOT, ME};
 use super::{Demo, Window};
-use crate::model::{Chip, ChipKind, Command, Event, GroupId, Message, ReadReceipt, Shortcut, SpanKind};
+use crate::model::{AttachmentKind, Chip, ChipKind, Command, Event, GroupId, Message, ReadReceipt, Shortcut, SpanKind};
 
 fn demo() -> (Demo, flume::Receiver<Event>) {
   let (events, received) = flume::unbounded();
@@ -706,4 +706,50 @@ fn leaving_or_deleting_takes_the_conversation_out_of_the_world() {
   demo.handle(Command::Leave(dm.clone()));
   assert!(demo.groups.contains_key(&dm));
   assert!(drain(&events).iter().any(|event| matches!(event, Event::Error(_))));
+}
+
+/// Width and height from a JPEG's start-of-frame segment, walking the segments after the SOI marker.
+fn jpeg_size(bytes: &[u8]) -> Option<(u32, u32)> {
+  let byte = |at: usize| bytes.get(at).copied();
+  let word = |at: usize| Some(u16::from_be_bytes([byte(at)?, byte(at + 1)?]));
+  if word(0)? != 0xFFD8 {
+    return None;
+  }
+  let mut at = 2;
+  while byte(at)? == 0xFF {
+    let marker = byte(at + 1)?;
+    // SOF0 to SOF15, except DHT (C4), JPG (C8), and DAC (CC). The frame header is length, precision, height, width.
+    if (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC) {
+      return Some((u32::from(word(at + 7)?), u32::from(word(at + 5)?)));
+    }
+    at += 2 + usize::from(word(at + 2)?);
+  }
+  None
+}
+
+#[test]
+fn every_picture_fetches_as_a_jpeg_of_its_declared_size() {
+  let world = super::data::world(1_800_000_000_000_000);
+  let mut served = Vec::new();
+  for attachment in world.histories.values().flatten().flat_map(|message| &message.attachments) {
+    let pictures = match attachment.kind {
+      AttachmentKind::Image => vec![&attachment.url, attachment.thumb_url.as_ref().unwrap()],
+      AttachmentKind::LinkPreview => attachment.thumb_url.iter().collect(),
+      _ => continue,
+    };
+    for url in pictures {
+      let bytes = super::fetch_bytes(url).unwrap();
+      assert_eq!(
+        jpeg_size(&bytes),
+        Some((attachment.width.unwrap(), attachment.height.unwrap())),
+        "{url} is not a JPEG of the size {} declares",
+        attachment.name
+      );
+      served.push(url.clone());
+    }
+  }
+  for photo in super::image::PHOTOS {
+    assert!(served.contains(&photo.url()), "no message shows {}", photo.file);
+  }
+  assert!(super::fetch_bytes("demo:image/missing.jpg").is_err());
 }

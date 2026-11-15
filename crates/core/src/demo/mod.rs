@@ -85,13 +85,12 @@ fn now_micros() -> Micros {
     .map_or(0, |elapsed| i64::try_from(elapsed.as_micros()).unwrap_or(i64::MAX))
 }
 
-/// Bytes for a URL the demo hands out: drawn images, its own files, and files the user attached.
+/// Bytes for a URL the demo hands out: its embedded photos, its own files, and files the user attached.
 fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
-  if let Some(spec) = url.strip_prefix("demo:image/") {
-    let mut parts = spec.split('/').map(|part| part.parse::<u32>().ok());
-    if let (Some(Some(hue)), Some(Some(width)), Some(Some(height))) = (parts.next(), parts.next(), parts.next()) {
-      return Ok(image::gradient(hue, width.min(2400), height.min(2400)));
-    }
+  if url.starts_with("demo:image/") {
+    return image::photo(url)
+      .map(|photo| photo.bytes.to_vec())
+      .ok_or_else(|| "The demo has no such photo.".into());
   }
   if let Some(name) = url.strip_prefix("demo:file/") {
     return Ok(data::file_body(name).into_bytes());
@@ -1053,10 +1052,7 @@ fn canned(serial: usize) -> &'static str {
 fn local_attachment(path: &Path) -> Attachment {
   Attachment {
     kind: AttachmentKind::File,
-    name: path
-      .file_name()
-      .map(|name| name.to_string_lossy().into_owned())
-      .unwrap_or_default(),
+    name: path.file_name().map_or_default(|name| name.to_string_lossy().into_owned()),
     mime: mime_guess::from_path(path).first_or_octet_stream().essence_str().to_string(),
     url: format!("file://{}", path.display()),
     thumb_url: None,

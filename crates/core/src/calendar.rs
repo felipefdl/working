@@ -488,15 +488,12 @@ fn browser_keys(page: &str) -> Vec<String> {
 }
 
 fn pastels(colors: &Value) -> HashMap<String, u32> {
-  colors["calendar"]
-    .as_object()
-    .map(|palette| {
-      palette
-        .iter()
-        .filter_map(|(id, color)| Some((id.clone(), hex(color["background"].as_str()?)?)))
-        .collect()
-    })
-    .unwrap_or_default()
+  colors["calendar"].as_object().map_or_default(|palette| {
+    palette
+      .iter()
+      .filter_map(|(id, color)| Some((id.clone(), hex(color["background"].as_str()?)?)))
+      .collect()
+  })
 }
 
 fn hex(text: &str) -> Option<u32> {

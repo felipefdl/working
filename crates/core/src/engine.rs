@@ -104,10 +104,7 @@ fn now_micros() -> Micros {
 }
 
 fn file_name(path: &Path) -> String {
-  path
-    .file_name()
-    .map(|name| name.to_string_lossy().into_owned())
-    .unwrap_or_default()
+  path.file_name().map_or_default(|name| name.to_string_lossy().into_owned())
 }
 
 /// How a file about to be uploaded shows in its message until the server answers with the real attachment.
