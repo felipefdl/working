@@ -1,0 +1,19 @@
+{
+  "name": "working-website",
+  "private": true,
+  "packageManager": "bun@1.4.4",
+  "type": "module",
+  "scripts": {
+    "dev": "bun dev.ts",
+    "build": "bun build.ts --clean",
+    "card": "bun card.ts",
+    "verify": "bun fmt --check && bun check && bun test && bun run build"
+  },
+  "dependencies": {
+    "preact": "11.2.0",
+    "preact-render-to-string": "6.8.3"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.4"
+  }
+}

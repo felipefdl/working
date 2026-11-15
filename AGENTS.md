@@ -19,7 +19,7 @@ Native Google Chat client for macOS, Linux, and Windows. The GPUI app is `crates
 - `WORKING_TRACE=1` prints stream array types (and Meet screen-share shapes). Never message text, cookie values, or token values.
 - The product is unshipped: replace a surface in place rather than keeping a compatibility path.
 - When a dependency (GPUI, gpui-kit, wry, ...) lacks something, such as a corner radius on text highlights, do not work around it in app code. Stop and ask the developer whether to open an issue or a PR on that library. A workaround lands only when the feature is really needed, with an entry in [docs/workarounds.md](docs/workarounds.md) (what, why, the code location, and the upstream change that would remove it), so it can be dropped once the library catches up.
-- New crates add a child `AGENTS.md` in the same change, with only local obligations. Protocol, cache, and MCP: [crates/core/AGENTS.md](crates/core/AGENTS.md). GPUI, Meet, and theming: [crates/app/AGENTS.md](crates/app/AGENTS.md).
+- New crates add a child `AGENTS.md` in the same change, with only local obligations. Protocol, cache, and MCP: [crates/core/AGENTS.md](crates/core/AGENTS.md). GPUI, Meet, and theming: [crates/app/AGENTS.md](crates/app/AGENTS.md). The public site (Bun, outside the Cargo workspace and `just check`): [website/AGENTS.md](website/AGENTS.md).
 - `scripts/bundle.sh` signs `Working.app` with the Apple Development identity when the keychain has one. macOS ties camera and microphone grants to that signature; an ad-hoc signature changes every rebuild and drops them.
 
 ## Platforms

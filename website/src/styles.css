@@ -1,0 +1,455 @@
+/* The site follows the system, as the app does: its typeface, and its light or dark appearance. The one shape of
+   its own is the chat bubble's corner (--tail), on buttons, code, and the questions thread. */
+:root {
+  color-scheme: light dark;
+  --paper: light-dark(#ffffff, #0d0f14);
+  --raised: light-dark(#f2f4f7, #181b22);
+  --ink: light-dark(#101318, #e9ebef);
+  --muted: light-dark(#566070, #9aa3b2);
+  --line: light-dark(#e1e5ea, #272b35);
+  --mine: light-dark(#d9ebfc, #1a3048);
+  --accent: light-dark(#0a62bd, #6ab7f7);
+  --round: 1.25rem;
+  --tail: 0.3rem;
+  --page: 70rem;
+  --gutter: clamp(1.25rem, 4vw, 2.5rem);
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+  scroll-behavior: smooth;
+  scroll-padding-top: 5rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font: 1.0625rem/1.6 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+p,
+ul,
+ol,
+dl,
+dd,
+figure,
+pre,
+table {
+  margin: 0;
+}
+
+h1,
+h2 {
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1.05;
+  text-wrap: balance;
+}
+
+h1 {
+  font-size: clamp(2.5rem, 7vw, 5rem);
+}
+
+h2 {
+  font-size: clamp(1.75rem, 4vw, 2.75rem);
+}
+
+h3 {
+  font-size: 1.125rem;
+  line-height: 1.35;
+}
+
+a {
+  color: var(--accent);
+  text-underline-offset: 0.2em;
+  text-decoration-thickness: 0.06em;
+}
+
+a:hover {
+  text-decoration-thickness: 0.12em;
+}
+
+:focus-visible {
+  outline: 0.15rem solid var(--accent);
+  outline-offset: 0.2rem;
+  border-radius: 0.25rem;
+}
+
+code,
+kbd {
+  font: 0.9em var(--mono);
+}
+
+:not(pre) > code,
+kbd {
+  padding: 0.1em 0.35em;
+  border-radius: 0.35em;
+  background: var(--raised);
+  overflow-wrap: anywhere;
+}
+
+td:first-child code {
+  white-space: nowrap;
+}
+
+pre {
+  padding: 0.85rem 1.1rem;
+  border-radius: var(--round) var(--round) var(--round) var(--tail);
+  background: var(--raised);
+  overflow-x: auto;
+  line-height: 1.5;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  padding: 0.6rem 1rem 0.6rem 0;
+  border-bottom: 0.0625rem solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+th {
+  color: var(--muted);
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+.skip {
+  position: absolute;
+  left: var(--gutter);
+  top: -4rem;
+  padding: 0.5rem 1rem;
+  background: var(--ink);
+  color: var(--paper);
+}
+
+.skip:focus {
+  top: 0.5rem;
+  z-index: 2;
+}
+
+.top,
+main > *,
+.bottom {
+  width: min(100% - 2 * var(--gutter), var(--page));
+  margin-inline: auto;
+}
+
+.top {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding-block: 1.25rem;
+}
+
+.top nav {
+  display: flex;
+  gap: 1.5rem;
+  margin-left: auto;
+  font-size: 0.9375rem;
+}
+
+.top nav a {
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.top nav a:hover,
+.top nav a[aria-current] {
+  color: var(--ink);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--ink);
+  font-size: 1.125rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  text-decoration: none;
+}
+
+.brand span {
+  display: flex;
+}
+
+.mark {
+  width: 1.75rem;
+  height: 1.75rem;
+}
+
+.button {
+  display: inline-block;
+  padding: 0.8rem 1.5rem;
+  border-radius: var(--round) var(--round) var(--round) var(--tail);
+  background: var(--ink);
+  color: var(--paper);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.button:hover {
+  background: var(--accent);
+}
+
+.button.small {
+  padding: 0.45rem 1rem;
+  font-size: 0.9375rem;
+}
+
+.lede {
+  max-width: 62ch;
+  color: var(--muted);
+  font-size: clamp(1.125rem, 1.6vw, 1.3125rem);
+  line-height: 1.5;
+}
+
+.fine {
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 1rem 1.5rem;
+}
+
+/* The screenshots are always dark. In dark mode a faint light edge, drawn from the image's own alpha so rounded
+   corners stay clear, keeps the window from melting into the page. */
+.shot {
+  display: block;
+  width: 100%;
+  height: auto;
+  filter: drop-shadow(0 0 1px light-dark(transparent, rgb(255 255 255 / 0.3)))
+    drop-shadow(0 1.5rem 2.5rem light-dark(rgb(16 19 24 / 0.22), rgb(0 0 0 / 0.6)));
+}
+
+.hero {
+  display: grid;
+  gap: 1.5rem;
+  padding-block: clamp(2.5rem, 8vw, 6rem) 2rem;
+}
+
+.hero h1 {
+  max-width: 13ch;
+}
+
+.hero .shot {
+  margin-top: clamp(1.5rem, 4vw, 3rem);
+}
+
+.band {
+  display: grid;
+  gap: 1.5rem;
+  padding-block: clamp(3rem, 8vw, 6rem);
+}
+
+.tour {
+  display: grid;
+  gap: 3rem 2.5rem;
+  margin-top: 1.5rem;
+}
+
+.tour figcaption {
+  max-width: 48ch;
+  margin-top: 1.25rem;
+  color: var(--muted);
+}
+
+.tour strong {
+  color: var(--ink);
+}
+
+.features {
+  display: grid;
+  gap: 1.75rem 2.5rem;
+  margin-top: 1rem;
+}
+
+.features dt {
+  font-weight: 650;
+}
+
+.features dd {
+  color: var(--muted);
+}
+
+.systems {
+  display: grid;
+  gap: 2.5rem;
+  margin-block: 1rem;
+}
+
+.systems section {
+  display: grid;
+  align-content: start;
+  gap: 0.75rem;
+  padding-top: 1.25rem;
+  border-top: 0.125rem solid var(--ink);
+}
+
+.systems h3 {
+  font-size: 1.375rem;
+  letter-spacing: -0.02em;
+}
+
+.systems p {
+  color: var(--muted);
+}
+
+.systems pre {
+  font-size: 0.875rem;
+}
+
+/* Questions arrive as their bubbles, answers leave as yours. */
+.thread {
+  display: grid;
+  gap: 0.5rem;
+  max-width: 46rem;
+  margin-top: 1rem;
+}
+
+.bubble {
+  justify-self: start;
+  max-width: min(100%, 36rem);
+  padding: 0.7rem 1.1rem;
+  border-radius: var(--round) var(--round) var(--round) var(--tail);
+  background: var(--raised);
+  font-size: 1.0625rem;
+  font-weight: 600;
+  line-height: 1.45;
+}
+
+.bubble.mine {
+  justify-self: end;
+  margin-bottom: 1.25rem;
+  border-radius: var(--round) var(--round) var(--tail) var(--round);
+  background: var(--mine);
+  font-weight: 400;
+}
+
+.doc {
+  display: grid;
+  gap: 1.5rem;
+  max-width: 46rem;
+  margin-left: max(var(--gutter), (100% - var(--page)) / 2);
+  padding-block: clamp(1.5rem, 5vw, 3.5rem) clamp(3rem, 8vw, 6rem);
+}
+
+.doc h1 {
+  font-size: clamp(2.25rem, 6vw, 4rem);
+}
+
+.doc h2 {
+  font-size: 1.625rem;
+  letter-spacing: -0.02em;
+  line-height: 1.2;
+}
+
+.doc section {
+  display: grid;
+  gap: 0.9rem;
+  margin-top: 1.5rem;
+}
+
+.doc ul,
+.doc ol {
+  display: grid;
+  gap: 0.5rem;
+  padding-left: 1.25rem;
+}
+
+.doc .shot {
+  margin-block: 1rem;
+}
+
+.crumbs {
+  display: flex;
+  gap: 0.5rem;
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+
+.bottom {
+  display: grid;
+  gap: 1rem;
+  padding-block: 2.5rem 4rem;
+  border-top: 0.0625rem solid var(--line);
+  color: var(--muted);
+  font-size: 0.9375rem;
+}
+
+.bottom nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.bottom p {
+  max-width: 70ch;
+}
+
+@media (min-width: 40rem) {
+  .features {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (min-width: 60rem) {
+  .tour {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .features,
+  .systems {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
+@media (max-width: 47.9rem) {
+  .top {
+    flex-wrap: wrap;
+    gap: 0.75rem 1.25rem;
+  }
+
+  .top nav {
+    order: 3;
+    width: 100%;
+    margin-left: 0;
+    gap: 1.25rem;
+    overflow-x: auto;
+  }
+
+  .top .button {
+    margin-left: auto;
+  }
+}

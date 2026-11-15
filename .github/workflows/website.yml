@@ -1,0 +1,66 @@
+name: Website
+
+# Builds website/ and publishes it to GitHub Pages. The site reads the version from Cargo.toml and its
+# pictures from docs/screenshots and logo, so a change to any of them publishes it again.
+on:
+  push:
+    branches: [main]
+    paths:
+      - website/**
+      - docs/screenshots/**
+      - logo/**
+      - Cargo.toml
+      - .github/workflows/website.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One deployment at a time; a newer push waits for the one in progress rather than cutting it off.
+concurrency:
+  group: website
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version-file: website/package.json
+
+      - uses: actions/configure-pages@v6
+        id: pages
+
+      - run: bun install --frozen-lockfile
+
+      # Format, types, tests, then the build. Pages says where the site is served, custom domain included.
+      - run: bun run verify
+        env:
+          SITE_URL: ${{ steps.pages.outputs.base_url }}/
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: website/dist
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@v5
+        id: deployment
