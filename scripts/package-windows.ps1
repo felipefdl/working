@@ -1,9 +1,9 @@
 # Builds the Windows release of Working and its per-user NSIS installer:
 #   target\dist\Working_<version>_<arch>-setup.exe   (<arch>: x64 or arm64, the machine this runs on)
 # That raw installer is what latest.json points the updater at (platform keys windows-x86_64 / windows-aarch64,
-# format "nsis"); cargo-packager-updater runs it with /P /R (passive, then relaunch the app).
+# format "nsis"); cargo-packager-updater runs it with /P /R /NS (passive, relaunch the app, no Desktop shortcut).
 # With CARGO_PACKAGER_SIGN_PRIVATE_KEY (and CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD) set, it also writes the
-# installer's minisign signature, <installer>.sig, which the updater checks against the public key in updater.rs.
+# installer's minisign signature, <installer>.sig, which the updater checks against the public key in updater/mod.rs.
 # The installer and the exe are not Authenticode-signed: the project has no Windows code-signing certificate.
 #
 # Release builds check for updates only when WORKING_UPDATES=1 is set for the build, as the release workflow does.

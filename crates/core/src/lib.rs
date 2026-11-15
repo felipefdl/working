@@ -25,9 +25,9 @@ pub use calendar::{EVENT_COLORS, boundary_date, local_midnight};
 pub use engine::device_time_zone;
 pub use http::SessionCookie;
 pub use model::*;
-#[cfg(target_os = "windows")]
-pub use paths::webview_dir;
 pub use paths::{cache_dir, config_dir};
+#[cfg(target_os = "windows")]
+pub use paths::{updates_dir, webview_dir};
 
 /// True when `WORKING_DEMO=1`: the core serves a made-up workspace and never signs in.
 pub fn demo_mode() -> bool {

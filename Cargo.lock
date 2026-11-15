@@ -10189,6 +10189,7 @@ dependencies = [
  "serde",
  "serde_json",
  "soup3",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "unicode-segmentation",

@@ -3,17 +3,27 @@
 //! (only an `AppImage` updates itself: a package manager owns any other install), and Windows keeps the verified NSIS
 //! installer for the restart, which runs it. There is no setting: every release build updates itself. Local builds
 //! (`just run`) never update, because `WORKING_UPDATES` is set only by the release workflow.
+//!
+//! Each OS has a file of its own (`macos.rs`, `linux.rs`, `windows.rs`) for what differs: whether this copy can
+//! update, how the downloaded update is installed, how the restart finishes it, and what a previous update left.
 
-#[cfg(not(target_os = "windows"))]
-use std::path::{Path, PathBuf};
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
 #[cfg(target_os = "windows")]
-use std::sync::Arc;
+mod windows;
+
+#[cfg(target_os = "linux")]
+use linux as os;
+#[cfg(target_os = "macos")]
+use macos as os;
+#[cfg(target_os = "windows")]
+use windows as os;
+
 use std::time::Duration;
 
-#[cfg(target_os = "windows")]
-use cargo_packager_updater::Update;
-
-use cargo_packager_updater::{Config, UpdaterBuilder, semver::Version};
+use cargo_packager_updater::{Config, UpdaterBuilder, WindowsConfig, semver::Version};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::*;
 
@@ -31,21 +41,11 @@ const INTERVAL: Duration = Duration::from_hours(4);
 const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_mins(10);
 
-/// What the restart finishes the update with: the new bundle (macOS) or `AppImage` (Linux), already installed over the
-/// running one.
-#[cfg(not(target_os = "windows"))]
-type Pending = PathBuf;
-
-/// What the restart finishes the update with: the update and its verified installer, which replaces the running app
-/// and so waits for the restart.
-#[cfg(target_os = "windows")]
-type Pending = Arc<(Update, Vec<u8>)>;
-
 /// An update waiting for a restart.
 #[derive(Clone)]
 pub struct Ready {
   pub version: String,
-  pending: Pending,
+  pending: os::Pending,
 }
 
 /// Whether an update waits for a restart.
@@ -54,9 +54,18 @@ pub struct Updater(pub Option<Ready>);
 
 impl Global for Updater {}
 
+/// What one check came to.
+enum Outcome {
+  /// A newer version is installed or kept for the restart.
+  Ready(Ready),
+  /// Nothing newer is published.
+  Current,
+  /// This copy cannot be replaced now, so nothing was downloaded; the reason says why.
+  Blocked(String),
+}
+
 fn enabled() -> bool {
-  let installable = !cfg!(target_os = "linux") || std::env::var_os("APPIMAGE").is_some();
-  option_env!("WORKING_UPDATES") == Some("1") && installable
+  option_env!("WORKING_UPDATES") == Some("1") && os::installable()
 }
 
 /// Starts the background check loop in release builds. It stops once an update is installed.
@@ -67,17 +76,27 @@ pub fn start(cx: &mut App) {
   }
   cx.spawn(async move |cx| {
     cx.background_executor().timer(FIRST_CHECK).await;
+    // What the previous update left; whatever ran it has exited by now.
+    cx.background_executor().spawn(async { os::clean() }).await;
+    let mut told = false;
     loop {
       let result = cx.background_executor().spawn(async { check_and_install() }).await;
       match result {
-        Ok(Some(ready)) => {
+        Ok(Outcome::Ready(ready)) => {
           cx.update(|cx| {
             cx.set_global(Updater(Some(ready)));
             cx.refresh_windows();
           });
           return;
         },
-        Ok(None) => {},
+        Ok(Outcome::Current) => {},
+        // Once per run: the reason holds until the user changes something, and the loop keeps trying.
+        Ok(Outcome::Blocked(reason)) => {
+          if !told {
+            tracing::warn!("update skipped: {reason}");
+            told = true;
+          }
+        },
         Err(err) => tracing::warn!("update failed: {err}"),
       }
       cx.background_executor().timer(INTERVAL).await;
@@ -88,79 +107,33 @@ pub fn start(cx: &mut App) {
 
 /// Checks the manifest and, when a newer version exists, downloads and verifies it, and installs it where the running
 /// app can be replaced (macOS, Linux).
-fn check_and_install() -> Result<Option<Ready>, String> {
+fn check_and_install() -> Result<Outcome, String> {
+  if let Some(reason) = os::blocked() {
+    return Ok(Outcome::Blocked(reason));
+  }
   let current: Version = env!("CARGO_PKG_VERSION").parse().map_err(|err| format!("{err}"))?;
   let config = Config {
     endpoints: vec![ENDPOINT.parse().map_err(|err| format!("{err}"))?],
     pubkey: PUBKEY.into(),
-    // The default: Windows runs the NSIS installer passively (`/P /R`), which closes the app, installs, and opens it
-    // again.
-    windows: None,
+    // Windows runs the NSIS installer passively (`/P /R`, the default mode), which closes the app, installs, and opens
+    // it again. `/NS` keeps it from putting back the Desktop shortcut a user may have deleted; the Start Menu
+    // shortcut, which carries the app's notification identity, is written either way.
+    windows: Some(WindowsConfig {
+      installer_args: Some(vec!["/NS".into()]),
+      install_mode: None,
+    }),
   };
   let updater = UpdaterBuilder::new(current, config)
     .timeout(CHECK_TIMEOUT)
     .build()
     .map_err(|err| err.to_string())?;
   let Some(mut update) = updater.check().map_err(|err| err.to_string())? else {
-    return Ok(None);
+    return Ok(Outcome::Current);
   };
   update.timeout = Some(DOWNLOAD_TIMEOUT);
-  #[cfg(not(target_os = "windows"))]
-  {
-    update.download_and_install().map_err(|err| err.to_string())?;
-    Ok(Some(Ready {
-      version: update.version.clone(),
-      pending: update.extract_path,
-    }))
-  }
-  // Installing runs the installer and exits this process at once, so only the download happens now.
-  #[cfg(target_os = "windows")]
-  {
-    let bytes = update.download().map_err(|err| err.to_string())?;
-    Ok(Some(Ready {
-      version: update.version.clone(),
-      pending: Arc::new((update, bytes)),
-    }))
-  }
-}
-
-/// Opens the new bundle once this process has exited, then quits.
-#[cfg(target_os = "macos")]
-fn restart(bundle: &Path, cx: &mut App) {
-  let spawned = std::process::Command::new("/bin/sh")
-    .arg("-c")
-    .arg(r#"while kill -0 "$1" 2>/dev/null; do sleep 0.2; done; open "$2""#)
-    .arg("sh")
-    .arg(std::process::id().to_string())
-    .arg(bundle)
-    .spawn();
-  match spawned {
-    Ok(_) => cx.quit(),
-    Err(err) => tracing::warn!("restart failed: {err}"),
-  }
-}
-
-/// Runs the new `AppImage` once this process has exited, then quits. `$APPIMAGE`, not the running executable, which sits
-/// in the old image's temporary mount.
-#[cfg(target_os = "linux")]
-fn restart(appimage: &Path, cx: &mut App) {
-  cx.set_restart_path(appimage.to_path_buf());
-  cx.restart();
-}
-
-/// Runs the installer, which closes this process, installs, and opens the new version. Off the main thread: starting a
-/// process on Windows can pump the window messages, which re-enters GPUI.
-#[cfg(target_os = "windows")]
-fn restart(installer: &Pending, cx: &mut App) {
-  let installer = installer.clone();
-  cx.background_executor()
-    .spawn(async move {
-      let (update, bytes) = &*installer;
-      if let Err(err) = update.install(bytes.clone()) {
-        tracing::warn!("restart failed: {err}");
-      }
-    })
-    .detach();
+  let version = update.version.clone();
+  let pending = os::install(update)?;
+  Ok(Outcome::Ready(Ready { version, pending }))
 }
 
 /// The persistent card shown once an update is ready; the window root puts it in the bottom-right corner.
@@ -213,7 +186,7 @@ pub fn card(cx: &App) -> Option<AnyElement> {
           .text_color(rgb(ACCENT))
           .cursor_pointer()
           .hover(|style| style.opacity(0.85))
-          .on_click(move |_, _, cx| restart(&pending, cx))
+          .on_click(move |_, _, cx| os::restart(&pending, cx))
           .child("Restart"),
       )
       .into_any_element(),

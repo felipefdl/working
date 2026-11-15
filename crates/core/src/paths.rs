@@ -38,6 +38,13 @@ fn local_dir() -> PathBuf {
   dirs::data_local_dir().unwrap_or_default().join("dev.felipefdl.working")
 }
 
+/// Where the updater writes the downloaded installer, which runs from there at restart:
+/// `%LOCALAPPDATA%\dev.felipefdl.working\updates`. Only the updater writes there, so the next launch clears it.
+#[cfg(target_os = "windows")]
+pub fn updates_dir() -> PathBuf {
+  local_dir().join("updates")
+}
+
 /// The `WebView2` data folder (the webviews' cookies, cache, and storage):
 /// `%LOCALAPPDATA%\dev.felipefdl.working\WebView2`.
 ///
@@ -90,6 +97,7 @@ mod tests {
       let local = dirs::data_local_dir().unwrap().join("dev.felipefdl.working");
       assert_eq!(cache_dir(), local.join("cache"));
       assert_eq!(webview_dir(), local.join("WebView2"));
+      assert_eq!(updates_dir(), local.join("updates"));
     }
   }
 

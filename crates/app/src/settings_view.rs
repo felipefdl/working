@@ -1531,6 +1531,13 @@ impl Render for SettingsView {
           .child(section.title()),
       );
     }
+    sections = sections.child(div().flex_1()).child(
+      div()
+        .px_3()
+        .text_size(px(12.))
+        .text_color(rgb(MUTED))
+        .child(concat!("Working ", env!("CARGO_PKG_VERSION"))),
+    );
 
     let body = match self.section {
       Section::Appearance => self.appearance(settings).children(Self::desktop(cx)),

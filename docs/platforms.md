@@ -40,13 +40,15 @@ Working draws emoji with its own copy of Google's Noto Color Emoji on every dist
 - In the media viewer, a video can stay black while its sound plays. This was seen in a Fedora 44 virtual machine whose GStreamer had the needed demuxers and decoders (Matroska, VP8, VP9, AV1, H.264), so missing codec packages are not the cause there. The cause is still open: the most likely one is that VM's VA-API video decoder, which isn't confirmed. Audio, PDF, and text files open normally.
 - On the welcome screen, after the sign-in page is canceled, the window can ignore clicks until it is resized or the pointer leaves it and comes back ([gpui-kit#3985](https://github.com/longbridge/gpui-kit/issues/3985)).
 - With the window maximized, a window button can keep its hover color after the pointer leaves the window through the top edge, until the pointer comes back in ([gpui-kit#3987](https://github.com/longbridge/gpui-kit/issues/3987)).
-- The AppImage updates itself; a copy installed any other way does not.
+- The AppImage updates itself when it sits in a folder you can write to; a copy installed any other way, or in a folder you cannot write to, does not.
 
 ## Windows
 
 The installer sets Working up for your user only, with no administrator rights, and installs the Microsoft WebView2 runtime if it is missing. It is not code-signed, so SmartScreen warns before it runs: choose **More info**, then **Run anyway**.
 
 Notifications show only for the installed app, whose Start Menu shortcut carries the app's identity.
+
+Updates keep your shortcuts as they are: the Start Menu shortcut is renewed, and a Desktop shortcut you deleted does not come back.
 
 ## Shortcuts
 
@@ -70,7 +72,7 @@ Settings, the session, and the MCP token (`settings.json`, `cookies.json`, `mcp-
 | Linux | `$XDG_CONFIG_HOME/working` (`~/.config/working`) | `$XDG_CACHE_HOME/working` (`~/.cache/working`) |
 | Windows | `%APPDATA%\working` | `%LOCALAPPDATA%\dev.felipefdl.working\cache` |
 
-On Windows, the web views keep their data in `%LOCALAPPDATA%\dev.felipefdl.working\WebView2`.
+On Windows, the web views keep their data in `%LOCALAPPDATA%\dev.felipefdl.working\WebView2`, and an update's installer waits in `%LOCALAPPDATA%\dev.felipefdl.working\updates` until the next launch removes it.
 
 ## Build prerequisites
 
