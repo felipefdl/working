@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # Each architecture builds on its own runner at the same time; the release job joins them.
+  # macOS: each architecture builds on its own runner at the same time; the release job joins them.
   build:
     strategy:
       fail-fast: true
@@ -63,6 +63,7 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
+          pattern: working-*-apple-darwin
           path: target/bin
 
       - uses: dtolnay/rust-toolchain@stable
@@ -144,50 +145,137 @@ jobs:
           CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
         run: ./scripts/release.sh
 
-      - name: Generate latest.json
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json
-          import os
-          from datetime import datetime, timezone
-          from pathlib import Path
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-macos
+          path: target/dist/*
+          if-no-files-found: error
+          retention-days: 1
 
-          tag = os.environ["TAG"]
-          version = os.environ["VERSION"]
-          repo = os.environ["GITHUB_REPOSITORY"]
-          name = f"Working_{version}_universal.app.tar.gz"
-          dist = Path("target/dist")
-          signature = (dist / f"{name}.sig").read_text().strip()
-          if not signature:
-              raise SystemExit("updater signature is empty")
-          # cargo-packager-updater keys are macos-{arch}; the universal bundle serves both.
-          entry = {
-              "signature": signature,
-              "url": f"https://github.com/{repo}/releases/download/{tag}/{name}",
-              "format": "app",
-          }
-          manifest = {
-              "version": version,
-              "notes": "",
-              "pub_date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "platforms": {"macos-aarch64": entry, "macos-x86_64": entry},
-          }
-          (dist / "latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-          PY
+  # The AppImage, built on each architecture's own runner by scripts/package-linux.sh. GTK 3, WebKitGTK 4.1, and
+  # libsoup 3 stay system libraries, so the runner's Ubuntu sets the oldest glibc the AppImage runs on.
+  linux:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: linux-${{ matrix.arch }}
+          cache-on-failure: true
+
+      # GPUI, wry (WebKitGTK), the D-Bus notifications, and protoc for crates/core/build.rs; desktop-file-utils lets
+      # the script validate working.desktop.
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libsoup-3.0-dev libxkbcommon-x11-dev libx11-xcb-dev libxcb1-dev \
+            libwayland-dev libfontconfig-dev libasound2-dev libvulkan-dev libdbus-1-dev protobuf-compiler clang \
+            pkg-config desktop-file-utils
+
+      - name: Cache cargo-packager
+        id: cache-packager
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/cargo-packager
+          key: cargo-packager-0.11.8-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-packager
+        if: steps.cache-packager.outputs.cache-hit != 'true'
+        run: cargo install cargo-packager --version 0.11.8 --locked
+
+      - name: Build and sign the AppImage
+        env:
+          WORKING_UPDATES: "1"
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.PACKAGER_SIGN_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
+        run: ./scripts/package-linux.sh
 
       - uses: actions/upload-artifact@v7
         with:
-          name: dist
-          path: target/dist/*
+          name: dist-linux-${{ matrix.arch }}
+          path: |
+            target/dist/Working_*_${{ matrix.arch }}.AppImage
+            target/dist/Working_*_${{ matrix.arch }}.AppImage.sig
+          if-no-files-found: error
+          retention-days: 1
+
+  # The per-user NSIS installer, built on each architecture's own runner by scripts/package-windows.ps1. It is not
+  # Authenticode-signed; the minisign .sig is for the updater.
+  windows:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: windows-${{ matrix.arch }}
+          cache-on-failure: true
+
+      # crates/core/build.rs compiles proto/googlechat.proto with prost-build, which needs protoc.
+      - name: Install protoc
+        run: choco install protoc --no-progress -y
+
+      # ring compiles C with clang on arm64; the image puts LLVM's bin folder on PATH.
+      - name: Check clang
+        if: matrix.arch == 'arm64'
+        run: clang --version
+
+      - name: Cache cargo-packager
+        id: cache-packager
+        uses: actions/cache@v6
+        with:
+          path: ~/.cargo/bin/cargo-packager.exe
+          key: cargo-packager-0.11.8-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Install cargo-packager
+        if: steps.cache-packager.outputs.cache-hit != 'true'
+        run: cargo install cargo-packager --version 0.11.8 --locked
+
+      - name: Build and sign the installer
+        shell: pwsh
+        env:
+          WORKING_UPDATES: "1"
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY: ${{ secrets.PACKAGER_SIGN_PRIVATE_KEY }}
+          CARGO_PACKAGER_SIGN_PRIVATE_KEY_PASSWORD: ${{ secrets.PACKAGER_SIGN_PRIVATE_KEY_PASSWORD }}
+        run: ./scripts/package-windows.ps1
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist-windows-${{ matrix.arch }}
+          path: |
+            target/dist/Working_*_${{ matrix.arch }}-setup.exe
+            target/dist/Working_*_${{ matrix.arch }}-setup.exe.sig
           if-no-files-found: error
           retention-days: 1
 
   # Notes, the release, and its files are made on Linux, apart from the signing keychain. A stable tag is published
   # as the latest release; a tag with a "-" (v0.0.7-rc1) stays a draft prerelease to test by hand.
   publish:
-    needs: release
+    needs: [release, linux, windows]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -201,7 +289,8 @@ jobs:
 
       - uses: actions/download-artifact@v8
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist
 
       - name: Resolve version
@@ -226,6 +315,53 @@ jobs:
             echo "tag=${TAG}"
             echo "stable=${STABLE}"
           } >> "$GITHUB_OUTPUT"
+
+      # Every platform the updater serves, with the minisign signature of the file it downloads. A missing file or
+      # an empty signature fails the release.
+      - name: Generate latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          tag = os.environ["TAG"]
+          version = os.environ["VERSION"]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          dist = Path("dist")
+          # cargo-packager-updater keys are {os}-{arch}; the universal macOS bundle serves both Mac architectures.
+          files = {
+              "macos-aarch64": (f"Working_{version}_universal.app.tar.gz", "app"),
+              "macos-x86_64": (f"Working_{version}_universal.app.tar.gz", "app"),
+              "linux-x86_64": (f"Working_{version}_x86_64.AppImage", "appimage"),
+              "linux-aarch64": (f"Working_{version}_aarch64.AppImage", "appimage"),
+              "windows-x86_64": (f"Working_{version}_x64-setup.exe", "nsis"),
+              "windows-aarch64": (f"Working_{version}_arm64-setup.exe", "nsis"),
+          }
+          platforms = {}
+          for key, (name, kind) in files.items():
+              if not (dist / name).is_file():
+                  raise SystemExit(f"{key}: {name} is missing")
+              sig = dist / f"{name}.sig"
+              signature = sig.read_text().strip() if sig.is_file() else ""
+              if not signature:
+                  raise SystemExit(f"{key}: {sig.name} is missing or empty")
+              platforms[key] = {
+                  "signature": signature,
+                  "url": f"https://github.com/{repo}/releases/download/{tag}/{name}",
+                  "format": kind,
+              }
+          manifest = {
+              "version": version,
+              "notes": "",
+              "pub_date": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": platforms,
+          }
+          (dist / "latest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+          PY
 
       - name: Write release notes
         shell: bash
