@@ -273,16 +273,14 @@ impl EventEditor {
     ];
     title.update(cx, |state, cx| state.focus(window, cx));
 
-    let guests = held
-      .map(|event| {
-        event
-          .guests
-          .iter()
-          .filter(|guest| !guest.me)
-          .map(|guest| guest.email.clone())
-          .collect()
-      })
-      .unwrap_or_default();
+    let guests = held.map_or_default(|event| {
+      event
+        .guests
+        .iter()
+        .filter(|guest| !guest.me)
+        .map(|guest| guest.email.clone())
+        .collect()
+    });
     Self {
       kind: held.map_or(EventKind::Event, |event| event.kind),
       calendar_id: held.map_or(own, |event| event.calendar_id.clone()),

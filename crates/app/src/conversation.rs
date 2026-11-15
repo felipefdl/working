@@ -1075,10 +1075,7 @@ impl ConversationView {
       return None;
     }
     let chips = files.iter().enumerate().map(|(ix, path)| {
-      let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_default();
+      let name = path.file_name().map_or_default(|name| name.to_string_lossy().into_owned());
       let glyph = if is_image(path) {
         // The backdrop is for pictures with see-through parts.
         img(path.clone())

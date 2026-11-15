@@ -11,7 +11,7 @@
 <p align="center">Google Chat as a real desktop app for macOS, Linux, and Windows.</p>
 
 <p align="center">
-  <img src="docs/screenshots/messages.png" width="900" alt="Working in the Messages layout: every chat in one list with previews, beside the open conversation">
+  <img src="docs/screenshots/google-chat.png" width="900" alt="Working in the Google Chat layout: the sidebar with its sections beside the Product launch space, showing a link preview of the new landing page with a reaction">
 </p>
 
 ---
@@ -26,16 +26,24 @@ Pick the layout that fits how you work, switch any time in Settings, and every l
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/screenshots/google-chat.png" alt="Google Chat layout"><br><b>Google Chat.</b> The sidebar you already know, with sections, Mentions, and Starred, just faster.</td>
-    <td width="50%"><img src="docs/screenshots/rail.png" alt="Rail layout"><br><b>Rail.</b> People, Groups, Spaces, and Apps one click away, with unread counts on each.</td>
+    <td width="50%"><img src="docs/screenshots/messages.png" alt="Messages layout: every chat in one list with previews, beside the open conversation"><br><b>Messages.</b> Every chat in one list with previews, beside the conversation. Or keep the Google Chat sidebar you already know.</td>
+    <td width="50%"><img src="docs/screenshots/rail.png" alt="Rail layout: tabs with unread counts, the chat list, and a bot conversation with cards"><br><b>Rail.</b> People, Groups, Spaces, and Apps one click away, with unread counts on each.</td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/filters.png" alt="Filter chips and the sort menu"><br><b>Find people fast.</b> Filter to just people, groups, spaces, apps, or unread, then sort by recent or A to Z.</td>
-    <td width="50%"><img src="docs/screenshots/themes.png" alt="Theme picker"><br><b>28 themes.</b> Ayu, Catppuccin, Dracula, Tokyo Night, and more, previewed live with ⌘⇧T.</td>
+    <td width="50%"><img src="docs/screenshots/calendar.png" alt="The Calendar week view with an event card offering Join with Google Meet and a Going? reply"><br><b>Calendar.</b> Google Calendar in the same window: day to year views, event cards with Join and going or not, and an editor for new events.</td>
+    <td width="50%"><img src="docs/screenshots/meet.png" alt="The Meet view: a day's meetings beside the field that joins with a code or nickname"><br><b>Meet.</b> The day's meetings, a field to join with a code or a link, and new meetings in a click.</td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/settings.png" alt="Layout and density settings"><br><b>Make it yours.</b> Layout, density, sidebar side and width, auto-hide: all a click away.</td>
+    <td width="50%"><img src="docs/screenshots/filters.png" alt="The People filter chip and the sort menu open over the chat list"><br><b>Find people fast.</b> Filter to just people, groups, spaces, apps, or unread, then sort by recent or A to Z.</td>
+    <td width="50%"><img src="docs/screenshots/themes.png" alt="Theme picker previewing Ayu Dark, with Working Dark marked as the current theme"><br><b>28 themes.</b> Ayu, Catppuccin, Dracula, Tokyo Night, and more, previewed live with ⌘⇧T.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/settings.png" alt="Settings open on the density and layout options"><br><b>Make it yours.</b> Layout, density, sidebar side and width, auto-hide: all a click away.</td>
     <td width="50%"><br><b>Try it without an account.</b> These screenshots come from demo mode's made-up workspace. Run <code>just demo</code> to explore every feature before you sign in.</td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/screenshots/windows.png" alt="Working on Windows in the Ayu Dark theme: the Google Chat sidebar beside a chat showing a photo of a bowl of ramen"><br><b>On Windows.</b> The same app, with the window buttons where Windows puts them.</td>
+    <td width="50%"><img src="docs/screenshots/linux.png" alt="Working on Linux in the Messages layout: the chat list beside the Coffee chat space, where a photo of fresh coffee beans gets a reply"><br><b>On Linux.</b> An AppImage for x86_64 and Arm64, with color emoji on every distribution.</td>
   </tr>
 </table>
 
