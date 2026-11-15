@@ -21,6 +21,11 @@ use crate::util;
 pub const RAIL_WIDTH: f32 = 68.0;
 /// Width of one button, leaving a little room each side of it.
 const TAB_WIDTH: f32 = 60.0;
+/// Height of a pane button when the rail has room: its glyph and label with padding above and below.
+const TAB_HEIGHT: f32 = 56.0;
+/// The least a pane button shrinks to when the rail is short: its glyph, the gap, and one line of label, without
+/// padding. Below that the list of panes scrolls instead.
+const TAB_MIN_HEIGHT: f32 = 44.0;
 
 pub struct Rail {
   store: Entity<Store>,
@@ -120,7 +125,9 @@ fn tab_button(handle: &Entity<Store>, ix: usize, tab: &Tab, selected: bool) -> S
   v_flex()
     .id(("rail", ix))
     .w(px(TAB_WIDTH))
-    .py_1p5()
+    .h(px(TAB_HEIGHT))
+    .min_h(px(TAB_MIN_HEIGHT))
+    .justify_center()
     .items_center()
     .gap_1()
     .rounded(px(10.))
@@ -195,7 +202,6 @@ impl Render for Rail {
       .flex_shrink_0()
       .items_center()
       .gap_2()
-      .pt_2()
       .pb_3()
       .child(
         v_flex()
@@ -204,6 +210,8 @@ impl Render for Rail {
           .min_h_0()
           .w_full()
           .items_center()
+          // Inside the scrolling list, so the unread badge over the first button is not cut by its edge.
+          .pt_2()
           .gap_1()
           .overflow_y_scroll()
           .children(tabs),

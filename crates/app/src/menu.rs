@@ -11,7 +11,7 @@ use gchat_core::{Command, Core, Group, GroupId, GroupKind, Notify, Placement};
 use crate::emoji_font;
 use crate::settings::Sort;
 use crate::store::{Section, Store};
-use crate::theme::{ACCENT, BORDER, MUTED, POPOVER, RED, ROW_HOVER, TEXT, rgb};
+use crate::theme::{self, ACCENT, BORDER, MUTED, POPOVER, RED, ROW_HOVER, TEXT, rgb};
 use crate::ui::{Icon, icon};
 
 const WIDTH: f32 = 200.0;
@@ -315,9 +315,42 @@ pub fn show(at: Point<Pixels>, items: Vec<MenuItem>, window: &mut Window, cx: &m
   show_sized(at, WIDTH, items, window, cx);
 }
 
-/// Opens the context menu at `at`, `width` wide: for labels that do not fit the usual width.
+/// Opens the context menu at `at`, at least `width` wide and wider when a row's label needs it: for labels that do not
+/// fit the usual width.
 pub fn show_sized(at: Point<Pixels>, width: f32, items: Vec<MenuItem>, window: &mut Window, cx: &mut App) {
+  let width = width.max(fit_width(&items, window));
   present(Shown::new(at, items, width), window, cx);
+}
+
+/// How wide a list must be for its widest row to show whole: the frame's border, the row's margins and padding, its
+/// icon, its label as `row` draws it, and its check or chevron.
+fn fit_width(items: &[MenuItem], window: &Window) -> f32 {
+  let font = font(theme::sans());
+  items
+    .iter()
+    .map(|item| {
+      let run = TextRun {
+        len: item.label.len(),
+        font: font.clone(),
+        color: Hsla::default(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+      };
+      let label = window
+        .text_system()
+        .shape_line(item.label.clone(), px(13.), &[run], None)
+        .width()
+        .as_f32();
+      let icon = if item.icon.is_some() { 16. + 8. } else { 0. };
+      let trailing = if item.checked || !item.submenu.is_empty() {
+        8. + 16.
+      } else {
+        0.
+      };
+      2. + 8. + 24. + icon + label.ceil() + trailing
+    })
+    .fold(0., f32::max)
 }
 
 /// Opens a strip of short choices (emoji) at `at`.
