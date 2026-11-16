@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use gchat_core::{Command, Core, McpConfig, McpStatus};
+use gchat_core::{Command, Core, GroupId, McpConfig, McpStatus, Shortcut};
 use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 use serde::{Deserialize, Serialize};
@@ -331,6 +331,27 @@ impl RewriteTool {
   }
 }
 
+/// Somewhere a number key (`keys::hotkey_keys`) opens: a view, or one conversation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Place {
+  Home,
+  Mentions,
+  Starred,
+  Calendar,
+  Meet,
+  Conversation(GroupId),
+}
+
+impl From<Shortcut> for Place {
+  fn from(shortcut: Shortcut) -> Self {
+    match shortcut {
+      Shortcut::Mentions => Self::Mentions,
+      Shortcut::Starred => Self::Starred,
+    }
+  }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -352,12 +373,15 @@ pub struct Settings {
   pub show_mentions: bool,
   /// The Starred button of every layout. Off removes only the button: the view still opens from anywhere else.
   pub show_starred: bool,
-  /// The Calendar button of every layout. Off removes only the button: its key (`secondary-2`) and the Go menu still
-  /// open the view.
-  pub show_calendar: bool,
-  /// The Meet button of every layout. Off removes only the button: its key (`secondary-3`) and the Go menu still open
+  /// The Calendar button of every layout. Off removes only the button: its key (`hotkeys`) and the Go menu still open
   /// the view.
+  pub show_calendar: bool,
+  /// The Meet button of every layout. Off removes only the button: its key (`hotkeys`) and the Go menu still open the
+  /// view.
   pub show_meet: bool,
+  /// What each number key opens, by its number (1 to 9). A right-click on a view's button or a conversation assigns
+  /// one.
+  pub hotkeys: BTreeMap<u8, Place>,
   /// Dragged widths of each layout's resizable column; a layout without an entry uses `Layout::default_width`.
   pub column_widths: BTreeMap<Layout, f32>,
   /// Order of Home and of the Messages and Rail list.
@@ -428,6 +452,7 @@ impl Default for Settings {
       show_starred: true,
       show_calendar: true,
       show_meet: true,
+      hotkeys: BTreeMap::from([(1, Place::Home), (2, Place::Calendar), (3, Place::Meet)]),
       column_widths: BTreeMap::new(),
       list_sort: Sort::default(),
       list_window: ListWindow::default(),
@@ -511,6 +536,20 @@ impl Settings {
         }
       },
       Err(error) => tracing::warn!("could not save settings: {error}"),
+    }
+  }
+
+  /// The number key that opens `place`.
+  pub fn hotkey_of(&self, place: &Place) -> Option<u8> {
+    self.hotkeys.iter().find_map(|(slot, held)| (held == place).then_some(*slot))
+  }
+
+  /// Gives `place` the number key `slot`, taking it from what had it, or with `None` leaves `place` without a key. A
+  /// place has one key at most.
+  pub fn assign_hotkey(&mut self, slot: Option<u8>, place: Place) {
+    self.hotkeys.retain(|_, held| *held != place);
+    if let Some(slot) = slot {
+      self.hotkeys.insert(slot, place);
     }
   }
 
@@ -691,7 +730,7 @@ pub fn show_theme(index: usize, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-  use super::{Appearance, Settings, Sound, installed_family};
+  use super::{Appearance, Place, Settings, Sound, installed_family};
   use crate::theme::find;
 
   #[test]
@@ -837,5 +876,31 @@ mod tests {
     assert_eq!(installed_family(Some("Comic Neue"), &installed), None);
     assert_eq!(installed_family(Some(""), &installed), None);
     assert_eq!(installed_family(None, &installed), None);
+  }
+
+  #[test]
+  fn number_keys_default_to_home_calendar_and_meet() {
+    let settings: Settings = serde_json::from_str("{}").unwrap();
+    assert_eq!(settings.hotkey_of(&Place::Home), Some(1));
+    assert_eq!(settings.hotkey_of(&Place::Calendar), Some(2));
+    assert_eq!(settings.hotkey_of(&Place::Meet), Some(3));
+    assert_eq!(settings.hotkey_of(&Place::Mentions), None);
+  }
+
+  #[test]
+  fn a_number_key_moves_with_its_place_and_displaces_the_old_one() {
+    let chat = Place::Conversation(gchat_core::GroupId::Dm("jpark".into()));
+    let mut settings = Settings::default();
+    settings.assign_hotkey(Some(2), chat.clone());
+    assert_eq!(settings.hotkey_of(&chat), Some(2));
+    assert_eq!(settings.hotkey_of(&Place::Calendar), None);
+    // A place keeps one key: taking another gives the first one up.
+    settings.assign_hotkey(Some(5), chat.clone());
+    assert_eq!(settings.hotkey_of(&chat), Some(5));
+    assert!(!settings.hotkeys.contains_key(&2));
+    let back: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+    assert_eq!(back.hotkeys, settings.hotkeys);
+    settings.assign_hotkey(None, chat.clone());
+    assert_eq!(settings.hotkey_of(&chat), None);
   }
 }

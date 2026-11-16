@@ -233,7 +233,7 @@ pub fn conversation_menu(
     let Some(conv) = store.group(&id) else {
       return;
     };
-    let items = menu::conversation_items(store, &conv.g, event.position);
+    let items = menu::conversation_items(store, &conv.g, event.position, cx);
     menu::show(event.position, items, window, cx);
   }
 }

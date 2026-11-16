@@ -13,10 +13,11 @@ use gpui_kit::*;
 use crate::calendar::OpenCalendar;
 use crate::emoji_font;
 use crate::home::{ROW_HEIGHT, RowMarks, conv_row, conversation_menu, hit_row, unread_toggle};
+use crate::keys;
 use crate::meet::OpenMeet;
 use crate::menu;
 use crate::new_chat::OpenNewChat;
-use crate::settings::{Layout, Settings};
+use crate::settings::{Layout, Place, Settings};
 use crate::store::{Conv, Kind, ListRow, Pane, Store, View};
 use crate::theme::{ACCENT, ACCENT_BG, BORDER, FIELD, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, mono, rgb};
 use crate::ui::{Icon, icon};
@@ -259,7 +260,8 @@ impl ConvList {
     let shortcut_button = |id: &'static str, glyph: Icon, name: &'static str, shortcut: Shortcut| {
       let handle = self.store.clone();
       header_button(id, glyph, shown == Some(shortcut))
-        .tooltip(hint(name))
+        .tooltip(place_tip(name, shortcut.into()))
+        .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, shortcut.into()))
         .on_click(move |_, _, cx| handle.update(cx, |s, cx| s.open_shortcut(shortcut, cx)))
     };
     let (show_mentions, show_starred, show_calendar, show_meet) = {
@@ -287,14 +289,16 @@ impl ConvList {
       .when(show_calendar, |actions| {
         actions.child(fit(
           header_button("calendar", Icon::Calendar, store.view == View::Calendar)
-            .tooltip(calendar_tip)
+            .tooltip(place_tip("Calendar", Place::Calendar))
+            .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Calendar))
             .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenCalendar), cx)),
         ))
       })
       .when(show_meet, |actions| {
         actions.child(fit(
           header_button("meet", Icon::Video, store.view == View::Meet)
-            .tooltip(meet_tip)
+            .tooltip(place_tip("Meet", Place::Meet))
+            .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Meet))
             .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMeet), cx)),
         ))
       })
@@ -461,14 +465,17 @@ pub fn new_chat_tip(window: &mut Window, cx: &mut App) -> AnyView {
   Tooltip::new("New chat").action(&OpenNewChat, None).build(window, cx)
 }
 
-/// The tooltip of a Calendar button: its name and keyboard shortcut.
-pub fn calendar_tip(window: &mut Window, cx: &mut App) -> AnyView {
-  Tooltip::new("Calendar").action(&OpenCalendar, None).build(window, cx)
-}
-
-/// The tooltip of a Meet button: its name and keyboard shortcut.
-pub fn meet_tip(window: &mut Window, cx: &mut App) -> AnyView {
-  Tooltip::new("Meet").action(&OpenMeet, None).build(window, cx)
+/// The tooltip of a view's button: its name, and its number key while it has one.
+pub fn place_tip(name: &'static str, place: Place) -> impl Fn(&mut Window, &mut App) -> AnyView {
+  move |window, cx| {
+    let action = cx.global::<Settings>().hotkey_of(&place).and_then(keys::hotkey_action);
+    let tip = Tooltip::new(name);
+    match action {
+      Some(action) => tip.action(&*action, None),
+      None => tip,
+    }
+    .build(window, cx)
+  }
 }
 
 /// A tooltip naming a button.

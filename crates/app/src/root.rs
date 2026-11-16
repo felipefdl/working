@@ -1,7 +1,7 @@
 //! Window root: title bar with search and status, the layout's columns, content panel, and overlays.
 
 use chrono::NaiveDate;
-use gchat_core::{Connection, Core};
+use gchat_core::{Connection, Core, Shortcut};
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
 use std::sync::Arc;
@@ -26,11 +26,12 @@ use crate::conv_list::ConvList;
 use crate::emoji_font;
 use crate::emoji_picker::{EmojiHandle, EmojiPicker};
 use crate::home::HomeView;
+use crate::keys::{self, Hotkey1, Hotkey2, Hotkey3, Hotkey4, Hotkey5, Hotkey6, Hotkey7, Hotkey8, Hotkey9};
 use crate::meet::{MeetEvent, MeetView, OpenMeet};
 use crate::menu::{ContextMenu, MenuHandle};
 use crate::new_chat::{NewChat, NewChatEvent, OpenNewChat};
 use crate::rail::{RAIL_WIDTH, Rail};
-use crate::settings::{self, Layout, SidebarMode, SidebarSide};
+use crate::settings::{self, Layout, Place, SidebarMode, SidebarSide};
 use crate::settings_view::{SettingsEvent, SettingsView};
 use crate::shortcut::ShortcutView;
 use crate::sidebar::Sidebar;
@@ -93,8 +94,20 @@ const HOT_ZONE_WIDTH: f32 = 12.0;
 /// Width of the grab area on a column's inner edge.
 const RESIZE_HANDLE_WIDTH: f32 = 8.0;
 
-/// The application menus: the macOS menu bar, and on Linux and Windows the submenus of the top bar's menu button.
-pub fn menus() -> Vec<Menu> {
+/// The application menus: the macOS menu bar, and on Linux and Windows the submenus of the top bar's menu button. A
+/// view with a number key (`Settings::hotkeys`) is listed with that key's action, so the menu shows the key.
+pub fn menus(cx: &App) -> Vec<Menu> {
+  let place = |name: &'static str, place: Place, action: Box<dyn Action>| MenuItem::Action {
+    name: name.into(),
+    action: cx
+      .global::<settings::Settings>()
+      .hotkey_of(&place)
+      .and_then(keys::hotkey_action)
+      .unwrap_or(action),
+    os_action: None,
+    checked: false,
+    disabled: false,
+  };
   let mut app = vec![
     MenuItem::action("Settings...", OpenSettings),
     MenuItem::action("Color Theme…", OpenThemePicker),
@@ -149,9 +162,9 @@ pub fn menus() -> Vec<Menu> {
         MenuItem::action("Back", GoBack),
         MenuItem::action("Forward", GoForward),
         MenuItem::separator(),
-        MenuItem::action("Home", GoHome),
-        MenuItem::action("Calendar", OpenCalendar),
-        MenuItem::action("Meet", OpenMeet),
+        place("Home", Place::Home, Box::new(GoHome)),
+        place("Calendar", Place::Calendar, Box::new(OpenCalendar)),
+        place("Meet", Place::Meet, Box::new(OpenMeet)),
         MenuItem::action("New Chat…", OpenNewChat),
         MenuItem::action("Quick Switcher…", OpenSwitcher),
         MenuItem::separator(),
@@ -168,6 +181,46 @@ pub fn menus() -> Vec<Menu> {
     items: vec![MenuItem::action("Minimize", Minimize), MenuItem::action("Zoom", Zoom)],
   });
   menus
+}
+
+/// A menu bar command: what it does to the main window's root view.
+#[cfg(target_os = "macos")]
+pub type MenuCommand = fn(&mut RootView, &mut Window, &mut Context<RootView>);
+
+/// Answers the menu bar's commands for the app as a whole, each through `on_main`, which runs it on the main window.
+/// The root view's own listeners answer while the focus is inside it; these answer when another window is in front or
+/// nothing in the main window has the focus, so the menu items stay enabled.
+#[cfg(target_os = "macos")]
+pub fn bind_menu_commands(cx: &mut App, on_main: fn(&mut App, MenuCommand)) {
+  fn bind<A: Action>(cx: &mut App, on_main: fn(&mut App, MenuCommand), run: MenuCommand) {
+    cx.on_action(move |_: &A, cx| on_main(cx, run));
+  }
+  bind::<OpenSettings>(cx, on_main, RootView::open_settings);
+  bind::<OpenThemePicker>(cx, on_main, RootView::open_theme_picker);
+  bind::<FindInChat>(cx, on_main, RootView::find_in_chat);
+  bind::<FindNext>(cx, on_main, RootView::find_next);
+  bind::<FindPrevious>(cx, on_main, RootView::find_previous);
+  bind::<RewriteDraft>(cx, on_main, RootView::rewrite_draft);
+  bind::<ToggleSidebar>(cx, on_main, RootView::toggle_sidebar);
+  bind::<GoBack>(cx, on_main, |root, window, cx| root.step(true, window, cx));
+  bind::<GoForward>(cx, on_main, |root, window, cx| root.step(false, window, cx));
+  bind::<GoHome>(cx, on_main, RootView::go_home);
+  bind::<OpenCalendar>(cx, on_main, RootView::open_calendar);
+  bind::<OpenMeet>(cx, on_main, RootView::open_meet);
+  bind::<OpenNewChat>(cx, on_main, RootView::open_new_chat);
+  bind::<OpenSwitcher>(cx, on_main, RootView::open_switcher);
+  bind::<NextConversation>(cx, on_main, |root, window, cx| root.step_conversation(true, window, cx));
+  bind::<PreviousConversation>(cx, on_main, |root, window, cx| root.step_conversation(false, window, cx));
+  bind::<NextUnread>(cx, on_main, RootView::open_next_unread);
+  bind::<Hotkey1>(cx, on_main, |root, window, cx| root.open_hotkey(1, window, cx));
+  bind::<Hotkey2>(cx, on_main, |root, window, cx| root.open_hotkey(2, window, cx));
+  bind::<Hotkey3>(cx, on_main, |root, window, cx| root.open_hotkey(3, window, cx));
+  bind::<Hotkey4>(cx, on_main, |root, window, cx| root.open_hotkey(4, window, cx));
+  bind::<Hotkey5>(cx, on_main, |root, window, cx| root.open_hotkey(5, window, cx));
+  bind::<Hotkey6>(cx, on_main, |root, window, cx| root.open_hotkey(6, window, cx));
+  bind::<Hotkey7>(cx, on_main, |root, window, cx| root.open_hotkey(7, window, cx));
+  bind::<Hotkey8>(cx, on_main, |root, window, cx| root.open_hotkey(8, window, cx));
+  bind::<Hotkey9>(cx, on_main, |root, window, cx| root.open_hotkey(9, window, cx));
 }
 
 /// Off macOS: `items` added to `popup`, a submenu as a submenu beside it. The system menus are macOS's alone.
@@ -444,6 +497,72 @@ impl RootView {
     });
     self.theme_picker = Some((picker, sub));
     cx.notify();
+  }
+
+  /// Number key `slot`: opens the place the settings give it, if any.
+  fn open_hotkey(&mut self, slot: u8, window: &mut Window, cx: &mut Context<Self>) {
+    let Some(place) = cx.global::<settings::Settings>().hotkeys.get(&slot).cloned() else {
+      return;
+    };
+    match place {
+      Place::Home => self.go_home(window, cx),
+      Place::Calendar => self.open_calendar(window, cx),
+      Place::Meet => self.open_meet(window, cx),
+      Place::Mentions => self.open_shortcut(Shortcut::Mentions, window, cx),
+      Place::Starred => self.open_shortcut(Shortcut::Starred, window, cx),
+      Place::Conversation(id) => {
+        // A conversation that was left keeps its key, and the key does nothing.
+        if self.store.read(cx).group(&id).is_none() || !self.can_navigate(window, cx) {
+          return;
+        }
+        self.close_overlay_state();
+        self.store.update(cx, |store, cx| store.open(id, window, cx));
+      },
+    }
+  }
+
+  fn open_shortcut(&mut self, shortcut: Shortcut, window: &mut Window, cx: &mut Context<Self>) {
+    if !self.can_navigate(window, cx) {
+      return;
+    }
+    self.close_overlay_state();
+    self.store.update(cx, |store, cx| store.open_shortcut(shortcut, cx));
+    window.focus(&self.focus, cx);
+  }
+
+  fn rewrite_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.modal_open(cx) {
+      return;
+    }
+    let Some(conv) = self.store.read(cx).conv.clone() else {
+      return;
+    };
+    conv.update(cx, |conv, cx| conv.rewrite_hotkey(window, cx));
+  }
+
+  fn find_in_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.modal_open(cx) {
+      return;
+    }
+    if let Some(conv) = self.store.read(cx).conv.clone() {
+      conv.update(cx, |conv, cx| conv.open_find(window, cx));
+    } else {
+      self.search.update(cx, |state, cx| state.focus(window, cx));
+    }
+  }
+
+  fn find_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let Some(conv) = self.store.read(cx).conv.clone() else {
+      return;
+    };
+    conv.update(cx, |conv, cx| conv.find_next(window, cx));
+  }
+
+  fn find_previous(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let Some(conv) = self.store.read(cx).conv.clone() else {
+      return;
+    };
+    conv.update(cx, |conv, cx| conv.find_prev(window, cx));
   }
 
   /// Closes the picker and shows the saved theme again, which is the picked one after a pick.
@@ -1039,7 +1158,8 @@ impl RootView {
               Some(focus) => popup.action_context(focus),
               None => popup,
             };
-            let menus: Vec<OwnedMenuItem> = menus().into_iter().map(|menu| OwnedMenuItem::Submenu(menu.owned())).collect();
+            let menus: Vec<OwnedMenuItem> =
+              menus(cx).into_iter().map(|menu| OwnedMenuItem::Submenu(menu.owned())).collect();
             fill_menu(popup, &menus, window, cx)
           }),
       )
@@ -1214,37 +1334,19 @@ impl Render for RootView {
       .on_action(cx.listener(|this, _: &NextUnread, window, cx| this.open_next_unread(window, cx)))
       .on_action(cx.listener(|this, _: &ToggleSidebar, window, cx| this.toggle_sidebar(window, cx)))
       .on_action(cx.listener(|this, _: &OpenNewChat, window, cx| this.open_new_chat(window, cx)))
-      .on_action(cx.listener(|this, _: &RewriteDraft, window, cx| {
-        if this.modal_open(cx) {
-          return;
-        }
-        let Some(conv) = this.store.read(cx).conv.clone() else {
-          return;
-        };
-        conv.update(cx, |conv, cx| conv.rewrite_hotkey(window, cx));
-      }))
-      .on_action(cx.listener(|this, _: &FindInChat, window, cx| {
-        if this.modal_open(cx) {
-          return;
-        }
-        if let Some(conv) = this.store.read(cx).conv.clone() {
-          conv.update(cx, |conv, cx| conv.open_find(window, cx));
-        } else {
-          this.search.update(cx, |state, cx| state.focus(window, cx));
-        }
-      }))
-      .on_action(cx.listener(|this, _: &FindNext, window, cx| {
-        let Some(conv) = this.store.read(cx).conv.clone() else {
-          return;
-        };
-        conv.update(cx, |conv, cx| conv.find_next(window, cx));
-      }))
-      .on_action(cx.listener(|this, _: &FindPrevious, window, cx| {
-        let Some(conv) = this.store.read(cx).conv.clone() else {
-          return;
-        };
-        conv.update(cx, |conv, cx| conv.find_prev(window, cx));
-      }))
+      .on_action(cx.listener(|this, _: &RewriteDraft, window, cx| this.rewrite_draft(window, cx)))
+      .on_action(cx.listener(|this, _: &FindInChat, window, cx| this.find_in_chat(window, cx)))
+      .on_action(cx.listener(|this, _: &FindNext, window, cx| this.find_next(window, cx)))
+      .on_action(cx.listener(|this, _: &FindPrevious, window, cx| this.find_previous(window, cx)))
+      .on_action(cx.listener(|this, _: &Hotkey1, window, cx| this.open_hotkey(1, window, cx)))
+      .on_action(cx.listener(|this, _: &Hotkey2, window, cx| this.open_hotkey(2, window, cx)))
+      .on_action(cx.listener(|this, _: &Hotkey3, window, cx| this.open_hotkey(3, window, cx)))
+      .on_action(cx.listener(|this, _: &Hotkey4, window, cx| this.open_hotkey(4, window, cx)))
+      .on_action(cx.listener(|this, _: &Hotkey5, window, cx| this.open_hotkey(5, window, cx)))
+      .on_action(cx.listener(|this, _: &Hotkey6, window, cx| this.open_hotkey(6, window, cx)))
+      .on_action(cx.listener(|this, _: &Hotkey7, window, cx| this.open_hotkey(7, window, cx)))
+      .on_action(cx.listener(|this, _: &Hotkey8, window, cx| this.open_hotkey(8, window, cx)))
+      .on_action(cx.listener(|this, _: &Hotkey9, window, cx| this.open_hotkey(9, window, cx)))
       .child(chrome::top_bar(bar, TOP_BAR_HEIGHT))
       .child(
         h_flex()

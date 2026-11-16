@@ -17,7 +17,7 @@ use crate::notify;
 #[cfg(target_os = "macos")]
 use crate::permissions::{self, Media, Status};
 use crate::settings::{
-  self, ActivityStatus, Appearance, DEFAULT_REWRITE_INSTRUCTION, Layout, ListWindow, McpState, MessageStyle,
+  self, ActivityStatus, Appearance, DEFAULT_REWRITE_INSTRUCTION, Layout, ListWindow, McpState, MessageStyle, Place,
   RewriteTool, Settings, SidebarMode, SidebarSide, Sound, ThreadView,
 };
 use crate::status::{self, DndState};
@@ -35,6 +35,14 @@ const NOTIFICATIONS_PANE: &str = "x-apple.systempreferences:com.apple.Notificati
 /// The least and the most the Settings window measures as the main window grows.
 const SETTINGS_SIZE: (Size<f32>, Size<f32>) =
   (Size { width: 780.0, height: 500.0 }, Size { width: 1120.0, height: 860.0 });
+
+/// What still opens a view whose button is hidden: its number key, while it has one, and the Go menu.
+fn still_opens(settings: &Settings, place: &Place) -> String {
+  match settings.hotkey_of(place).and_then(keys::hotkey_keys) {
+    Some(binding) => format!("{} and the Go menu still open it.", keys::text(binding)),
+    None => "The Go menu still opens it.".into(),
+  }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
@@ -971,8 +979,8 @@ impl SettingsView {
             Self::row(
               "Show Calendar",
               format!(
-                "The Calendar button in the sidebar, the Chats header, or the rail. {} and the Go menu still open it.",
-                keys::text("secondary-2")
+                "The Calendar button in the sidebar, the Chats header, or the rail. {}",
+                still_opens(&settings, &Place::Calendar)
               ),
               false,
             )
@@ -985,8 +993,8 @@ impl SettingsView {
             Self::row(
               "Show Meet",
               format!(
-                "The Meet button in the sidebar, the Chats header, or the rail. {} and the Go menu still open it.",
-                keys::text("secondary-3")
+                "The Meet button in the sidebar, the Chats header, or the rail. {}",
+                still_opens(&settings, &Place::Meet)
               ),
               false,
             )

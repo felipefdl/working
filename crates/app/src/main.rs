@@ -137,6 +137,16 @@ fn reopen(cx: &mut App) {
   cx.activate(true);
 }
 
+/// Runs a menu bar command on the main window whatever has the focus, bringing the window forward (or back) first.
+#[cfg(target_os = "macos")]
+fn on_main(cx: &mut App, run: root::MenuCommand) {
+  reopen(cx);
+  let Some(window) = cx.try_global::<Main>().and_then(|main| main.window.downcast::<RootView>()) else {
+    return;
+  };
+  let _ = window.update(cx, run);
+}
+
 fn main() {
   #[cfg(target_os = "windows")]
   {
@@ -179,7 +189,7 @@ fn main() {
     cx.on_action(|_: &Quit, cx| cx.quit());
     #[cfg(target_os = "macos")]
     {
-      use crate::root::{Hide, HideOthers, Minimize, ShowAll, Zoom, menus};
+      use crate::root::{Hide, HideOthers, Minimize, ShowAll, Zoom, bind_menu_commands, menus};
       cx.on_action(|_: &Hide, cx| cx.hide());
       cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
       cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
@@ -193,8 +203,19 @@ fn main() {
           let _ = window.update(cx, |_, window, _| window.zoom_window());
         }
       });
+      bind_menu_commands(cx, on_main);
       // Only macOS has a menu bar of its own: elsewhere the main window's top bar has a button with these menus.
-      cx.set_menus(menus());
+      cx.set_menus(menus(cx));
+      // The menu bar shows each view's number key: it is written again when the keys change hands.
+      let mut shown = cx.global::<Settings>().hotkeys.clone();
+      cx.observe_global::<Settings>(move |cx| {
+        let hotkeys = &cx.global::<Settings>().hotkeys;
+        if *hotkeys != shown {
+          shown = hotkeys.clone();
+          cx.set_menus(menus(cx));
+        }
+      })
+      .detach();
     }
     updater::start(cx);
 

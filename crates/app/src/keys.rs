@@ -10,14 +10,49 @@ use gpui_kit::component::input::Escape;
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::*;
 
-use crate::calendar::OpenCalendar;
 use crate::conversation::{FormatBold, FormatBulletedList, FormatItalic, FormatStrikethrough};
-use crate::meet::OpenMeet;
 use crate::new_chat::OpenNewChat;
 use crate::root::{
-  FindInChat, FindNext, FindPrevious, GoBack, GoForward, GoHome, NextConversation, NextUnread, OpenSettings,
-  OpenSwitcher, OpenThemePicker, PreviousConversation, Quit, RewriteDraft, ToggleSidebar,
+  FindInChat, FindNext, FindPrevious, GoBack, GoForward, NextConversation, NextUnread, OpenSettings, OpenSwitcher,
+  OpenThemePicker, PreviousConversation, Quit, RewriteDraft, ToggleSidebar,
 };
+
+// What the number keys do: each opens the place `Settings::hotkeys` gives its number.
+actions!(
+  working,
+  [Hotkey1, Hotkey2, Hotkey3, Hotkey4, Hotkey5, Hotkey6, Hotkey7, Hotkey8, Hotkey9]
+);
+
+/// The number keys, in order: the first is number 1.
+fn hotkeys() -> [(&'static str, Box<dyn Action>); 9] {
+  [
+    ("secondary-1", Box::new(Hotkey1)),
+    ("secondary-2", Box::new(Hotkey2)),
+    ("secondary-3", Box::new(Hotkey3)),
+    ("secondary-4", Box::new(Hotkey4)),
+    ("secondary-5", Box::new(Hotkey5)),
+    ("secondary-6", Box::new(Hotkey6)),
+    ("secondary-7", Box::new(Hotkey7)),
+    ("secondary-8", Box::new(Hotkey8)),
+    ("secondary-9", Box::new(Hotkey9)),
+  ]
+}
+
+/// The numbers of the number keys.
+pub const HOTKEY_SLOTS: std::ops::RangeInclusive<u8> = 1..=9;
+
+/// The binding of number key `slot`, for `text`.
+pub fn hotkey_keys(slot: u8) -> Option<&'static str> {
+  hotkeys().get(usize::from(slot).checked_sub(1)?).map(|(keys, _)| *keys)
+}
+
+/// The action of number key `slot`: a menu item or tooltip given it shows the key.
+pub fn hotkey_action(slot: u8) -> Option<Box<dyn Action>> {
+  hotkeys()
+    .into_iter()
+    .nth(usize::from(slot).checked_sub(1)?)
+    .map(|(_, action)| action)
+}
 
 /// The next conversation in the order the layout lists them. Option-Command arrows on macOS, as Mail; elsewhere
 /// Ctrl+Alt+arrows switch workspaces or rotate the screen, so Alt+arrows, as Slack.
@@ -55,13 +90,10 @@ const OS: OperatingSystem = OperatingSystem::Windows;
 
 /// Every binding: keys, action, and the key context it is live in.
 fn table() -> Vec<(&'static str, Box<dyn Action>, Option<&'static str>)> {
-  vec![
+  let mut table: Vec<(&'static str, Box<dyn Action>, Option<&'static str>)> = vec![
     ("secondary-k", Box::new(OpenSwitcher), None),
     ("secondary-shift-t", Box::new(OpenThemePicker), None),
     ("secondary-n", Box::new(OpenNewChat), None),
-    ("secondary-1", Box::new(GoHome), None),
-    ("secondary-2", Box::new(OpenCalendar), None),
-    ("secondary-3", Box::new(OpenMeet), None),
     // Safari's pair. The kit's text field binds the same keys to outdent and indent, which a chat composer has no
     // use for: binding them again in its "Input" context, after `init`, takes them back.
     ("secondary-[", Box::new(GoBack), None),
@@ -102,7 +134,9 @@ fn table() -> Vec<(&'static str, Box<dyn Action>, Option<&'static str>)> {
     ("secondary-g", Box::new(FindNext), None),
     ("secondary-shift-g", Box::new(FindPrevious), None),
     ("secondary-q", Box::new(Quit), None),
-  ]
+  ];
+  table.extend(hotkeys().into_iter().map(|(keys, action)| (keys, action, None)));
+  table
 }
 
 /// Binds every key of the table, and on macOS the app and window keys of its menu bar. Call after `gpui_kit::init`,

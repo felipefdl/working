@@ -9,7 +9,8 @@ use gpui_kit::*;
 use gchat_core::{Command, Core, Group, GroupId, GroupKind, Notify, Placement};
 
 use crate::emoji_font;
-use crate::settings::Sort;
+use crate::keys;
+use crate::settings::{Place, Settings, Sort};
 use crate::store::{Section, Store};
 use crate::theme::{self, ACCENT, BORDER, MUTED, POPOVER, RED, ROW_HOVER, TEXT, rgb};
 use crate::ui::{Icon, icon};
@@ -101,7 +102,7 @@ pub fn sort_items(current: Sort, set: impl Fn(Sort, &mut App) + 'static) -> Vec<
 }
 
 /// What a right-click at `at` on a conversation row offers. Every list builds its menu here, so they offer the same.
-pub fn conversation_items(store: &Store, group: &Group, at: Point<Pixels>) -> Vec<MenuItem> {
+pub fn conversation_items(store: &Store, group: &Group, at: Point<Pixels>, cx: &App) -> Vec<MenuItem> {
   let core = &store.core;
   let id = &group.id;
   let mut items = vec![
@@ -123,6 +124,7 @@ pub fn conversation_items(store: &Store, group: &Group, at: Point<Pixels>) -> Ve
     notify_menu(core, group),
   ];
   items.extend(move_menu(core, group, &store.custom_sections()));
+  items.push(hotkey_menu(store, &Place::Conversation(id.clone()), cx));
   let link = conversation_link(id);
   items.push(MenuItem::new("Copy link", move |_, cx| {
     cx.write_to_clipboard(ClipboardItem::new_string(link.clone()));
@@ -131,6 +133,62 @@ pub fn conversation_items(store: &Store, group: &Group, at: Point<Pixels>) -> Ve
   items.extend(closing.next().map(MenuItem::separated));
   items.extend(closing);
   items
+}
+
+/// What a number key's place is called in the Assign shortcut submenu. Nothing for a conversation that is gone.
+fn place_name(store: &Store, place: &Place) -> Option<String> {
+  Some(match place {
+    Place::Home => "Home".into(),
+    Place::Mentions => "Mentions".into(),
+    Place::Starred => "Starred".into(),
+    Place::Calendar => "Calendar".into(),
+    Place::Meet => "Meet".into(),
+    Place::Conversation(id) => store.group(id)?.g.name.clone(),
+  })
+}
+
+/// The Assign shortcut submenu of `place`: the number keys, its own checked and each taken one saying what it would
+/// replace, then Remove shortcut while it has one. A pick gives `place` that key, taking it from what had it.
+pub fn hotkey_menu(store: &Store, place: &Place, cx: &App) -> MenuItem {
+  let settings = cx.global::<Settings>();
+  let current = settings.hotkey_of(place);
+  let mut items: Vec<MenuItem> = keys::HOTKEY_SLOTS
+    .filter_map(|slot| {
+      let keys = keys::text(keys::hotkey_keys(slot)?);
+      let taken = settings.hotkeys.get(&slot).filter(|held| *held != place);
+      let label = match taken.and_then(|held| place_name(store, held)) {
+        Some(name) => format!("{keys} · replaces {name}"),
+        None => keys,
+      };
+      let place = place.clone();
+      Some(
+        MenuItem::new(label, move |_, cx| {
+          Settings::update(cx, |settings| settings.assign_hotkey(Some(slot), place.clone()));
+        })
+        .checked(current == Some(slot)),
+      )
+    })
+    .collect();
+  if current.is_some() {
+    let place = place.clone();
+    items.push(
+      MenuItem::new("Remove shortcut", move |_, cx| {
+        Settings::update(cx, |settings| settings.assign_hotkey(None, place.clone()));
+      })
+      .separated(),
+    );
+  }
+  MenuItem::submenu("Assign shortcut", items)
+}
+
+/// A view button's right-click: its Assign shortcut submenu, at the pointer.
+pub fn place_menu(handle: &Entity<Store>, place: Place) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+  let handle = handle.clone();
+  move |event, window, cx| {
+    cx.stop_propagation();
+    let items = vec![hotkey_menu(handle.read(cx), &place, cx)];
+    show(event.position, items, window, cx);
+  }
 }
 
 /// A choice that sends `command`.

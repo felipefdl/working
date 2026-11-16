@@ -8,10 +8,11 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::calendar::OpenCalendar;
-use crate::conv_list::{calendar_tip, meet_tip, new_chat_tip, pane_title};
+use crate::conv_list::{new_chat_tip, pane_title, place_tip};
 use crate::meet::OpenMeet;
+use crate::menu;
 use crate::new_chat::OpenNewChat;
-use crate::settings::Settings;
+use crate::settings::{Place, Settings};
 use crate::store::{Kind, Pane, Section, Store, Tab, View};
 use crate::theme::{ACCENT, BG, FIELD, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, TEXT_STRONG, Tone, rgb};
 use crate::ui::{Icon, icon};
@@ -219,14 +220,16 @@ impl Render for Rail {
       .when(show_calendar, |rail| {
         rail.child(
           view_button("rail-calendar", Icon::Calendar, "Calendar", store.view == View::Calendar)
-            .tooltip(calendar_tip)
+            .tooltip(place_tip("Calendar", Place::Calendar))
+            .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Calendar))
             .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenCalendar), cx)),
         )
       })
       .when(show_meet, |rail| {
         rail.child(
           view_button("rail-meet", Icon::Video, "Meet", store.view == View::Meet)
-            .tooltip(meet_tip)
+            .tooltip(place_tip("Meet", Place::Meet))
+            .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Meet))
             .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMeet), cx)),
         )
       })

@@ -11,12 +11,12 @@ use gpui_kit::*;
 use gchat_core::Shortcut;
 
 use crate::calendar::OpenCalendar;
-use crate::conv_list::{calendar_tip, meet_tip};
+use crate::conv_list::place_tip;
 use crate::home::conversation_menu;
 use crate::meet::OpenMeet;
 use crate::menu;
 use crate::new_chat::OpenNewChat;
-use crate::settings::{Layout, Settings};
+use crate::settings::{Layout, Place, Settings};
 use crate::store::{Section, SidebarItem, Store, View};
 use crate::theme::{ACCENT, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, TEXT_DIM, TEXT_STRONG, rgb};
 use crate::ui::{Icon, group_avatar, icon};
@@ -61,9 +61,12 @@ impl Sidebar {
           row
             .child(
               item_frame(selected_home)
+                .tooltip(place_tip("Home", Place::Home))
+                .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Home))
                 .on_click(move |_, _, cx| store_handle.update(cx, super::store::Store::go_home))
                 .child(icon(Icon::House, 16., TEXT))
-                .child(label("Home", false)),
+                .child(label("Home", false).flex_1())
+                .children(key_hint(&Place::Home, cx)),
             )
             .into_any_element()
         },
@@ -77,28 +80,35 @@ impl Sidebar {
           row
             .child(
               item_frame(selected_shortcut == Some(shortcut))
+                .tooltip(place_tip(name, shortcut.into()))
+                .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, shortcut.into()))
                 .on_click(move |_, _, cx| store_handle.update(cx, |s, cx| s.open_shortcut(shortcut, cx)))
                 .child(icon(glyph, 16., TEXT))
-                .child(label(name, false)),
+                .child(label(name, false).flex_1())
+                .children(key_hint(&shortcut.into(), cx)),
             )
             .into_any_element()
         },
         SidebarItem::Calendar => row
           .child(
             item_frame(selected_calendar)
-              .tooltip(calendar_tip)
+              .tooltip(place_tip("Calendar", Place::Calendar))
+              .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Calendar))
               .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenCalendar), cx))
               .child(icon(Icon::Calendar, 16., TEXT))
-              .child(label("Calendar", false)),
+              .child(label("Calendar", false).flex_1())
+              .children(key_hint(&Place::Calendar, cx)),
           )
           .into_any_element(),
         SidebarItem::Meet => row
           .child(
             item_frame(selected_meet)
-              .tooltip(meet_tip)
+              .tooltip(place_tip("Meet", Place::Meet))
+              .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Meet))
               .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMeet), cx))
               .child(icon(Icon::Video, 16., TEXT))
-              .child(label("Meet", false)),
+              .child(label("Meet", false).flex_1())
+              .children(key_hint(&Place::Meet, cx)),
           )
           .into_any_element(),
         SidebarItem::Header(section) => {
@@ -199,6 +209,7 @@ impl Sidebar {
                 .on_mouse_down(MouseButton::Right, right_click)
                 .child(group_avatar(&store.images, cx, &conv.g, 20.))
                 .child(div().flex_1().min_w_0().child(label(&conv.g.name, conv.g.unread).truncate()))
+                .children(key_hint(&Place::Conversation(conv.g.id.clone()), cx))
                 .when(conv.g.pinned, |d| d.child(icon(Icon::Pin, 12., MUTED)))
                 .when(conv.g.unread && !conv.g.pinned, |d| {
                   d.child(div().size(px(7.)).flex_shrink_0().rounded_full().bg(rgb(ACCENT)))
@@ -259,6 +270,18 @@ fn label(text: &str, bold: bool) -> Div {
     .text_color(rgb(if bold { TEXT_STRONG } else { TEXT_DIM }))
     .when(bold, |d| d.font_weight(FontWeight::SEMIBOLD))
     .child(text.to_string())
+}
+
+/// The number key that opens a row's place, dim at the row's right edge, while it has one.
+fn key_hint(place: &Place, cx: &App) -> Option<Div> {
+  let keys = cx.global::<Settings>().hotkey_of(place).and_then(crate::keys::hotkey_keys)?;
+  Some(
+    div()
+      .flex_shrink_0()
+      .text_size(px(11.))
+      .text_color(rgb(MUTED))
+      .child(crate::keys::text(keys)),
+  )
 }
 
 impl Render for Sidebar {
