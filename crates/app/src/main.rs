@@ -46,7 +46,7 @@ mod call {
   }
 
   /// No call window, so no notification is a call's.
-  pub fn show_chat(_: &str, _: &mut gpui_kit::App) -> bool {
+  pub const fn show_chat(_: &str, _: &mut gpui_kit::App) -> bool {
     false
   }
 }
