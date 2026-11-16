@@ -7,16 +7,16 @@
   reason = "bootstrap page scraping and protobuf request headers"
 )]
 
-use std::sync::Arc;
-use std::sync::RwLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use prost::Message;
-use reqwest::cookie::Jar;
+use reqwest::cookie::{CookieStore, Jar};
+use reqwest::header::HeaderValue;
 use serde::Deserialize;
 
 use crate::proto;
@@ -70,6 +70,80 @@ fn load_cookies(jar: &Jar, path: &std::path::Path) -> Result<()> {
   Ok(())
 }
 
+/// The chat session's cookie jar, which also keeps what Google sets while the session runs (it refreshes
+/// cookies such as `SIDCC` on ordinary answers), until `Http::save_refreshed` writes that to the session file.
+/// Without it the file would hold the cookies of the sign-in for as long as the session lasts.
+#[derive(Default)]
+struct SessionJar {
+  jar: Jar,
+  refreshed: Mutex<Vec<SessionCookie>>,
+}
+
+impl SessionJar {
+  fn refreshed(&self) -> std::sync::MutexGuard<'_, Vec<SessionCookie>> {
+    self.refreshed.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+  }
+}
+
+impl CookieStore for SessionJar {
+  fn set_cookies(&self, cookie_headers: &mut dyn Iterator<Item = &HeaderValue>, url: &reqwest::Url) {
+    let headers: Vec<&HeaderValue> = cookie_headers.collect();
+    {
+      let mut refreshed = self.refreshed();
+      let set = headers.iter().filter_map(|header| set_cookie(header.to_str().ok()?, url));
+      for cookie in set {
+        refreshed.retain(|held| !same_cookie(held, &cookie));
+        refreshed.push(cookie);
+      }
+    }
+    self.jar.set_cookies(&mut headers.into_iter(), url);
+  }
+
+  fn cookies(&self, url: &reqwest::Url) -> Option<HeaderValue> {
+    self.jar.cookies(url)
+  }
+}
+
+/// Two cookies are one when name, domain, and path agree.
+pub(crate) fn same_cookie(a: &SessionCookie, b: &SessionCookie) -> bool {
+  a.name == b.name && a.domain == b.domain && a.path == b.path
+}
+
+/// Reads a `Set-Cookie` header from `url` as a cookie of the session file: one for `chat.google.com` alone or
+/// for every `google.com` host, written as the file writes them. A header that takes a cookie away, or sets one
+/// for any other host, reads as none.
+fn set_cookie(header: &str, url: &reqwest::Url) -> Option<SessionCookie> {
+  let mut parts = header.split(';').map(str::trim);
+  let (name, value) = parts.next()?.split_once('=')?;
+  let mut domain = None;
+  let mut path = None;
+  for part in parts {
+    let (key, setting) = part.split_once('=').unwrap_or((part, ""));
+    match key.to_ascii_lowercase().as_str() {
+      "domain" => domain = Some(setting.trim_start_matches('.').to_ascii_lowercase()),
+      "path" => path = Some(setting),
+      // How a cookie is taken away: no time left to live, or an expiry at the start of the epoch.
+      "max-age" if setting.parse::<i64>().is_ok_and(|seconds| seconds <= 0) => return None,
+      "expires" if setting.contains("1970") => return None,
+      _ => {},
+    }
+  }
+  if name.is_empty() || value.is_empty() {
+    return None;
+  }
+  let domain = match domain.as_deref() {
+    Some("google.com") => ".google.com",
+    None if url.host_str() == Some("chat.google.com") => "chat.google.com",
+    _ => return None,
+  };
+  Some(SessionCookie {
+    name: name.into(),
+    value: value.into(),
+    domain: domain.into(),
+    path: path.filter(|path| !path.is_empty()).unwrap_or("/").into(),
+  })
+}
+
 fn root_path() -> String {
   "/".into()
 }
@@ -93,18 +167,21 @@ pub struct Http {
   stream_client: reqwest::Client,
   /// The session cookies, shared with both clients, and the file they come from. A Meet call rotates the
   /// session's cookies and saves the new ones to that file; they are read again when the old ones stop working.
-  jar: Arc<Jar>,
+  jar: Arc<SessionJar>,
   cookie_path: std::path::PathBuf,
   xsrf: RwLock<Option<String>>,
   /// Token the web app's page RPCs require, read with the XSRF token.
   page_token: RwLock<Option<String>>,
   request_id: AtomicU64,
+  /// The session was refused and `session.log` has a line about it: one line a sign-out, however many
+  /// requests run into it.
+  refused: AtomicBool,
 }
 
 impl Http {
   pub fn from_cookie_file(path: &std::path::Path) -> Result<Self> {
-    let jar = Arc::new(Jar::default());
-    load_cookies(&jar, path)?;
+    let jar = Arc::new(SessionJar::default());
+    load_cookies(&jar.jar, path)?;
 
     // No default Origin or Referer: with them, attachment URLs answer 204 instead of redirecting to the file.
     let builder = || {
@@ -123,11 +200,27 @@ impl Http {
       xsrf: RwLock::new(None),
       page_token: RwLock::new(None),
       request_id: AtomicU64::new(1),
+      refused: AtomicBool::new(false),
     })
   }
 
+  /// Takes the session file's cookies again, after a sign-in or a Meet call wrote it. What Google set for the
+  /// session held before is dropped: it is not the file's session any more.
   pub fn reload_cookies(&self) -> Result<()> {
-    load_cookies(&self.jar, &self.cookie_path)
+    self.jar.refreshed().clear();
+    load_cookies(&self.jar.jar, &self.cookie_path)
+  }
+
+  /// Writes the cookies Google set since the last call into the session file, so the next launch, and the next
+  /// Meet call, start from the session as it is now. Does nothing while there is no file: signed out.
+  pub fn save_refreshed(&self) {
+    let refreshed = std::mem::take(&mut *self.jar.refreshed());
+    if refreshed.is_empty() || !self.cookie_path.is_file() {
+      return;
+    }
+    if let Err(error) = crate::merge_session_cookies(&self.cookie_path, refreshed) {
+      tracing::warn!("could not save the session's refreshed cookies: {error}");
+    }
   }
 
   pub const fn stream_client(&self) -> &reqwest::Client {
@@ -144,13 +237,45 @@ impl Http {
 
   /// Reads the XSRF token from the web app's bootstrap page. Also the cheapest check that the session is alive.
   pub async fn refresh_xsrf(&self) -> Result<String> {
-    match self.read_bootstrap().await {
+    let result = match self.read_bootstrap().await {
       Err(error) if error.downcast_ref::<SignedOut>().is_some() => {
         // The cookies in use were rotated away (by a Meet call): take the saved ones and try once more.
-        load_cookies(&self.jar, &self.cookie_path)?;
+        load_cookies(&self.jar.jar, &self.cookie_path)?;
         self.read_bootstrap().await
       },
       result => result,
+    };
+    match &result {
+      Ok(_) => self.refused.store(false, Ordering::Relaxed),
+      Err(error) if error.downcast_ref::<SignedOut>().is_some() => self.note_refused(),
+      Err(_) => {},
+    }
+    result
+  }
+
+  /// Google refused the session, with the saved cookies too. `session.log`, beside the session file, gets a line
+  /// with when, and how long ago the session file was written: a file written moments ago was refused by Google
+  /// while fresh, an old one may only have gone stale. Never a cookie's name or value.
+  fn note_refused(&self) {
+    if self.refused.swap(true, Ordering::Relaxed) {
+      return;
+    }
+    let written = std::fs::metadata(&self.cookie_path)
+      .and_then(|file| file.modified())
+      .ok()
+      .and_then(|at| at.elapsed().ok())
+      .map_or_else(|| "at an unknown time".to_string(), |age| format!("{} s before", age.as_secs()));
+    let line = format!(
+      "{} Google refused the session; the session file was written {written}\n",
+      chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+    tracing::warn!("{}", line.trim_end());
+    let log = std::fs::OpenOptions::new()
+      .create(true)
+      .append(true)
+      .open(self.cookie_path.with_file_name("session.log"));
+    if let Ok(mut log) = log {
+      let _ = std::io::Write::write_all(&mut log, line.as_bytes());
     }
   }
 
@@ -427,5 +552,70 @@ pub fn request_header() -> proto::RequestHeader {
       ..Default::default()
     }),
     ..Default::default()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use reqwest::cookie::CookieStore;
+  use reqwest::header::HeaderValue;
+
+  use super::{SessionJar, set_cookie};
+
+  fn from(host: &str, header: &str) -> Option<(String, String, String, String)> {
+    let url = format!("https://{host}/u/0/").parse().expect("url");
+    set_cookie(header, &url).map(|cookie| (cookie.name, cookie.value, cookie.domain, cookie.path))
+  }
+
+  #[test]
+  fn set_cookie_reads_what_the_session_file_holds() {
+    let all = |name: &str, value: &str, domain: &str| Some((name.into(), value.into(), domain.into(), "/".into()));
+    assert_eq!(
+      from(
+        "chat.google.com",
+        "SIDCC=a=b; expires=Tue, 16-Nov-2027 03:20:21 GMT; path=/; domain=.google.com"
+      ),
+      all("SIDCC", "a=b", ".google.com")
+    );
+    // No Domain: the cookie of the host that set it.
+    assert_eq!(
+      from("chat.google.com", "COMPASS=x; path=/; Secure; HttpOnly"),
+      all("COMPASS", "x", "chat.google.com")
+    );
+    assert_eq!(
+      from("chat.google.com", "OSID=x; Domain=google.com"),
+      all("OSID", "x", ".google.com")
+    );
+  }
+
+  #[test]
+  fn set_cookie_skips_removals_and_other_hosts() {
+    assert_eq!(from("chat.google.com", "SID=; path=/; domain=.google.com"), None);
+    assert_eq!(from("chat.google.com", "SID=x; Max-Age=0; domain=.google.com"), None);
+    assert_eq!(
+      from(
+        "chat.google.com",
+        "SID=EXPIRED; expires=Thu, 01-Jan-1970 00:00:00 GMT; domain=.google.com"
+      ),
+      None
+    );
+    assert_eq!(from("lh3.googleusercontent.com", "NID=x; path=/"), None);
+    assert_eq!(from("chat.google.com", "NID=x; domain=.example.com"), None);
+  }
+
+  #[test]
+  fn the_jar_keeps_the_newest_of_each_refreshed_cookie() {
+    let jar = SessionJar::default();
+    let url = "https://chat.google.com/u/0/".parse().expect("url");
+    let headers = ["SIDCC=one; path=/; domain=.google.com", "SIDCC=two; path=/; domain=.google.com"]
+      .map(|header| HeaderValue::from_str(header).expect("header"));
+    jar.set_cookies(&mut headers.iter(), &url);
+    let refreshed = jar.refreshed();
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(refreshed[0].value, "two");
+    drop(refreshed);
+    // The requests send it too.
+    let sent = jar.cookies(&url).expect("cookie header");
+    assert_eq!(sent.to_str().expect("text"), "SIDCC=two");
   }
 }

@@ -64,7 +64,7 @@ Settings and the app's menus show each shortcut the way your system writes it.
 
 ## Where Working keeps its files
 
-Settings, the session, and the MCP token (`settings.json`, `cookies.json`, `mcp-token`) live in one folder, the cache in another:
+Settings, the session, and the MCP token (`settings.json`, `cookies.json`, `mcp-token`) live in one folder, the cache in another. `session.log` in the settings folder gets one line each time Google asks you to sign in again: when, and how long before that the session was last saved.
 
 | System | Settings and session | Cache |
 |---|---|---|

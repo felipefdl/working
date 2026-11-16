@@ -332,6 +332,7 @@ async fn run(
   tokio::spawn(engine.clone().stream_loop(stream_rx));
   tokio::spawn(engine.clone().presence_loop());
   tokio::spawn(engine.clone().statuses_loop());
+  tokio::spawn(engine.clone().session_loop());
   tokio::spawn({
     let engine = engine.clone();
     async move {
@@ -2861,6 +2862,9 @@ fn meeting_link(call: &proto::CreateVideoCallResponse) -> Option<String> {
 /// How often the server is told the user is still there (or still gone).
 const HEARTBEAT: Duration = Duration::from_secs(120);
 
+/// How often the cookies Google refreshed go into the session file.
+const SESSION_SAVE: Duration = Duration::from_secs(120);
+
 /// The time zone of this computer, as Google Chat names zones.
 pub fn device_time_zone() -> String {
   iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".into())
@@ -2868,6 +2872,14 @@ pub fn device_time_zone() -> String {
 
 // Presence and do-not-disturb schedules.
 impl Engine {
+  /// Keeps the session file at what the session is now: Google refreshes cookies while the chat runs.
+  async fn session_loop(self: Arc<Self>) {
+    loop {
+      tokio::time::sleep(SESSION_SAVE).await;
+      self.http.save_refreshed();
+    }
+  }
+
   async fn presence_loop(self: Arc<Self>) {
     loop {
       tokio::time::sleep(HEARTBEAT).await;

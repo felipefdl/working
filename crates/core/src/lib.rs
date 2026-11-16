@@ -19,7 +19,7 @@ mod proto;
 
 use std::io::{self, Write};
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 pub use calendar::{EVENT_COLORS, boundary_date, local_midnight};
 pub use engine::device_time_zone;
@@ -41,18 +41,26 @@ pub fn session_cookies() -> Vec<SessionCookie> {
   http::read_cookies(&config_dir().join("cookies.json")).unwrap_or_default()
 }
 
+/// One writer of the session file at a time: the chat side saves what Google refreshes from the core's threads,
+/// and a Meet call saves its rotated cookies from the app's.
+static SESSION_FILE: Mutex<()> = Mutex::new(());
+
 /// Merges Meet-rotated session cookies into the saved file.
 ///
 /// Google rotates cookies while a call is open. Cookies the browser does not hold are kept. Answers whether
 /// the file changed.
 pub fn save_session_cookies(current: Vec<SessionCookie>) -> io::Result<bool> {
-  let path = config_dir().join("cookies.json");
-  let saved = session_cookies();
+  merge_session_cookies(&config_dir().join("cookies.json"), current)
+}
+
+/// Puts `current` into the session file at `path`: a cookie the file holds takes the new value, any other is
+/// added, and what `current` does not name stays. Answers whether the file changed.
+pub(crate) fn merge_session_cookies(path: &Path, current: Vec<SessionCookie>) -> io::Result<bool> {
+  let _writing = SESSION_FILE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+  let saved = http::read_cookies(path).unwrap_or_default();
   let mut merged = saved.clone();
   for cookie in current {
-    let same =
-      |held: &&mut SessionCookie| held.name == cookie.name && held.domain == cookie.domain && held.path == cookie.path;
-    match merged.iter_mut().find(same) {
+    match merged.iter_mut().find(|held| http::same_cookie(held, &cookie)) {
       Some(held) => held.value = cookie.value,
       None => merged.push(cookie),
     }
@@ -60,7 +68,7 @@ pub fn save_session_cookies(current: Vec<SessionCookie>) -> io::Result<bool> {
   if merged == saved {
     return Ok(false);
   }
-  write_cookies(&path, &merged)?;
+  write_cookies(path, &merged)?;
   Ok(true)
 }
 
@@ -127,7 +135,7 @@ impl Core {
 
 #[cfg(test)]
 mod tests {
-  use super::{SessionCookie, write_cookies};
+  use super::{SessionCookie, merge_session_cookies, write_cookies};
   use crate::http::read_cookies;
 
   fn cookie(name: &str, domain: &str, value: &str) -> SessionCookie {
@@ -151,6 +159,31 @@ mod tests {
     assert!(read.iter().zip(&cookies).all(|(got, want)| {
       got.name == want.name && got.domain == want.domain && got.path == want.path && got.value == want.value
     }));
+    let _ = std::fs::remove_dir_all(&dir);
+  }
+
+  #[test]
+  fn merge_updates_and_adds_and_keeps_the_rest() {
+    let dir = std::env::temp_dir().join(format!("working-session-merge-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("cookies.json");
+    let saved = vec![cookie("SID", ".google.com", "kept"), cookie("SIDCC", ".google.com", "old")];
+    write_cookies(&path, &saved).expect("write");
+    let refreshed = vec![
+      cookie("SIDCC", ".google.com", "new"),
+      cookie("COMPASS", "chat.google.com", "added"),
+    ];
+    assert!(merge_session_cookies(&path, refreshed.clone()).expect("merge"));
+    let values: Vec<_> = read_cookies(&path)
+      .expect("read")
+      .into_iter()
+      .map(|cookie| (cookie.name, cookie.value))
+      .collect();
+    let want =
+      [("SID", "kept"), ("SIDCC", "new"), ("COMPASS", "added")].map(|(name, value)| (name.into(), value.into()));
+    assert_eq!(values, want);
+    // Nothing new: the file is left alone.
+    assert!(!merge_session_cookies(&path, refreshed).expect("merge"));
     let _ = std::fs::remove_dir_all(&dir);
   }
 }
