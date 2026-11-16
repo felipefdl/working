@@ -329,13 +329,16 @@ impl RootView {
       }
     });
 
-    // A clicked notification opens its conversation.
+    // A clicked notification opens its conversation, or the chat of its call.
     let clicks = crate::notify::start();
     let target = store.clone();
     let opened = cx.spawn_in(window, async move |_, cx| {
       while let Ok(key) = clicks.recv_async().await {
         let target = target.clone();
         let opening = cx.update(|window, cx| {
+          if crate::call::show_chat(&key, cx) {
+            return;
+          }
           target.update(cx, |store, cx| store.open_key(&key, window, cx));
           cx.activate(true);
           window.activate_window();

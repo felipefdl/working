@@ -55,7 +55,7 @@ Pick the layout that fits how you work, switch any time in Settings, and every l
 - **Full conversations.** Formatted text, threads, quotes, edits, reactions, cards, attachments, and read receipts.
 - **Format as you write.** Bold, italic, strikethrough, lists, and code, from a bar or from the keyboard.
 - **Calendar and Meet in the same window.** `Cmd+2` opens Google Calendar, `Cmd+3` opens Google Meet.
-- **Calls in their own window.** Camera, microphone, and screen sharing. On Linux, meetings open in your browser.
+- **Calls in their own window.** Camera, microphone, screen sharing, and the call's chat. On Linux, meetings open in your browser.
 - **Media viewer.** Images, video, audio, PDF, and text files open inside the app.
 - **Notifications and presence.** System notifications, an unread badge, do-not-disturb schedules, and a custom status.
 - **Rewrite a draft.** `Cmd+Shift+R` rewrites your message through the Claude Code or Codex CLI you already have.

@@ -35,12 +35,19 @@ mod calendar_grid;
 mod calendar_layout;
 #[cfg(not(target_os = "linux"))]
 mod call;
+#[cfg(not(target_os = "linux"))]
+mod call_chat;
 /// `WebKitGTK` as Fedora builds it has no WebRTC (`RTCPeerConnection` stays undefined with the setting on), so a
 /// call window could never join: on Linux a meeting opens in the default browser.
 #[cfg(target_os = "linux")]
 mod call {
   pub fn open(url: &str, cx: &mut gpui_kit::App) {
     cx.open_url(url);
+  }
+
+  /// No call window, so no notification is a call's.
+  pub fn show_chat(_: &str, _: &mut gpui_kit::App) -> bool {
+    false
   }
 }
 mod chrome;

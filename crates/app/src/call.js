@@ -9,6 +9,18 @@
 (() => {
   if (window.__working) return;
 
+  // WebKit stops a page's animation frames while its window is covered or minimized, and Meet draws what changes
+  // inside one, chat messages too: a message would reach the app only when the window shows again, too late for
+  // its notification. So while the page is hidden, a frame runs from a timer. Those have negative numbers, to
+  // tell them from WebKit's when one is cancelled.
+  {
+    const frame = window.requestAnimationFrame.bind(window);
+    const cancel = window.cancelAnimationFrame.bind(window);
+    window.requestAnimationFrame = (callback) =>
+      document.hidden ? -setTimeout(() => callback(performance.now()), 16) : frame(callback);
+    window.cancelAnimationFrame = (id) => (id < 0 ? clearTimeout(-id) : cancel(id));
+  }
+
   const CSS = `
     html.working-min { background: #131314 !important; }
 
@@ -72,6 +84,8 @@
   let sent = '';
   let summary = '';
   let tilesSeen = '';
+  let chatSent = '';
+  let chatNudged = 0;
   // How loud the microphone is right now, 0 (silent or muted) to 4: the app draws it on its mic button, in
   // place of the self view Meet floats over the call.
   let voice = 0;
@@ -94,6 +108,17 @@
   const isOn = (el) => (!el ? '-' : /^turn off/i.test(label(el)) ? '1' : /^turn on/i.test(label(el)) ? '0' : '-');
   const click = (el) => el && el.click();
   const stopPresenting = () => byText(/^Stop presenting$/);
+  // Meet's chat lives in its side panel, which stays in the page once it has been opened.
+  const chatButton = () => one('button[aria-label="Chat with everyone"]');
+  const chatPanel = () => one('div[data-panel-id="2"]');
+  const chatField = () => one('textarea[aria-label="Send a message"]');
+  const setChatField = (field, text) => {
+    Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(field, text);
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+  const chatSend = () =>
+    one('button[jsname="SoqoBf"]') ||
+    [...document.querySelectorAll('button')].find((b) => label(b) === 'Send a message');
 
   function install() {
     const root = document.documentElement;
@@ -179,6 +204,61 @@
     const presenting = sharing ? '1' : '0';
     summary = [phase, isOn(mic()), camera, raised, custom ? '1' : '0', presenting].join('|');
     report();
+
+    // The app's chat panel shows what Meet's own holds, so Meet's is kept open behind the tiles: it is where
+    // the messages are, and an open panel is what Meet keeps up to date.
+    if (phase === 'call') {
+      const button = chatButton();
+      if (custom && button && button.getAttribute('aria-expanded') !== 'true' && Date.now() - chatNudged > 1500) {
+        chatNudged = Date.now();
+        click(button);
+      }
+      reportChat();
+    }
+  }
+
+  // What a message says, in parts: plain text, with Meet's line breaks, and links with their address.
+  function readParts(node, parts) {
+    const add = (text, href) => {
+      const last = parts[parts.length - 1];
+      if (last && !last.href && !href) last.text += text;
+      else if (text) parts.push({ text, href });
+    };
+    for (const child of node.childNodes) {
+      if (child.nodeType === Node.TEXT_NODE) add(child.textContent, '');
+      else if (child.nodeType !== Node.ELEMENT_NODE) continue;
+      else if (child.tagName === 'BR') add('\n', '');
+      else if (child.tagName === 'A' && child.href) add(child.textContent, child.href);
+      else readParts(child, parts);
+    }
+    return parts;
+  }
+
+  // One message of the call's chat, as Meet draws it: messages sent in a row share a line with the time, and
+  // with the sender's name when it is someone else.
+  function readMessage(el) {
+    let group = el.parentElement;
+    while (group && group.getAttribute('jsname') !== 'xySENc' && !group.querySelector('[jsname="biJjHb"]')) {
+      group = group.parentElement;
+    }
+    const stamp = group && group.querySelector('[jsname="biJjHb"]');
+    const time = stamp ? stamp.textContent.trim() : '';
+    const head = stamp && stamp.parentElement ? stamp.parentElement.textContent.trim() : '';
+    const sender = head.endsWith(time) ? head.slice(0, head.length - time.length).trim() : '';
+    return { sender, time, parts: readParts(el.querySelector('[jsname="dTKtvb"]') || el, []) };
+  }
+
+  // The chat the app's panel draws from: `chat|` and a JSON object with the messages, oldest first, and whether
+  // the meeting lets this person write, which is not known (`null`) until Meet's panel is there.
+  function reportChat() {
+    const field = chatField();
+    const messages = [...document.querySelectorAll('div[data-message-id]')].map(readMessage);
+    const writable = chatPanel() ? !!field && !field.disabled : null;
+    const chat = JSON.stringify({ messages, writable });
+    if (chat !== chatSent) {
+      chatSent = chat;
+      window.ipc.postMessage('chat|' + chat);
+    }
   }
 
   // The state the app's window draws from: `phase|mic|camera|hand|custom|presenting|voice`.
@@ -213,6 +293,37 @@
     // While the user presents, the same button stops it.
     share: () => click(stopPresenting() || share()),
     toggleHand: () => click(hand()),
+    // Writes `text` into Meet's chat field and presses its send button, which Meet enables a moment after.
+    // Meet empties its field once the message is on its way: the app hears `sent|1` then, and `sent|0` when
+    // that did not happen, with Meet's field emptied so that the next try starts clean.
+    sendChat(text) {
+      const field = chatField();
+      if (!field || field.disabled) {
+        window.ipc.postMessage('sent|0');
+        return;
+      }
+      setChatField(field, text);
+      let tries = 0;
+      let pressed = false;
+      const follow = () => {
+        if (pressed && field.value === '') {
+          window.ipc.postMessage('sent|1');
+          return;
+        }
+        if (++tries > 25) {
+          if (field.isConnected) setChatField(field, '');
+          window.ipc.postMessage('sent|0');
+          return;
+        }
+        const send = chatSend();
+        if (!pressed && send && !send.disabled) {
+          pressed = true;
+          click(send);
+        }
+        setTimeout(follow, 100);
+      };
+      follow();
+    },
     leave: () => click(leave()),
   };
 

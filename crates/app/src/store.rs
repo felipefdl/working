@@ -811,17 +811,7 @@ impl Store {
     if !wanted || (window.is_window_active() && self.is_open(&message.group)) {
       return;
     }
-    // Inside a do-not-disturb schedule, or while the status button has do not disturb on, Google Chat
-    // stays quiet, and so does this.
-    let scheduled = cx
-      .global::<crate::status::DndState>()
-      .0
-      .as_ref()
-      .is_some_and(crate::status::muted_now);
-    let manual = cx
-      .try_global::<crate::status::Mine>()
-      .is_some_and(|mine| mine.0.dnd_on(crate::status_menu::now_usec()));
-    if scheduled || manual {
+    if crate::status::quiet(cx) {
       return;
     }
     // Only what just happened: a reconnect can replay older messages.

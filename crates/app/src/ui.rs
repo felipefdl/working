@@ -52,6 +52,10 @@ pub enum Icon {
   Hand,
   #[cfg(not(target_os = "linux"))]
   PhoneOff,
+  #[cfg(not(target_os = "linux"))]
+  MessageSquare,
+  #[cfg(not(target_os = "linux"))]
+  Send,
   Monitor,
   /// The macOS permissions section of Settings, which only macOS has.
   #[cfg(target_os = "macos")]
@@ -162,6 +166,12 @@ impl Icon {
       #[cfg(not(target_os = "linux"))]
       Self::Hand => lucide!(
         r#"<path d="M18 11V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2"/><path d="M14 10V4a2 2 0 0 0-2-2a2 2 0 0 0-2 2v2"/><path d="M10 10.5V6a2 2 0 0 0-2-2a2 2 0 0 0-2 2v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/>"#
+      ),
+      #[cfg(not(target_os = "linux"))]
+      Self::MessageSquare => lucide!(r#"<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>"#),
+      #[cfg(not(target_os = "linux"))]
+      Self::Send => lucide!(
+        r#"<path d="M14.536 21.686a.5.5 0 0 0 .937-.024l6.5-19a.496.496 0 0 0-.635-.635l-19 6.5a.5.5 0 0 0-.024.937l7.93 3.18a2 2 0 0 1 1.112 1.11z"/><path d="m21.854 2.147-10.94 10.939"/>"#
       ),
       #[cfg(not(target_os = "linux"))]
       Self::PhoneOff => lucide!(

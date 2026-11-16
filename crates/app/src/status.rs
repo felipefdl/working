@@ -141,6 +141,16 @@ pub struct Mine(pub gchat_core::MyStatus);
 
 impl Global for Mine {}
 
+/// Do not disturb is on right now, by one of the account's schedules or by the status button: Google Chat stays
+/// quiet then, and so do the app's notifications.
+pub fn quiet(cx: &App) -> bool {
+  let scheduled = cx.global::<DndState>().0.as_ref().is_some_and(muted_now);
+  let manual = cx
+    .try_global::<Mine>()
+    .is_some_and(|mine| mine.0.dnd_on(crate::status_menu::now_usec()));
+  scheduled || manual
+}
+
 /// Whether a schedule that is turned on covers this moment.
 pub fn muted_now(schedules: &DndSchedules) -> bool {
   let now = Local::now();
