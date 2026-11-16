@@ -11,10 +11,12 @@
 //! without such a dock ignores it.
 
 use std::collections::HashMap;
+use std::future::poll_fn;
+use std::pin::Pin;
 use std::sync::OnceLock;
 
-use zbus::blocking::{Connection, MessageIterator};
-use zbus::zvariant::Value;
+use zbus::export::futures_core::Stream as _;
+use zbus::{Connection, MessageStream, Variant};
 
 use crate::settings::Sound;
 
@@ -52,7 +54,7 @@ static REQUESTS: OnceLock<flume::Sender<Request>> = OnceLock::new();
 /// clicked notification; it closes at once when there is no session bus.
 pub fn start() -> flume::Receiver<String> {
   let (clicked, clicks) = flume::unbounded();
-  let connection = match Connection::session() {
+  let connection = match zbus::block_on(Connection::session()) {
     Ok(connection) => connection,
     Err(error) => {
       tracing::warn!("notifications are off: no session bus: {error}");
@@ -66,7 +68,7 @@ pub fn start() -> flume::Receiver<String> {
   let signals = connection.clone();
   let listen = std::thread::Builder::new()
     .name("notify-signals".into())
-    .spawn(move || listen(&signals, &requests));
+    .spawn(move || zbus::block_on(listen(&signals, &requests)));
   if let Err(error) = listen {
     tracing::warn!("notification clicks are off: {error}");
   }
@@ -122,16 +124,19 @@ fn send(request: Request) {
 }
 
 /// Forwards the server's click and close signals to the bus thread, for as long as the bus lasts.
-fn listen(connection: &Connection, requests: &flume::Sender<Request>) {
+async fn listen(connection: &Connection, requests: &flume::Sender<Request>) {
   let rule = format!("type='signal',interface='{BUS_NAME}',path='{PATH}'");
-  let signals = match MessageIterator::for_match_rule(rule.as_str(), connection, None) {
+  let mut signals = match MessageStream::for_match_rule(rule.as_str(), connection, None).await {
     Ok(signals) => signals,
     Err(error) => {
       tracing::warn!("notification clicks are off: {error}");
       return;
     },
   };
-  for message in signals.flatten() {
+  while let Some(message) = poll_fn(|cx| Pin::new(&mut signals).poll_next(cx)).await {
+    let Ok(message) = message else {
+      continue;
+    };
     let header = message.header();
     let request = match header.member().map(zbus::names::MemberName::as_str) {
       Some("ActionInvoked") => message
@@ -168,9 +173,9 @@ struct Server {
 
 impl Server {
   fn new(connection: Connection, clicked: flume::Sender<String>) -> Self {
-    let capabilities = connection
-      .call_method(Some(BUS_NAME), PATH, Some(BUS_NAME), "GetCapabilities", &())
-      .and_then(|reply| reply.body().deserialize::<Vec<String>>());
+    let capabilities =
+      zbus::block_on(connection.call_method(Some(BUS_NAME), PATH, Some(BUS_NAME), "GetCapabilities", &()))
+        .and_then(|reply| reply.body().deserialize::<Vec<String>>());
     let markup = match capabilities {
       Ok(capabilities) => capabilities.iter().any(|capability| capability == "body-markup"),
       Err(error) => {
@@ -212,39 +217,37 @@ impl Server {
     } else {
       body.to_owned()
     };
-    let mut hints: HashMap<&str, Value<'_>> = HashMap::from([
-      ("desktop-entry", Value::from(DESKTOP_ID)),
-      ("category", Value::from("im.received")),
+    let mut hints: HashMap<&str, Variant<'_>> = HashMap::from([
+      ("desktop-entry", Variant::from(DESKTOP_ID)),
+      ("category", Variant::from("im.received")),
     ]);
     match sound {
       Sound::None => {
-        hints.insert("suppress-sound", Value::from(true));
+        hints.insert("suppress-sound", Variant::from(true));
       },
       // The sound theme's own name for an incoming instant message, which the desktop maps to its sound.
       _ => {
-        hints.insert("sound-name", Value::from("message-new-instant"));
+        hints.insert("sound-name", Variant::from("message-new-instant"));
       },
     }
     let actions = [DEFAULT_ACTION, "Open"];
-    let shown = self
-      .connection
-      .call_method(
-        Some(BUS_NAME),
-        PATH,
-        Some(BUS_NAME),
-        "Notify",
-        &(
-          "Working",
-          replaces,
-          DESKTOP_ID,
-          summary,
-          body.as_str(),
-          &actions[..],
-          hints,
-          -1_i32,
-        ),
-      )
-      .and_then(|reply| reply.body().deserialize::<u32>());
+    let shown = zbus::block_on(self.connection.call_method(
+      Some(BUS_NAME),
+      PATH,
+      Some(BUS_NAME),
+      "Notify",
+      &(
+        "Working",
+        replaces,
+        DESKTOP_ID,
+        summary,
+        body.as_str(),
+        &actions[..],
+        hints,
+        -1_i32,
+      ),
+    ))
+    .and_then(|reply| reply.body().deserialize::<u32>());
     match shown {
       Ok(number) => {
         if replaces != 0 && replaces != number {
@@ -263,11 +266,10 @@ impl Server {
         continue;
       };
       self.threads.remove(&number);
-      if let Err(error) =
-        self
-          .connection
-          .call_method(Some(BUS_NAME), PATH, Some(BUS_NAME), "CloseNotification", &number)
-      {
+      let closed = self
+        .connection
+        .call_method(Some(BUS_NAME), PATH, Some(BUS_NAME), "CloseNotification", &number);
+      if let Err(error) = zbus::block_on(closed) {
         tracing::debug!("closing a notification failed: {error}");
       }
     }
@@ -280,18 +282,18 @@ impl Server {
   }
 
   fn badge(&self, count: usize) {
-    let properties: HashMap<&str, Value<'_>> = HashMap::from([
-      ("count", Value::from(i64::try_from(count).unwrap_or(i64::MAX))),
-      ("count-visible", Value::from(count > 0)),
+    let properties: HashMap<&str, Variant<'_>> = HashMap::from([
+      ("count", Variant::from(i64::try_from(count).unwrap_or(i64::MAX))),
+      ("count-visible", Variant::from(count > 0)),
     ]);
     let app = format!("application://{DESKTOP_ID}.desktop");
-    let sent = self.connection.emit_signal(
+    let sent = zbus::block_on(self.connection.emit_signal(
       None::<&str>,
       format!("/com/canonical/unity/launcherentry/{DESKTOP_ID}").as_str(),
       "com.canonical.Unity.LauncherEntry",
       "Update",
       &(app.as_str(), properties),
-    );
+    ));
     if let Err(error) = sent {
       tracing::debug!("sending the unread count failed: {error}");
     }

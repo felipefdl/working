@@ -19,16 +19,16 @@ publish = false
 gchat-core = { path = "crates/core" }
 anyhow = "1"
 axum = { version = "0.8", default-features = false, features = ["tokio", "http1"] }
-base64 = "0.22"
+base64 = "0.23"
 block2 = "0.6"
 cargo-packager-updater = "0.2.3"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-dirs = "6"
+dirs = "7"
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
 emojis = "0.9.1"
-flume = "0.11"
-gpui-kit = { version = "0.9.1", features = ["gpui-fast"] }
-gpui-webview = { version = "0.9.1", features = ["gpui-fast"] }
+flume = "0.12"
+gpui-kit = { version = "0.10", features = ["gpui-fast"] }
+gpui-webview = { version = "0.10", features = ["gpui-fast"] }
 iana-time-zone = "0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff", "bmp"] }
 linkify = "0.11"
@@ -42,7 +42,7 @@ objc2-screen-capture-kit = { version = "0.3", default-features = false, features
 objc2-user-notifications = "0.3"
 prost = "0.14"
 prost-build = "0.14"
-rand = "0.9"
+rand = "0.10"
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "cookies", "gzip", "brotli", "query"] }
 serde = { version = "1", features = ["derive"] }
@@ -61,8 +61,8 @@ windows = { version = "0.61", features = ["Data_Xml_Dom", "UI_Notifications", "W
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
 winresource = { version = "0.1.34", default-features = false }
 wry = { version = "0.53.3", package = "lb-wry" }
-x11rb = { version = "0.13", features = ["screensaver"] }
-zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api"] }
+x11rb = { version = "0.14", features = ["screensaver"] }
+zbus = { version = "6.3", default-features = false, features = ["default-rt"] }
 
 # Line tables keep panic and backtrace locations for workspace code and drop the
 # type debuginfo that dominates test binary size and link time.
