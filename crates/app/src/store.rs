@@ -1021,7 +1021,7 @@ impl Store {
 
   /// Shows or hides the older conversations at the end of the list.
   pub fn toggle_older(&mut self, cx: &mut Context<Self>) {
-    self.list.show_older = !self.list.show_older;
+    self.list.show_older.toggle();
     cx.notify();
   }
 

@@ -249,7 +249,7 @@ fn arguments(value: &str) -> Vec<String> {
   while let Some(ch) = chars.next() {
     match ch {
       '"' => {
-        quoted = !quoted;
+        quoted.toggle();
         started = true;
       },
       '\\' if quoted => {

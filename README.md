@@ -86,7 +86,7 @@ Turn it on in Settings. It listens on `http://127.0.0.1:3021/mcp` and needs the 
 
 ## Build from source
 
-You need Rust 1.99.1 or newer, `protoc`, and [just](https://github.com/casey/just). Each system's packages are listed under [build prerequisites](docs/platforms.md#build-prerequisites).
+You need Rust 1.100.0 or newer, `protoc`, and [just](https://github.com/casey/just). Each system's packages are listed under [build prerequisites](docs/platforms.md#build-prerequisites).
 
 ```bash
 git clone https://github.com/felipefdl/working.git

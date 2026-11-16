@@ -360,7 +360,7 @@ impl CallView {
   }
 
   fn toggle_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    self.chat_shown = !self.chat_shown;
+    self.chat_shown.toggle();
     if self.chat_shown {
       self.see_chat();
       self.draft.update(cx, |state, cx| state.focus(window, cx));

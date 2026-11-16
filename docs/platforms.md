@@ -76,7 +76,7 @@ On Windows, the web views keep their data in `%LOCALAPPDATA%\dev.felipefdl.worki
 
 ## Build prerequisites
 
-Every system needs Rust 1.99.1 or newer and `protoc` (the Protocol Buffers compiler).
+Every system needs Rust 1.100.0 or newer and `protoc` (the Protocol Buffers compiler).
 
 - **macOS:** [just](https://github.com/casey/just), Xcode (its `actool` compiles the app icon), and `brew install protobuf`. With an Apple Development certificate in your keychain, local builds keep camera and microphone permissions across rebuilds; without one, macOS asks again after every build.
 - **Linux:** [just](https://github.com/casey/just) and the development packages. On Debian and Ubuntu:

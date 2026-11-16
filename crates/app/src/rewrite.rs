@@ -422,8 +422,7 @@ fn clean(text: &str) -> String {
     .strip_prefix("text")
     .or_else(|| rest.strip_prefix("markdown"))
     .unwrap_or(rest);
-  let rest = rest.strip_prefix('\n').unwrap_or(rest);
-  rest.strip_suffix("```").unwrap_or(rest).trim().to_string()
+  rest.trim_prefix('\n').trim_suffix("```").trim().to_string()
 }
 
 #[cfg(test)]

@@ -683,7 +683,7 @@ async fn inbox(engine: &Arc<Engine>, arguments: Value) -> Result<String, String>
     let (engine, id) = (engine.clone(), group.id.clone());
     loads.spawn(async move { (index, engine.topics(&id, Page::Latest).await) });
   }
-  let mut pages: Vec<_> = shown.iter().map(|_| None).collect();
+  let mut pages = Vec::from_fn(shown.len(), |_| None);
   while let Some(loaded) = loads.join_next().await {
     if let Ok((index, page)) = loaded {
       pages[index] = Some(page);

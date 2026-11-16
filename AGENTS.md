@@ -5,7 +5,7 @@ Native Google Chat client for macOS, Linux, and Windows. The GPUI app is `crates
 ## Quality bar
 
 - Gate: `just check`. Contract: [docs/rust-quality.md](docs/rust-quality.md). Machine config: `rustfmt.toml`, `clippy.toml`, `deny.toml`, `.cargo/config.toml`, root `[workspace.lints]`.
-- Edition 2024, MSRV 1.99.1. Do not weaken workspace lints or deny gates to land a change.
+- Edition 2024, MSRV 1.100.0. Do not weaken workspace lints or deny gates to land a change.
 - Mid-change: `just task <package>` or `just t '<nextest filter>'`. Completion claims still require `just check`.
 - The gate builds for the host only: a change to per-OS code also needs clippy and tests on that OS (on Windows, the cargo commands behind `just task`). `.github/workflows/ci.yml` runs the gate on macOS plus clippy and tests on Linux and Windows for every push to `main` and every pull request.
 

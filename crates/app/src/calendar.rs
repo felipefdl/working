@@ -466,7 +466,7 @@ impl CalendarView {
             "Show the calendars"
           }))
           .on_click(|_, _, cx| {
-            Settings::update(cx, |settings| settings.calendar_panel_closed = !settings.calendar_panel_closed);
+            Settings::update(cx, |settings| settings.calendar_panel_closed.toggle());
           }),
       )
       .child(

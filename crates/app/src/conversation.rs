@@ -1328,7 +1328,7 @@ impl ConversationView {
   /// The toggle at a composer's right: shows or hides the formatting bar of every composer, and leaves the keyboard
   /// with the text.
   fn toggle_format_bar(&mut self, in_thread: bool, window: &mut Window, cx: &mut Context<Self>) {
-    Settings::update(cx, |settings| settings.show_format_bar = !settings.show_format_bar);
+    Settings::update(cx, |settings| settings.show_format_bar.toggle());
     if let Some(composer) = self.composer_of(in_thread) {
       composer.update(cx, |state, cx| state.focus(window, cx));
     }
@@ -1428,7 +1428,7 @@ impl ConversationView {
             .on_click(cx.listener(move |this, _, window, cx| this.rewrite(in_thread, false, window, cx)))
             .on_mouse_down(MouseButton::Right, |_, _, cx| {
               cx.stop_propagation();
-              Settings::update(cx, |settings| settings.rewrite_always = !settings.rewrite_always);
+              Settings::update(cx, |settings| settings.rewrite_always.toggle());
             })
             .child(sparkle),
         )

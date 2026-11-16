@@ -953,7 +953,7 @@ impl SettingsView {
             )
             .child(
               Self::toggle("show-mentions", settings.show_mentions)
-                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_mentions = !settings.show_mentions)),
+                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_mentions.toggle())),
             ),
           )
           .child(
@@ -964,7 +964,7 @@ impl SettingsView {
             )
             .child(
               Self::toggle("show-starred", settings.show_starred)
-                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_starred = !settings.show_starred)),
+                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_starred.toggle())),
             ),
           )
           .child(
@@ -978,7 +978,7 @@ impl SettingsView {
             )
             .child(
               Self::toggle("show-calendar", settings.show_calendar)
-                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_calendar = !settings.show_calendar)),
+                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_calendar.toggle())),
             ),
           )
           .child(
@@ -992,7 +992,7 @@ impl SettingsView {
             )
             .child(
               Self::toggle("show-meet", settings.show_meet)
-                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_meet = !settings.show_meet)),
+                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_meet.toggle())),
             ),
           ),
       ))
@@ -1042,7 +1042,7 @@ impl SettingsView {
               )
               .child(
                 Self::toggle("meet-builtin", settings.meet_builtin)
-                  .on_click(|_, _, cx| Settings::update(cx, |settings| settings.meet_builtin = !settings.meet_builtin)),
+                  .on_click(|_, _, cx| Settings::update(cx, |settings| settings.meet_builtin.toggle())),
               ),
             )
           })
@@ -1053,9 +1053,8 @@ impl SettingsView {
               !call_window,
             )
             .child(
-              Self::toggle("meet-auto-open", settings.meet_auto_open).on_click(|_, _, cx| {
-                Settings::update(cx, |settings| settings.meet_auto_open = !settings.meet_auto_open)
-              }),
+              Self::toggle("meet-auto-open", settings.meet_auto_open)
+                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.meet_auto_open.toggle())),
             ),
           ),
       ))
@@ -1070,7 +1069,7 @@ impl SettingsView {
             )
             .child(
               Self::toggle("camera-off", settings.camera_off)
-                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.camera_off = !settings.camera_off)),
+                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.camera_off.toggle())),
             ),
           ),
         ))
@@ -1265,7 +1264,7 @@ impl SettingsView {
             Self::toggle(("dnd-on", ix), schedule.enabled).on_click(cx.listener(move |this, _, _, cx| {
               this.change_dnd(cx, |dnd| {
                 if let Some(schedule) = dnd.schedules.get_mut(ix) {
-                  schedule.enabled = !schedule.enabled;
+                  schedule.enabled.toggle();
                 }
               });
             })),
@@ -1304,7 +1303,7 @@ impl SettingsView {
         )
         .child(
           Self::toggle("dnd-zone", dnd.match_time_zone).on_click(cx.listener(|this, _, _, cx| {
-            this.change_dnd(cx, |dnd| dnd.match_time_zone = !dnd.match_time_zone);
+            this.change_dnd(cx, |dnd| dnd.match_time_zone.toggle());
           })),
         ),
       );
@@ -1466,7 +1465,7 @@ impl SettingsView {
         )
         .child(
           Self::toggle("rewrite-always", settings.rewrite_always)
-            .on_click(|_, _, cx| Settings::update(cx, |settings| settings.rewrite_always = !settings.rewrite_always)),
+            .on_click(|_, _, cx| Settings::update(cx, |settings| settings.rewrite_always.toggle())),
         ),
       )
       .child(
@@ -1541,8 +1540,7 @@ impl SettingsView {
           true,
         )
         .child(
-          Self::toggle("mcp", settings.mcp)
-            .on_click(|_, _, cx| Settings::update(cx, |settings| settings.mcp = !settings.mcp)),
+          Self::toggle("mcp", settings.mcp).on_click(|_, _, cx| Settings::update(cx, |settings| settings.mcp.toggle())),
         ),
       )
       .child(
@@ -1553,7 +1551,7 @@ impl SettingsView {
         )
         .child(
           Self::toggle("mcp-send", settings.mcp_send)
-            .on_click(|_, _, cx| Settings::update(cx, |settings| settings.mcp_send = !settings.mcp_send)),
+            .on_click(|_, _, cx| Settings::update(cx, |settings| settings.mcp_send.toggle())),
         ),
       );
     let out = v_flex().gap_5().child(Self::group("Server", server));

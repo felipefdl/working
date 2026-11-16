@@ -1612,7 +1612,7 @@ fn link_card(att: &Attachment, id: SharedString, bubble: Tone, ctx: &MsgCtx, cx:
 fn link_domain(url: &str) -> String {
   let rest = url.split_once("://").map_or(url, |(_, rest)| rest);
   let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-  host.strip_prefix("www.").unwrap_or(host).to_string()
+  host.trim_prefix("www.").to_string()
 }
 
 /// A video: poster frame (when the server has one) under a play button, like the web app. Opens the viewer.

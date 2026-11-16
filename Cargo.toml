@@ -8,7 +8,7 @@ members = ["crates/core", "crates/app"]
 # CARGO_PKG_VERSION. Library crates in the workspace carry neither.
 [workspace.package]
 edition = "2024"
-rust-version = "1.99.1"
+rust-version = "1.100.0"
 version = "0.1.5"
 description = "Native Google Chat client for macOS, Linux, and Windows"
 license = "MIT"
@@ -111,6 +111,10 @@ strip = false
 [workspace.lints.rust]
 unsafe_code = "deny"
 missing_docs = "deny"
+
+# Cargo's own lints (Rust 1.100): a dependency no target uses fails the build.
+[workspace.lints.cargo]
+unused_dependencies = "deny"
 
 [workspace.lints.clippy]
 # Groups at deny (priority -1 so individual allows/denies win).

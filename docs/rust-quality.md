@@ -17,7 +17,7 @@ This document is the human-readable contract. Machine configuration lives in:
 | Field | Value |
 |-------|-------|
 | Edition | 2024 |
-| MSRV | 1.99.1 through `rust-version` in the workspace |
+| MSRV | 1.100.0 through `rust-version` in the workspace |
 | Workspace | Virtual root `Cargo.toml`, resolver `"3"` |
 | Layout | `crates/core` for the chat engine and `crates/app` for the GPUI application |
 | Format | `cargo fmt --all` against `rustfmt.toml` |
@@ -31,6 +31,7 @@ Configured in root `Cargo.toml` `[workspace.lints]` and `clippy.toml`.
 
 - `unsafe_code = deny`. Production logic is safe Rust. The only `unsafe` is platform FFI in `crates/app`: macOS in `notify/macos.rs`, `session/macos.rs`, `permissions.rs`, `screen.rs`, and `status.rs`, and Windows in `notify/windows.rs`, `session/windows.rs`, `console.rs`, and `status.rs`; each file allows it with a `reason`. Third-party crates sit outside this boundary; their unsafe code does not permit unsafe in owned logic.
 - Clippy groups `all`, `pedantic`, `nursery`, and `cargo` at **deny**, with a short allow-list for known noise without safety value
+- Cargo's own `unused_dependencies` lint at **deny** (`[workspace.lints.cargo]`)
 - The full Clippy `restriction` group is not enabled. Selected panic and silent-fail lints are denied individually, including:
   - `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `unreachable`
   - `indexing_slicing`, `string_slice`, `as_conversions`
