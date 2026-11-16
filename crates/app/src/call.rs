@@ -167,7 +167,7 @@ impl CallView {
     });
 
     // Google rotates the session's cookies while a call is open; the saved ones stop working soon after, for
-    // the chat side and for the next call (the webview keeps none between launches). So the call's current
+    // the chat side and for the next call (each call starts from the saved ones alone). So the call's current
     // ones are saved, a little after joining and then regularly.
     let session_sync = cx.spawn(async move |this, cx| {
       let mut wait = std::time::Duration::from_secs(10);

@@ -44,7 +44,13 @@ pub(crate) fn read(web: &wry::WebView) -> flume::Receiver<Vec<SessionCookie>> {
   read_rx
 }
 
-/// Puts the saved session's cookies into the webview. The returned channel gets a message once they are stored.
+/// Puts the saved session's cookies into the webview, in place of every cookie its store holds. The returned
+/// channel gets a message once they are stored.
+///
+/// The store outlives the app, and keeps what the sign-in page and earlier calls left in it. Writing the saved
+/// session over that is not enough: a cookie written here does not replace a stored `HttpOnly` one, so the
+/// webview would send half of an older session with half of the saved one, and Google answers with its sign-in
+/// page. So the store is emptied first.
 ///
 /// Goes to `WebKit`'s cookie store directly: `wry::WebView::set_cookie` drops the leading dot of a domain, which
 /// turns `.google.com` cookies into ones for the bare `google.com` host that `meet.google.com` never receives.
@@ -70,18 +76,27 @@ pub(crate) fn install(web: &wry::WebView) -> flume::Receiver<()> {
         NSHTTPCookie::cookieWithProperties(&properties)
       })
       .collect();
-    // The store applies writes in order, so the last one finishing means all of them have.
-    let Some((last, rest)) = cookies.split_last() else {
-      let _ = done_tx.send(());
-      return done_rx;
-    };
-    for cookie in rest {
-      store.setCookie_completionHandler(cookie, None);
-    }
-    let done = block2::RcBlock::new(move || {
-      let _ = done_tx.send(());
+    let fill = store.clone();
+    let replace = block2::RcBlock::new(move |held: NonNull<NSArray<NSHTTPCookie>>| {
+      // SAFETY: WebKit hands over a valid array for the duration of the call, on the main thread.
+      for cookie in held.as_ref() {
+        fill.deleteCookie_completionHandler(&cookie, None);
+      }
+      // The store applies writes in order, so the last one finishing means all of them have.
+      let Some((last, rest)) = cookies.split_last() else {
+        let _ = done_tx.send(());
+        return;
+      };
+      for cookie in rest {
+        fill.setCookie_completionHandler(cookie, None);
+      }
+      let done_tx = done_tx.clone();
+      let done = block2::RcBlock::new(move || {
+        let _ = done_tx.send(());
+      });
+      fill.setCookie_completionHandler(last, Some(&done));
     });
-    store.setCookie_completionHandler(last, Some(&done));
+    store.getAllCookies(&replace);
   }
   done_rx
 }
