@@ -15,17 +15,30 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::completion::{self, Menu, Trigger};
-use crate::conv_list::hint;
+use crate::conv_list::{buffer_name, hint};
+use crate::emoji_font;
 use crate::format_logic::Format;
 use crate::images::Images;
 use crate::message::{self, Act, Actor, MsgCtx, Opener, Readers, Row};
-use crate::settings::{Density, RewriteTool, Settings};
+use crate::settings::{Layout, MessageStyle, RewriteTool, Settings, SidebarSide, ThreadView};
 use crate::store::{History, Store};
-use crate::theme::{ACCENT, ACCENT_BG, BORDER, FIELD, MUTED, PLACEHOLDER, POPOVER, ROW_HOVER, ROW_SELECTED, TEXT, rgb};
+use crate::text_panel::TextPanelHandle;
+use crate::theme::{
+  ACCENT, ACCENT_BG, BORDER, FIELD, MUTED, PANEL, PLACEHOLDER, POPOVER, ROW_HOVER, ROW_SELECTED, TEXT, mono, rgb,
+};
 use crate::ui::{Icon, group_avatar, icon};
 
 const TYPING_IDLE: Duration = Duration::from_secs(5);
 const TYPING_EXPIRY: Duration = Duration::from_secs(8);
+/// IRC: the one-line title bar, the nick list's width, and one nick's line.
+const IRC_BAR_HEIGHT: f32 = 32.0;
+const NICK_LIST_WIDTH: f32 = 150.0;
+const NICK_ROW_HEIGHT: f32 = 22.0;
+/// The least and the most the thread pop-up measures as the window grows.
+const THREAD_POPUP: (Size<f32>, Size<f32>) =
+  (Size { width: 640.0, height: 420.0 }, Size { width: 1040.0, height: 1200.0 });
+/// The room a modal leaves to each edge of the window.
+const MODAL_MARGIN: f32 = 16.0;
 
 actions!(working, [FormatBold, FormatItalic, FormatStrikethrough, FormatBulletedList]);
 
@@ -108,6 +121,8 @@ struct LoadState {
 struct Thread {
   topic: String,
   rows: Vec<Row>,
+  /// The IRC style's sender column for those rows (`message::irc_nick_width`).
+  nick_width: Cell<(usize, f32)>,
   /// Who has read up to each of those messages.
   readers: Readers,
   list: ListState,
@@ -140,12 +155,14 @@ pub struct ConversationView {
   me_avatar: Option<String>,
   messages: Arc<Vec<Arc<Message>>>,
   rows: Vec<Row>,
+  /// The IRC style's sender column for those rows (`message::irc_nick_width`).
+  nick_width: Cell<(usize, f32)>,
   /// Who has read the conversation, as the core last said: none while Google Chat has read receipts off here.
   receipts: Arc<Vec<ReadReceipt>>,
   /// Who has read up to each message of the main list.
   readers: Readers,
   /// The message layout the lists were measured with.
-  density: Density,
+  density: MessageStyle,
   thread: Option<Thread>,
   opener: Opener,
   /// Opens the chat with the person a name or a mention names.
@@ -163,6 +180,8 @@ pub struct ConversationView {
   on_tools: Rc<Cell<bool>>,
   /// The thread panel vanished while its composer had focus: give focus back to the main composer.
   refocus: bool,
+  /// The press on the thread pop-up's backdrop also closed the text panel: that press leaves the thread open.
+  backdrop_kept: bool,
   loaded: bool,
   list: ListState,
   composer: Entity<TextareaState>,
@@ -186,9 +205,11 @@ pub struct ConversationView {
   find: Option<Find>,
   /// Who `@` offers, once `Command::LoadMembers` answered.
   members: Option<Arc<Vec<User>>>,
+  /// The members A to Z, for IRC's nick list.
+  nicks: Vec<User>,
   /// What `/` offers, once `Command::LoadSlashCommands` answered.
   commands: Option<Arc<Vec<SlashCommand>>>,
-  /// Members and commands are asked for on the first `@` or `/`, once.
+  /// Members and commands are asked for on the first `@` or `/`, once; IRC asks for a space's members on opening.
   asked_members: bool,
   asked_commands: bool,
   /// The `@` or `/` menu over one of the composers.
@@ -297,9 +318,10 @@ impl ConversationView {
       me_avatar,
       messages,
       rows,
+      nick_width: Cell::default(),
       receipts: Arc::default(),
       readers: Readers::default(),
-      density: cx.global::<Settings>().density,
+      density: cx.global::<Settings>().message_style,
       thread: None,
       opener,
       open_person,
@@ -311,6 +333,7 @@ impl ConversationView {
       in_list: false,
       on_tools: Rc::new(Cell::new(false)),
       refocus: false,
+      backdrop_kept: false,
       loaded,
       list,
       composer,
@@ -330,14 +353,15 @@ impl ConversationView {
       _rewrite_error_clear: None,
       find: None,
       members: None,
+      nicks: Vec::new(),
       commands: None,
       asked_members: false,
       asked_commands: false,
       menu: None,
     };
-    // Rows change height with the message layout: measure the lists again.
+    // Rows change height with the message layout: measure the lists again. Picking IRC lists a space's members.
     view._subs.push(cx.observe_global::<Settings>(|this, cx| {
-      let density = cx.global::<Settings>().density;
+      let density = cx.global::<Settings>().message_style;
       if density != this.density {
         this.density = density;
         this.list.reset(this.rows.len());
@@ -345,8 +369,10 @@ impl ConversationView {
           thread.list.reset(thread.rows.len());
         }
       }
+      this.want_members(cx);
       cx.notify();
     }));
+    view.want_members(cx);
     view.schedule_top_check(cx);
     view
   }
@@ -928,6 +954,7 @@ impl ConversationView {
     self.thread = Some(Thread {
       topic: topic.to_string(),
       rows,
+      nick_width: Cell::default(),
       readers,
       list,
       composer,
@@ -946,6 +973,17 @@ impl ConversationView {
     self.composer.update(cx, |state, cx| state.focus(window, cx));
     cx.notify();
     true
+  }
+
+  /// Closes the thread when it is open as a pop-up, which Escape closes before anything else of the conversation.
+  /// Returns false when no pop-up was open.
+  pub fn close_thread_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    cx.global::<Settings>().thread_view == ThreadView::Modal && self.close_thread(window, cx)
+  }
+
+  /// A thread is open as a pop-up over the window.
+  fn popup_open(&self, cx: &App) -> bool {
+    self.thread.is_some() && cx.global::<Settings>().thread_view == ThreadView::Modal
   }
 
   fn send_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1424,8 +1462,12 @@ impl ConversationView {
 
   /// Members and commands of this conversation arrived: show them if a menu is waiting on them.
   pub fn set_members(&mut self, users: Arc<Vec<User>>, cx: &mut Context<Self>) {
+    let mut nicks = users.as_ref().clone();
+    nicks.sort_by_cached_key(|user| user.name.to_lowercase());
+    self.nicks = nicks;
     self.members = Some(users);
     self.refresh_menus(cx);
+    cx.notify();
   }
 
   pub fn set_slash_commands(&mut self, commands: Arc<Vec<SlashCommand>>, cx: &mut Context<Self>) {
@@ -1603,9 +1645,11 @@ impl ConversationView {
       act: &self.actor,
       open_person: &self.open_person,
       threads: self.group.kind == GroupKind::Space,
-      hovered: self.hovered.as_deref(),
+      // Under the thread pop-up the list shows no toolbar: the pop-up's own row has the same message.
+      hovered: self.hovered.as_deref().filter(|_| !self.popup_open(cx)),
       on_tools: &self.on_tools,
       readers: self.readers.of(&id),
+      nick_width: message::irc_nick_width(&self.rows, &self.nick_width),
     };
     message::render_row(row, &ctx, cx)
   }
@@ -1632,11 +1676,16 @@ impl ConversationView {
       hovered: self.hovered.as_deref(),
       on_tools: &self.on_tools,
       readers: self.thread.as_ref().map_or(&[][..], |thread| thread.readers.of(&id)),
+      nick_width: self
+        .thread
+        .as_ref()
+        .map_or(0., |thread| message::irc_nick_width(&thread.rows, &thread.nick_width)),
     };
     message::render_row(row, &ctx, cx)
   }
 
-  fn render_thread_panel(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+  /// The thread's header, rows and composer: the side panel and the pop-up show the same ones.
+  fn render_thread_panel(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
     let thread = self.thread.as_ref()?;
     let header = h_flex()
       .h(px(56.))
@@ -1705,11 +1754,7 @@ impl ConversationView {
       .child(self.composer_field(&thread.composer, true, cx));
     Some(
       v_flex()
-        .w(relative(0.45))
-        .h_full()
-        .flex_shrink_0()
-        .border_l_1()
-        .border_color(rgb(BORDER))
+        .id("thread")
         // Files dropped on the thread go out with the next reply.
         .drag_over::<ExternalPaths>(|style, _, _, _| style.bg(rgb(ROW_HOVER)))
         .on_drop(
@@ -1717,10 +1762,103 @@ impl ConversationView {
         )
         .child(header)
         .child(body)
-        .child(composer)
+        .child(composer),
+    )
+  }
+
+  /// The thread as a column beside the conversation, which shares the width with it.
+  fn thread_side(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    let panel = self.render_thread_panel(cx)?;
+    Some(
+      panel
+        .w(relative(0.45))
+        .h_full()
+        .flex_shrink_0()
+        .border_l_1()
+        .border_color(rgb(BORDER))
         .into_any_element(),
     )
   }
+
+  /// The thread over the dimmed window, centered as the window's other modals are and sized with the window (`viewport`
+  /// is the window's). The window root draws it, under its menus and pickers; `None` unless a thread is open and
+  /// `Settings::thread_view` is the pop-up. A press on the backdrop closes it, unless that press was closing the text
+  /// panel opened from inside it; presses inside it stay there.
+  pub fn thread_popup(&self, viewport: Size<Pixels>, cx: &mut Context<Self>) -> Option<AnyElement> {
+    if cx.global::<Settings>().thread_view != ThreadView::Modal {
+      return None;
+    }
+    let panel = self.render_thread_panel(cx)?;
+    let (width, height) = modal_size(viewport, THREAD_POPUP, (0.55, 0.85));
+    Some(
+      self
+        .keyed(div(), cx)
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgba(0x00000073))
+        .occlude()
+        // The capture phase runs before the text panel's press outside closes it.
+        .capture_any_mouse_down(cx.listener(|this, _, _, cx| {
+          this.backdrop_kept = cx.global::<TextPanelHandle>().0.read(cx).is_open();
+        }))
+        .on_mouse_down(
+          MouseButton::Left,
+          cx.listener(|this, _, window, cx| {
+            if !std::mem::take(&mut this.backdrop_kept) {
+              this.close_thread(window, cx);
+            }
+          }),
+        )
+        .child(
+          panel
+            .w(width)
+            .h(height)
+            .rounded(px(14.))
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .shadow_lg()
+            .overflow_hidden()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+        )
+        .into_any_element(),
+    )
+  }
+
+  /// The keys a conversation's composers share, on `root`: the conversation itself and the thread pop-up, which the
+  /// window root draws outside it.
+  fn keyed(&self, root: Div, cx: &mut Context<Self>) -> Div {
+    root
+      // Before the composer sees the paste, so files never land in it as text.
+      .capture_action(cx.listener(Self::paste))
+      .on_action(cx.listener(|this, _: &FormatBold, window, cx| this.format_key(Format::Bold, window, cx)))
+      .on_action(cx.listener(|this, _: &FormatItalic, window, cx| this.format_key(Format::Italic, window, cx)))
+      .on_action(cx.listener(|this, _: &FormatStrikethrough, window, cx| {
+        this.format_key(Format::Strikethrough, window, cx);
+      }))
+      .on_action(cx.listener(|this, _: &FormatBulletedList, window, cx| this.format_key(Format::Bullets, window, cx)))
+  }
+}
+
+/// The size of a modal that grows with the window: `share` of the viewport each way, no smaller than `least` nor larger
+/// than `most`, and always clear of the window's edges.
+pub fn modal_size(
+  viewport: Size<Pixels>,
+  (least, most): (Size<f32>, Size<f32>),
+  share: (f32, f32),
+) -> (Pixels, Pixels) {
+  let fit = |room: Pixels, share: f32, least: f32, most: f32| {
+    (room * share).clamp(px(least), px(most)).min(room - px(MODAL_MARGIN * 2.))
+  };
+  (
+    fit(viewport.width, share.0, least.width, most.width),
+    fit(viewport.height, share.1, least.height, most.height),
+  )
 }
 
 impl Drop for ConversationView {
@@ -1736,16 +1874,37 @@ impl ConversationView {
     self.list.scroll_to_end();
     cx.notify();
   }
-}
 
-impl Render for ConversationView {
-  fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-    if self.refocus {
-      self.refocus = false;
-      let composer = self.composer.clone();
-      window.defer(cx, move |window, cx| composer.update(cx, |state, cx| state.focus(window, cx)));
+  /// The IRC layout lists a space's members beside it from the start, so it asks for them as the space opens or
+  /// the layout is picked, rather than on the first `@`.
+  fn want_members(&mut self, cx: &App) {
+    if !self.asked_members && self.group.kind == GroupKind::Space && cx.global::<Settings>().layout == Layout::Irc {
+      self.asked_members = true;
+      self.core.send(Command::LoadMembers(self.group.id.clone()));
     }
-    let header = h_flex()
+  }
+
+  /// The call button of the header.
+  fn meet_button(&self, height: f32, glyph: f32, cx: &mut Context<Self>) -> Stateful<Div> {
+    div()
+      .id("meet")
+      .h(px(height))
+      .px_4()
+      .flex()
+      .items_center()
+      .justify_center()
+      .rounded_full()
+      .bg(rgb(FIELD))
+      .cursor_pointer()
+      .hover(|s| s.bg(rgb(ROW_SELECTED)))
+      .on_click(cx.listener(|this, _, _, cx| this.start_meet(cx)))
+      .child(icon(Icon::Phone, glyph, TEXT))
+  }
+
+  /// The header: Back where the layout has no list beside the conversation, the avatar and name, then the call
+  /// button.
+  fn header(&self, cx: &mut Context<Self>) -> Div {
+    h_flex()
       .h(px(56.))
       .flex_shrink_0()
       .px_3()
@@ -1780,21 +1939,100 @@ impl Render for ConversationView {
           .child(self.group.name.clone()),
       )
       .child(div().flex_1())
+      .child(self.meet_button(36., 17., cx))
+  }
+
+  /// IRC's title bar: one line of the buffer name in the monospaced font, then the call button.
+  fn irc_header(&self, cx: &mut Context<Self>) -> Div {
+    h_flex()
+      .h(px(IRC_BAR_HEIGHT))
+      .flex_shrink_0()
+      .px_3()
+      .gap_2()
+      .items_center()
+      .border_b_1()
+      .border_color(rgb(BORDER))
       .child(
         div()
-          .id("meet")
-          .h(px(36.))
-          .px_4()
+          .flex_1()
+          .min_w_0()
+          .truncate()
+          .font_family(mono())
+          .text_size(px(13.))
+          .font_weight(FontWeight::BOLD)
+          .text_color(rgb(TEXT))
+          .child(emoji_font::text(buffer_name(&self.group))),
+      )
+      .child(self.meet_button(26., 14., cx))
+  }
+
+  /// IRC: the space's members A to Z, one monospaced line each, at a fixed width so nothing moves when they arrive.
+  /// A click opens the chat with that person, as a sender's name does.
+  fn nick_list(&self, cx: &mut Context<Self>) -> AnyElement {
+    let right = cx.global::<Settings>().sidebar_side == SidebarSide::Left;
+    let count = self.nicks.len();
+    div()
+      .w(px(NICK_LIST_WIDTH))
+      .h_full()
+      .flex_shrink_0()
+      .py_1()
+      .when(right, gpui_kit::Styled::border_l_1)
+      .when(!right, gpui_kit::Styled::border_r_1)
+      .border_color(rgb(BORDER))
+      .font_family(mono())
+      .text_size(px(13.))
+      .child(
+        uniform_list(
+          "nicks",
+          count,
+          cx.processor(|this, range: Range<usize>, _, _| this.nick_rows(range)),
+        )
+        .size_full(),
+      )
+      .into_any_element()
+  }
+
+  fn nick_rows(&self, range: Range<usize>) -> Vec<AnyElement> {
+    range
+      .filter_map(|ix| self.nicks.get(ix).map(|user| (ix, user)))
+      .map(|(ix, user)| {
+        let (id, open) = (user.id.clone(), self.open_person.clone());
+        div()
+          .id(("nick", ix))
+          .h(px(NICK_ROW_HEIGHT))
+          .w_full()
+          .px_3()
           .flex()
           .items_center()
-          .justify_center()
-          .rounded_full()
-          .bg(rgb(FIELD))
           .cursor_pointer()
-          .hover(|s| s.bg(rgb(ROW_SELECTED)))
-          .on_click(cx.listener(|this, _, _, cx| this.start_meet(cx)))
-          .child(icon(Icon::Phone, 17., TEXT)),
-      );
+          .hover(|s| s.bg(rgb(ROW_HOVER)))
+          .on_click(move |_, window, cx| open(&id, window, cx))
+          .child(
+            div()
+              .min_w_0()
+              .truncate()
+              .text_color(rgb(MUTED))
+              .child(emoji_font::text(user.name.clone())),
+          )
+          .into_any_element()
+      })
+      .collect()
+  }
+}
+
+impl Render for ConversationView {
+  fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    if self.refocus {
+      self.refocus = false;
+      let composer = self.composer.clone();
+      window.defer(cx, move |window, cx| composer.update(cx, |state, cx| state.focus(window, cx)));
+    }
+    let irc = cx.global::<Settings>().layout == Layout::Irc;
+    let header = if irc {
+      self.irc_header(cx)
+    } else {
+      self.header(cx)
+    };
 
     let body = if self.rows.is_empty() {
       div()
@@ -1878,18 +2116,27 @@ impl Render for ConversationView {
       .children(latest)
       .child(composer)
       .children(self.find_bar(cx));
-    h_flex()
+    // IRC: a space's nick list sits on the side away from the buffer list.
+    let nicks = (irc && self.group.kind == GroupKind::Space).then(|| self.nick_list(cx));
+    let nicks_left = cx.global::<Settings>().sidebar_side == SidebarSide::Right;
+    let (left, right) = if nicks_left {
+      (nicks, None)
+    } else {
+      (None, nicks)
+    };
+    let side = match cx.global::<Settings>().thread_view {
+      ThreadView::Side => self.thread_side(cx),
+      // The window root draws the pop-up, which reserves no width here.
+      ThreadView::Modal => None,
+    };
+    self
+      .keyed(h_flex(), cx)
+      .relative()
       .size_full()
-      // Before the composer sees the paste, so files never land in it as text.
-      .capture_action(cx.listener(Self::paste))
-      .on_action(cx.listener(|this, _: &FormatBold, window, cx| this.format_key(Format::Bold, window, cx)))
-      .on_action(cx.listener(|this, _: &FormatItalic, window, cx| this.format_key(Format::Italic, window, cx)))
-      .on_action(cx.listener(|this, _: &FormatStrikethrough, window, cx| {
-        this.format_key(Format::Strikethrough, window, cx);
-      }))
-      .on_action(cx.listener(|this, _: &FormatBulletedList, window, cx| this.format_key(Format::Bullets, window, cx)))
+      .children(left)
       .child(main)
-      .children(self.render_thread_panel(cx))
+      .children(side)
+      .children(right)
   }
 }
 

@@ -35,4 +35,4 @@ disallowed-methods = [
 disallowed-types = []
 
 # ".." appends to Clippy defaults (do not replace the full list).
-doc-valid-idents = ["Working", "GPUI", "MCP", "WebChannel", "XSRF", ".."]
+doc-valid-idents = ["Working", "GPUI", "MCP", "WebChannel", "WeeChat", "XSRF", ".."]

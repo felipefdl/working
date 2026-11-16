@@ -112,7 +112,7 @@ impl Render for HomeView {
     let mut chips = vec![("All", Pane::All)];
     chips.extend(kinds_present(store).map(|kind| (kind.title(), Pane::Kind(kind))));
     let chips = (chips.len() > 1).then(|| {
-      let mut row = chip_row("home-chips");
+      let mut row = chip_row();
       for (ix, (name, pane)) in chips.into_iter().enumerate() {
         let on = store.pane == pane || (pane == Pane::All && store.pane == Pane::Unread);
         let handle = self.store.clone();

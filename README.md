@@ -38,7 +38,7 @@ Pick the layout that fits how you work, switch any time in Settings, and every l
     <td width="50%"><img src="docs/screenshots/themes.png" alt="Theme picker previewing Ayu Dark, with Working Dark marked as the current theme"><br><b>28 themes.</b> Ayu, Catppuccin, Dracula, Tokyo Night, and more, previewed live with ⌘⇧T.</td>
   </tr>
   <tr>
-    <td width="50%"><img src="docs/screenshots/settings.png" alt="Settings open on the density and layout options"><br><b>Make it yours.</b> Layout, density, sidebar side and width, auto-hide: all a click away.</td>
+    <td width="50%"><img src="docs/screenshots/settings.png" alt="Settings open on the density and layout options"><br><b>Make it yours.</b> Layout, message style, sidebar side and width, auto-hide: all a click away.</td>
     <td width="50%"><br><b>Try it without an account.</b> These screenshots come from demo mode's made-up workspace. Run <code>just demo</code> to explore every feature before you sign in.</td>
   </tr>
   <tr>
@@ -50,7 +50,7 @@ Pick the layout that fits how you work, switch any time in Settings, and every l
 ## Features
 
 - **Every conversation in one place.** DMs, groups, spaces, and apps, with Mentions and Starred views across all of them.
-- **Three layouts.** Google Chat's sidebar, a Messages-style list with previews, or a Rail of categories.
+- **Four layouts.** Google Chat's sidebar, a Messages-style list with previews, a Rail of categories, or an IRC-style list of names with an aligned, monospaced message style to match.
 - **Fast.** A disk cache paints the last state on launch, and `Cmd+K` jumps to any conversation.
 - **Full conversations.** Formatted text, threads, quotes, edits, reactions, cards, attachments, and read receipts.
 - **Format as you write.** Bold, italic, strikethrough, lists, and code, from a bar or from the keyboard.

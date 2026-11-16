@@ -17,8 +17,8 @@ use crate::notify;
 #[cfg(target_os = "macos")]
 use crate::permissions::{self, Media, Status};
 use crate::settings::{
-  self, ActivityStatus, Appearance, DEFAULT_REWRITE_INSTRUCTION, Density, Layout, McpState, RewriteTool, Settings,
-  SidebarMode, SidebarSide, Sound,
+  self, ActivityStatus, Appearance, DEFAULT_REWRITE_INSTRUCTION, Layout, ListWindow, McpState, MessageStyle,
+  RewriteTool, Settings, SidebarMode, SidebarSide, Sound, ThreadView,
 };
 use crate::status::{self, DndState};
 use crate::theme::{
@@ -32,10 +32,15 @@ const CAMERA_PANE: &str = "x-apple.systempreferences:com.apple.preference.securi
 const MICROPHONE_PANE: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
 #[cfg(target_os = "macos")]
 const NOTIFICATIONS_PANE: &str = "x-apple.systempreferences:com.apple.Notifications-Settings.extension";
+/// The least and the most the Settings window measures as the main window grows.
+const SETTINGS_SIZE: (Size<f32>, Size<f32>) =
+  (Size { width: 780.0, height: 500.0 }, Size { width: 1120.0, height: 860.0 });
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
   Appearance,
+  Layout,
+  Messages,
   Status,
   Notifications,
   Calls,
@@ -48,8 +53,10 @@ enum Section {
 
 impl Section {
   #[cfg(target_os = "macos")]
-  const ALL: [Self; 7] = [
+  const ALL: [Self; 9] = [
     Self::Appearance,
+    Self::Layout,
+    Self::Messages,
     Self::Status,
     Self::Notifications,
     Self::Calls,
@@ -58,8 +65,10 @@ impl Section {
     Self::Permissions,
   ];
   #[cfg(not(target_os = "macos"))]
-  const ALL: [Self; 6] = [
+  const ALL: [Self; 8] = [
     Self::Appearance,
+    Self::Layout,
+    Self::Messages,
     Self::Status,
     Self::Notifications,
     Self::Calls,
@@ -70,6 +79,8 @@ impl Section {
   const fn title(self) -> &'static str {
     match self {
       Self::Appearance => "Appearance",
+      Self::Layout => "Layout",
+      Self::Messages => "Messages",
       Self::Status => "Activity status",
       Self::Notifications => "Notifications",
       Self::Calls => "Calls",
@@ -83,6 +94,8 @@ impl Section {
   const fn icon(self) -> Icon {
     match self {
       Self::Appearance => Icon::Monitor,
+      Self::Layout => Icon::PanelLeft,
+      Self::Messages => Icon::Thread,
       Self::Status => Icon::Activity,
       Self::Notifications => Icon::Bell,
       Self::Calls => Icon::Video,
@@ -151,6 +164,8 @@ pub struct SettingsView {
   light_theme: Entity<SelectState<Vec<ThemeChoice>>>,
   font: Entity<SelectState<SearchableVec<FontChoice>>>,
   mono_font: Entity<SelectState<SearchableVec<FontChoice>>>,
+  list_window: Entity<SelectState<Vec<ListWindow>>>,
+  thread_view: Entity<SelectState<Vec<ThreadView>>>,
   _copied_reset: Option<Task<()>>,
   #[cfg(target_os = "macos")]
   _refresh: Task<()>,
@@ -158,6 +173,8 @@ pub struct SettingsView {
   _rewrite_sub: Subscription,
   _theme_subs: [Subscription; 2],
   _font_subs: [Subscription; 2],
+  _list_window_sub: Subscription,
+  _thread_view_sub: Subscription,
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -231,6 +248,8 @@ impl SettingsView {
         });
       })
     });
+    let (list_window, list_window_sub) = Self::list_window_select(window, cx);
+    let (thread_view, thread_view_sub) = Self::thread_view_select(window, cx);
     Self {
       core,
       section: Section::Appearance,
@@ -245,6 +264,8 @@ impl SettingsView {
       light_theme,
       font,
       mono_font,
+      list_window,
+      thread_view,
       _copied_reset: None,
       #[cfg(target_os = "macos")]
       _refresh: refresh,
@@ -257,6 +278,8 @@ impl SettingsView {
       _rewrite_sub: rewrite_sub,
       _theme_subs: theme_subs,
       _font_subs: font_subs,
+      _list_window_sub: list_window_sub,
+      _thread_view_sub: thread_view_sub,
     }
   }
 
@@ -439,12 +462,13 @@ impl SettingsView {
     picker
   }
 
-  /// A density choice: a small drawing of the layout over its radio button, as in Google Chat.
-  fn density_option(value: Density, current: Density) -> Stateful<Div> {
+  /// A message style choice: a small drawing of the rows over its radio button, as in Google Chat.
+  fn message_style_option(value: MessageStyle, current: MessageStyle) -> Stateful<Div> {
     let selected = value == current;
     let (id, label) = match value {
-      Density::Comfortable => ("comfortable", "Comfortable"),
-      Density::Compact => ("compact", "Compact"),
+      MessageStyle::Comfortable => ("comfortable", "Comfortable"),
+      MessageStyle::Compact => ("compact", "Compact"),
+      MessageStyle::Irc => ("irc", "IRC"),
     };
     let line = |width: f32, strong: bool| {
       div()
@@ -463,7 +487,7 @@ impl SettingsView {
     };
     let right = |width: f32| h_flex().justify_end().child(line(width, false));
     let frame = v_flex()
-      .w(px(170.))
+      .w(px(140.))
       .h(px(104.))
       .p_3()
       .gap_1p5()
@@ -473,18 +497,41 @@ impl SettingsView {
       .border_color(rgb(if selected { ACCENT } else { BORDER }))
       .bg(rgb(BG));
     let drawing = match value {
-      Density::Comfortable => frame
+      MessageStyle::Comfortable => frame
         .child(left(52., true))
         .child(right(64.))
         .child(right(40.))
         .child(left(44., true))
         .child(right(48.)),
-      Density::Compact => frame
+      MessageStyle::Compact => frame
         .child(left(20., false))
         .child(left(52., true))
         .child(left(64., false))
         .child(left(44., true))
         .child(left(28., false)),
+      // Time, the sender right-aligned against a rule that runs down the rows, then the text.
+      MessageStyle::Irc => {
+        let column = |widths: [f32; 5], strong: bool, end: bool| {
+          v_flex()
+            .flex_shrink_0()
+            .gap_1p5()
+            .when(end, gpui_kit::Styled::items_end)
+            .children(widths.map(|width| line(width, strong)))
+        };
+        frame.child(
+          h_flex()
+            .gap_1p5()
+            .child(column([12.; 5], false, false))
+            .child(
+              div()
+                .w(px(22.))
+                .flex_shrink_0()
+                .child(column([18., 12., 22., 18., 14.], true, true)),
+            )
+            .child(div().w(px(1.5)).flex_shrink_0().self_stretch().bg(rgb(MUTED)).opacity(0.6))
+            .child(column([44., 30., 50., 38., 46.], false, false)),
+        )
+      },
     };
     let radio = div()
       .size(px(16.))
@@ -499,7 +546,7 @@ impl SettingsView {
       .id(id)
       .gap_2()
       .cursor_pointer()
-      .on_click(move |_, _, cx| Settings::update(cx, |settings| settings.density = value))
+      .on_click(move |_, _, cx| Settings::update(cx, |settings| settings.message_style = value))
       .child(drawing)
       .child(
         h_flex()
@@ -517,6 +564,7 @@ impl SettingsView {
       Layout::GoogleChat => "layout-google-chat",
       Layout::Messages => "layout-messages",
       Layout::Rail => "layout-rail",
+      Layout::Irc => "layout-irc",
     };
     let line = |width: f32, strong: bool| {
       div()
@@ -562,6 +610,14 @@ impl SettingsView {
         .items_center()
         .children((0..4).map(|_| div().size(px(7.)).rounded(px(2.)).bg(rgb(MUTED)).opacity(0.5)))
     };
+    // IRC: a column of single short lines, no avatars; the buffer list is wider than the nick list.
+    let names = |width: f32, lengths: [f32; 5]| {
+      v_flex()
+        .w(px(width))
+        .flex_shrink_0()
+        .gap(px(4.))
+        .children(lengths.into_iter().enumerate().map(|(ix, length)| line(length, ix == 1)))
+    };
     let panel = || {
       v_flex()
         .flex_1()
@@ -587,6 +643,10 @@ impl SettingsView {
       Layout::GoogleChat => frame.child(sidebar()).child(panel()),
       Layout::Messages => frame.child(list()).child(panel()),
       Layout::Rail => frame.child(rail()).child(list()).child(panel()),
+      Layout::Irc => frame
+        .child(names(26., [20., 26., 16., 22., 18.]))
+        .child(panel())
+        .child(names(18., [16., 12., 18., 14., 10.])),
     };
     let radio = div()
       .size(px(16.))
@@ -739,6 +799,53 @@ impl SettingsView {
     )
   }
 
+  /// The windows of activity the conversation list keeps, the saved one selected, and what picking one writes.
+  fn list_window_select(
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) -> (Entity<SelectState<Vec<ListWindow>>>, Subscription) {
+    let saved = cx.global::<Settings>().list_window;
+    let selected = ListWindow::ALL.iter().position(|choice| *choice == saved).map(IndexPath::new);
+    let select = cx.new(|cx| SelectState::new(ListWindow::ALL.to_vec(), selected, window, cx));
+    let sub = cx.subscribe(&select, |_, _, event: &SelectEvent<Vec<ListWindow>>, cx| {
+      let SelectEvent::Confirm(Some(choice)) = event else {
+        return;
+      };
+      let choice = *choice;
+      Settings::update(cx, |settings| settings.list_window = choice);
+    });
+    (select, sub)
+  }
+
+  /// Where a thread opens, the saved one selected, and what picking one writes.
+  fn thread_view_select(
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) -> (Entity<SelectState<Vec<ThreadView>>>, Subscription) {
+    let saved = cx.global::<Settings>().thread_view;
+    let selected = ThreadView::ALL.iter().position(|choice| *choice == saved).map(IndexPath::new);
+    let select = cx.new(|cx| SelectState::new(ThreadView::ALL.to_vec(), selected, window, cx));
+    let sub = cx.subscribe(&select, |_, _, event: &SelectEvent<Vec<ThreadView>>, cx| {
+      let SelectEvent::Confirm(Some(choice)) = event else {
+        return;
+      };
+      let choice = *choice;
+      Settings::update(cx, |settings| settings.thread_view = choice);
+    });
+    (select, sub)
+  }
+
+  /// Where a thread opens.
+  fn threads_row(&self) -> Div {
+    Self::row(
+      "Threads",
+      "Side panel keeps the thread beside the conversation. Pop-up opens it over the conversation; a click outside \
+       closes it.",
+      true,
+    )
+    .child(Self::select_field(Select::new(&self.thread_view).id("thread-view")))
+  }
+
   fn appearance(&self, settings: Settings) -> Div {
     v_flex()
       .gap_5()
@@ -763,15 +870,29 @@ impl SettingsView {
           ),
       ))
       .child(self.fonts())
+  }
+
+  /// How messages are drawn, and where a thread opens.
+  fn messages(&self, settings: Settings) -> Div {
+    v_flex()
+      .gap_5()
       .child(Self::group(
-        "Density",
+        "Message style",
         Self::card().py_4().child(
           h_flex()
-            .gap_8()
-            .child(Self::density_option(Density::Comfortable, settings.density))
-            .child(Self::density_option(Density::Compact, settings.density)),
+            .gap_4()
+            .child(Self::message_style_option(MessageStyle::Comfortable, settings.message_style))
+            .child(Self::message_style_option(MessageStyle::Compact, settings.message_style))
+            .child(Self::message_style_option(MessageStyle::Irc, settings.message_style)),
         ),
       ))
+      .child(Self::group("Threads", Self::card().child(self.threads_row())))
+  }
+
+  /// How the window is arranged: the layout and its sidebar, which conversations the list shows, and the view buttons.
+  fn layout(&self, settings: Settings) -> Div {
+    v_flex()
+      .gap_5()
       .child(Self::group(
         "Layout",
         Self::card()
@@ -809,6 +930,17 @@ impl SettingsView {
             )
             .child(Self::side_picker(settings.sidebar_side)),
           ),
+      ))
+      .child(Self::group(
+        "Conversation list",
+        Self::card().child(
+          Self::row(
+            "Spaces and group chats",
+            "Show the ones active in this period. Older ones wait behind a button at the end of the list.",
+            true,
+          )
+          .child(Self::select_field(Select::new(&self.list_window).id("list-window"))),
+        ),
       ))
       .child(Self::group(
         "View buttons",
@@ -1492,8 +1624,9 @@ impl SettingsView {
 }
 
 impl Render for SettingsView {
-  fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+  fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
     let settings = cx.global::<Settings>().clone();
+    let (width, height) = crate::conversation::modal_size(window.viewport_size(), SETTINGS_SIZE, (0.62, 0.78));
 
     let mut sections = v_flex().w(px(200.)).h_full().flex_shrink_0().p_3().gap_1().bg(rgb(BG)).child(
       div()
@@ -1541,6 +1674,8 @@ impl Render for SettingsView {
 
     let body = match self.section {
       Section::Appearance => self.appearance(settings).children(Self::desktop(cx)),
+      Section::Layout => self.layout(settings),
+      Section::Messages => self.messages(settings),
       Section::Status => Self::status(settings),
       Section::Notifications => self.notifications(settings, cx),
       Section::Calls => Self::calls(settings),
@@ -1578,8 +1713,8 @@ impl Render for SettingsView {
       .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.emit(SettingsEvent::Close)))
       .child(
         h_flex()
-          .w(px(740.))
-          .h(px(460.))
+          .w(width)
+          .h(height)
           .rounded(px(14.))
           .bg(rgb(POPOVER))
           .border_1()
@@ -1620,6 +1755,30 @@ impl SelectItem for ThemeChoice {
 
   fn value(&self) -> &usize {
     &self.index
+  }
+}
+
+impl SelectItem for ListWindow {
+  type Value = Self;
+
+  fn title(&self) -> SharedString {
+    self.label().into()
+  }
+
+  fn value(&self) -> &Self {
+    self
+  }
+}
+
+impl SelectItem for ThreadView {
+  type Value = Self;
+
+  fn title(&self) -> SharedString {
+    self.label().into()
+  }
+
+  fn value(&self) -> &Self {
+    self
   }
 }
 

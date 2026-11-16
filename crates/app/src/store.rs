@@ -12,7 +12,7 @@ use gpui_kit::*;
 
 use crate::conversation::ConversationView;
 use crate::images::Images;
-use crate::settings::{Layout, Settings, Sort};
+use crate::settings::{Layout, ListWindow, Settings, Sort};
 
 /// Sidebar sections, laid out as the Google Chat web app does.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -143,6 +143,16 @@ impl Kind {
       Self::Groups => "Groups",
       Self::Spaces => "Spaces",
       Self::Apps => "Apps",
+    }
+  }
+
+  /// Where the kind sits in the IRC buffer list: spaces, as channels, first, then group chats, people, and apps.
+  const fn buffer_rank(self) -> u8 {
+    match self {
+      Self::Spaces => 0,
+      Self::Groups => 1,
+      Self::People => 2,
+      Self::Apps => 3,
     }
   }
 }
@@ -290,6 +300,92 @@ pub struct ShortcutList {
   loading_more: bool,
 }
 
+/// A day in microseconds, the unit of `Group::sort_time`.
+const DAY_MICROS: Micros = 86_400_000_000;
+
+/// Whether the list leaves a conversation behind its Show older row under `window`: a space or group chat last
+/// active more than the window's days before `now`, neither pinned, unread, nor `open`. People and apps never are.
+pub fn is_older(group: &Group, open: bool, window: ListWindow, now: Micros) -> bool {
+  let Some(days) = window.days() else {
+    return false;
+  };
+  let stale = now.saturating_sub(group.sort_time) > Micros::from(days) * DAY_MICROS;
+  matches!(group.kind, GroupKind::Space | GroupKind::GroupDm) && stale && !group.pinned && !group.unread && !open
+}
+
+/// A row of the Messages, Rail, and IRC list.
+pub enum ListRow<'a> {
+  Conv(&'a Arc<Conv>),
+  /// The button that shows or hides the older conversations.
+  Older,
+}
+
+/// The Messages, Rail, and IRC list: the conversations it shows, then, when `Settings::list_window` leaves some out,
+/// the Show older row and, while it is open, the older ones after it.
+#[derive(Default)]
+pub struct Listing {
+  pub recent: Vec<Arc<Conv>>,
+  pub older: Vec<Arc<Conv>>,
+  /// The Show older row was clicked. Kept in memory across rebuilds; starts closed.
+  pub show_older: bool,
+}
+
+impl Listing {
+  /// Splits `list`, already in list order, into the conversations shown and the older ones, each keeping that order.
+  /// A search holds nothing back: its results come from every conversation.
+  fn set(&mut self, list: Vec<Arc<Conv>>, searching: bool, window: ListWindow, open: Option<&GroupId>, now: Micros) {
+    let window = if searching { ListWindow::All } else { window };
+    (self.older, self.recent) = list
+      .into_iter()
+      .partition(|conv| is_older(&conv.g, open == Some(&conv.g.id), window, now));
+  }
+
+  /// How many rows the list has: the conversations shown, the Show older row when any are older, and the older ones
+  /// while it is open.
+  pub const fn rows(&self) -> usize {
+    if self.older.is_empty() {
+      return self.recent.len();
+    }
+    self.recent.len() + 1 + if self.show_older { self.older.len() } else { 0 }
+  }
+
+  /// What row `ix` of the list holds.
+  pub fn row(&self, ix: usize) -> Option<ListRow<'_>> {
+    let Some(after) = ix.checked_sub(self.recent.len()) else {
+      return self.recent.get(ix).map(ListRow::Conv);
+    };
+    match after {
+      _ if self.older.is_empty() => None,
+      0 => Some(ListRow::Older),
+      _ if self.show_older => self.older.get(after - 1).map(ListRow::Conv),
+      _ => None,
+    }
+  }
+
+  /// The conversations on screen, in list order: the older ones only while shown.
+  pub fn visible(&self) -> impl Iterator<Item = &Arc<Conv>> {
+    let older = if self.show_older {
+      self.older.as_slice()
+    } else {
+      &[]
+    };
+    self.recent.iter().chain(older)
+  }
+
+  /// The row of a conversation on screen.
+  pub fn position(&self, id: &GroupId) -> Option<usize> {
+    if let Some(ix) = self.recent.iter().position(|conv| conv.g.id == *id) {
+      return Some(ix);
+    }
+    let older = self
+      .older
+      .iter()
+      .position(|conv| conv.g.id == *id)
+      .filter(|_| self.show_older)?;
+    Some(self.recent.len() + 1 + older)
+  }
+}
+
 const COLLAPSED_ROWS: usize = 8;
 
 pub struct Store {
@@ -308,9 +404,10 @@ pub struct Store {
   /// What Home shows: `all` narrowed by the Unread toggle; while there is search text, `every` narrowed by the toggle
   /// and ranked by the text, best match first.
   pub home: Vec<Arc<Conv>>,
-  /// What the Messages and Rail list shows: `all` narrowed by `pane` and the Unread toggle, pinned first; while there is
-  /// search text, `every` narrowed by those and the text instead.
-  pub list: Vec<Arc<Conv>>,
+  /// What the Messages, Rail, and IRC list shows: `all` narrowed by `pane` and the Unread toggle, pinned first, with
+  /// the conversations older than `list_window` behind a row at the end; while there is search text, `every` narrowed
+  /// by those and the text instead, nothing held back.
+  pub list: Listing,
   pub pane: Pane,
   /// Every Rail entry: All, Mentions, Starred, the user's own sections, each kind the account has, then Meetings.
   pub tabs: Vec<Tab>,
@@ -332,6 +429,11 @@ pub struct Store {
   /// Copies of `Settings::list_sort`, `Settings::section_sort`, and the `show_*` switches of the Mentions, Starred,
   /// Calendar, and Meet buttons, taken by `sync_settings`.
   pub list_sort: Sort,
+  /// The layout is IRC, whose list keeps each kind of conversation together (`Kind::buffer_rank`). Taken by
+  /// `sync_settings` too.
+  by_kind: bool,
+  /// A copy of `Settings::list_window`, taken by `sync_settings`.
+  list_window: ListWindow,
   section_sort: std::collections::BTreeMap<String, Sort>,
   show_mentions: bool,
   show_starred: bool,
@@ -367,7 +469,7 @@ impl Store {
       every: Vec::new(),
       all: Vec::new(),
       home: Vec::new(),
-      list: Vec::new(),
+      list: Listing::default(),
       pane: Pane::All,
       tabs: Vec::new(),
       sidebar: vec![
@@ -388,6 +490,8 @@ impl Store {
       shortcut: None,
       unread_only: false,
       list_sort: Sort::default(),
+      by_kind: false,
+      list_window: ListWindow::default(),
       section_sort: std::collections::BTreeMap::new(),
       show_mentions: true,
       show_starred: true,
@@ -859,11 +963,20 @@ impl Store {
         .collect(),
     );
     by_name(&mut list);
-    // Stable: pinned first, in the chosen order within each. Search results keep best match first.
+    // Stable: pinned first, then in IRC one kind after another, in the chosen order within each. Search results keep
+    // best match first.
     if query.is_empty() {
-      list.sort_by_key(|conv| !conv.g.pinned);
+      let by_kind = self.by_kind;
+      list.sort_by_key(|conv| {
+        let rank = if by_kind {
+          Kind::of(conv.g.kind).buffer_rank()
+        } else {
+          0
+        };
+        (!conv.g.pinned, rank)
+      });
     }
-    self.list = list;
+    self.set_list(list, !query.is_empty());
 
     let mut by_section: HashMap<Section, usize> = HashMap::new();
     let mut by_kind: HashMap<Kind, usize> = HashMap::new();
@@ -908,6 +1021,22 @@ impl Store {
         .map(section_tab),
     );
     self.tabs = tabs;
+  }
+
+  /// Splits the list by `list_window` around the open conversation.
+  fn set_list(&mut self, list: Vec<Arc<Conv>>, searching: bool) {
+    let open = match &self.view {
+      View::Conversation(id) => Some(id),
+      View::Home | View::Shortcut(_) | View::Calendar | View::Meet => None,
+    };
+    let now = crate::calendar_layout::now_micros();
+    self.list.set(list, searching, self.list_window, open, now);
+  }
+
+  /// Shows or hides the older conversations at the end of the list.
+  pub fn toggle_older(&mut self, cx: &mut Context<Self>) {
+    self.list.show_older = !self.list.show_older;
+    cx.notify();
   }
 
   pub fn rebuild_sidebar(&mut self) {
@@ -1047,7 +1176,7 @@ impl Store {
           _ => None,
         })
         .collect(),
-      Layout::Messages | Layout::Rail => self.list.iter().collect(),
+      Layout::Messages | Layout::Rail | Layout::Irc => self.list.visible().collect(),
     }
   }
 
@@ -1071,11 +1200,14 @@ impl Store {
       .unwrap_or_else(|| section.default_sort())
   }
 
-  /// Takes the sort orders and the Mentions, Starred, Calendar, and Meet buttons from the settings, rebuilding the
-  /// lists when they changed. Call at start and whenever the settings change.
+  /// Takes the sort orders, the list's window, and the Mentions, Starred, Calendar, and Meet buttons from the
+  /// settings, rebuilding the lists when they changed. Call at start and whenever the settings change.
   pub fn sync_settings(&mut self, cx: &mut Context<Self>) {
     let settings = cx.global::<Settings>();
+    let by_kind = settings.layout == Layout::Irc;
     if settings.list_sort == self.list_sort
+      && by_kind == self.by_kind
+      && settings.list_window == self.list_window
       && settings.section_sort == self.section_sort
       && settings.show_mentions == self.show_mentions
       && settings.show_starred == self.show_starred
@@ -1085,6 +1217,8 @@ impl Store {
       return;
     }
     self.list_sort = settings.list_sort;
+    self.by_kind = by_kind;
+    self.list_window = settings.list_window;
     self.section_sort = settings.section_sort.clone();
     self.show_mentions = settings.show_mentions;
     self.show_starred = settings.show_starred;
@@ -1178,7 +1312,6 @@ impl Store {
     if !self.query.is_empty() {
       self.query.clear();
       self.search = None;
-      self.rebuild_lists();
     }
     self.recent.retain(|r| r != &id);
     self.recent.insert(0, id.clone());
@@ -1189,6 +1322,8 @@ impl Store {
     let (core, images, me) = (self.core.clone(), self.images.clone(), self.me.clone());
     self.conv = Some(cx.new(|cx| ConversationView::new(store, core, images, group, me, history, window, cx)));
     self.set_view(View::Conversation(id.clone()));
+    // The open conversation is never held back as older.
+    self.rebuild_lists();
     self.drop_shortcut(cx);
     self.core.send(Command::Open(id.clone()));
     self.clear_notifications(&id);
@@ -1506,9 +1641,11 @@ fn ordered<'a>(present: impl Iterator<Item = &'a Section>) -> Vec<Section> {
 
 #[cfg(test)]
 mod tests {
-  use super::{Calling, Section};
-  use crate::settings::Sort;
-  use gchat_core::{Group, GroupId, GroupKind, Notify, Placement};
+  use std::sync::Arc;
+
+  use super::{Calling, Conv, DAY_MICROS, ListRow, Listing, Section, conv, is_older};
+  use crate::settings::{ListWindow, Sort};
+  use gchat_core::{Group, GroupId, GroupKind, Micros, Notify, Placement};
 
   fn group(kind: GroupKind, placement: Placement) -> Group {
     Group {
@@ -1590,5 +1727,93 @@ mod tests {
     // The call has its chat: it takes no other.
     assert!(!call.take_chat(&dm("jpark-other"), &members(&["jpark"])));
     assert!(!call.is_posted(&dm("jpark-other"), true));
+  }
+
+  /// Far enough past the epoch for every age the tests give.
+  const NOW: Micros = 365 * DAY_MICROS;
+
+  fn chat(id: &str, kind: GroupKind, days_ago: Micros) -> Group {
+    let mut g = group(kind, Placement::ByKind);
+    g.id = GroupId::Space(id.into());
+    g.name = id.into();
+    g.sort_time = NOW - days_ago * DAY_MICROS;
+    g
+  }
+
+  #[test]
+  fn only_quiet_spaces_and_group_chats_are_older() {
+    let old = |kind| chat("design-review", kind, 8);
+    assert!(is_older(&old(GroupKind::Space), false, ListWindow::Week, NOW));
+    assert!(is_older(&old(GroupKind::GroupDm), false, ListWindow::Week, NOW));
+    // People and apps stay, however quiet.
+    assert!(!is_older(&old(GroupKind::Dm), false, ListWindow::Week, NOW));
+    assert!(!is_older(&old(GroupKind::App), false, ListWindow::Week, NOW));
+    // A longer window, or All, keeps it.
+    assert!(!is_older(&old(GroupKind::Space), false, ListWindow::TwoWeeks, NOW));
+    assert!(!is_older(&old(GroupKind::Space), false, ListWindow::All, NOW));
+    // Pinned, unread, and open ones stay.
+    let mut pinned = old(GroupKind::Space);
+    pinned.pinned = true;
+    assert!(!is_older(&pinned, false, ListWindow::Week, NOW));
+    let mut unread = old(GroupKind::Space);
+    unread.unread = true;
+    assert!(!is_older(&unread, false, ListWindow::Week, NOW));
+    assert!(!is_older(&old(GroupKind::Space), true, ListWindow::Week, NOW));
+  }
+
+  #[test]
+  fn older_means_more_than_the_window_ago() {
+    let mut space = chat("design-review", GroupKind::Space, 7);
+    assert!(!is_older(&space, false, ListWindow::Week, NOW));
+    space.sort_time -= 1;
+    assert!(is_older(&space, false, ListWindow::Week, NOW));
+  }
+
+  fn list() -> Vec<Arc<Conv>> {
+    [
+      chat("launch", GroupKind::Space, 1),
+      chat("garden-club", GroupKind::GroupDm, 40),
+      chat("riley-brooks", GroupKind::Dm, 60),
+      chat("archive", GroupKind::Space, 90),
+    ]
+    .into_iter()
+    .map(|g| Arc::new(conv(g)))
+    .collect()
+  }
+
+  fn names<'a>(convs: impl Iterator<Item = &'a Arc<Conv>>) -> Vec<&'a str> {
+    convs.map(|conv| conv.g.name.as_str()).collect()
+  }
+
+  #[test]
+  fn the_list_holds_older_ones_behind_a_row_until_it_is_clicked() {
+    let mut listing = Listing::default();
+    listing.set(list(), false, ListWindow::Week, None, NOW);
+    assert_eq!(names(listing.visible()), ["launch", "riley-brooks"]);
+    assert_eq!(listing.rows(), 3);
+    assert!(matches!(listing.row(2), Some(ListRow::Older)));
+    assert!(listing.row(3).is_none());
+    assert_eq!(listing.position(&GroupId::Space("archive".into())), None);
+
+    listing.show_older = true;
+    assert_eq!(names(listing.visible()), ["launch", "riley-brooks", "garden-club", "archive"]);
+    assert_eq!(listing.rows(), 5);
+    assert!(matches!(listing.row(3), Some(ListRow::Conv(conv)) if conv.g.name == "garden-club"));
+    assert_eq!(listing.position(&GroupId::Space("archive".into())), Some(4));
+
+    // Clicked stays clicked when the list is built again.
+    listing.set(list(), false, ListWindow::Week, None, NOW);
+    assert_eq!(listing.rows(), 5);
+  }
+
+  #[test]
+  fn the_open_one_and_a_search_hold_nothing_back() {
+    let mut listing = Listing::default();
+    listing.set(list(), false, ListWindow::Week, Some(&GroupId::Space("archive".into())), NOW);
+    assert_eq!(names(listing.visible()), ["launch", "riley-brooks", "archive"]);
+    listing.set(list(), true, ListWindow::Week, None, NOW);
+    assert_eq!(names(listing.visible()), ["launch", "garden-club", "riley-brooks", "archive"]);
+    assert_eq!(listing.rows(), 4);
+    assert!(listing.older.is_empty());
   }
 }

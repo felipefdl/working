@@ -23,14 +23,17 @@ pub enum Appearance {
   Dark,
 }
 
-/// How messages are laid out, as in Google Chat.
+/// How messages are drawn: Google Chat's two densities, or the lines of an IRC client.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Density {
+pub enum MessageStyle {
   /// The user's own messages sit on the right, without avatar or name.
   #[default]
   Comfortable,
   /// Every message on the left, under its sender.
   Compact,
+  /// One line a message, as in WeeChat: time, the sender's nick in a right-aligned column, then the text, in the
+  /// monospaced font, without avatars or bubbles.
+  Irc,
 }
 
 /// How the main window is arranged, and how moving between conversations works in it.
@@ -43,33 +46,38 @@ pub enum Layout {
   Messages,
   /// An icon rail of categories, the selected one's list with previews, then the open conversation.
   Rail,
+  /// As WeeChat: a narrow list of conversation names without avatars or previews, the open conversation under a
+  /// one-line title bar, and the nick list of a space on the other side.
+  Irc,
 }
 
 impl Layout {
-  pub const ALL: [Self; 3] = [Self::GoogleChat, Self::Messages, Self::Rail];
+  pub const ALL: [Self; 4] = [Self::GoogleChat, Self::Messages, Self::Rail, Self::Irc];
 
   pub const fn label(self) -> &'static str {
     match self {
       Self::GoogleChat => "Google Chat",
       Self::Messages => "Messages",
       Self::Rail => "Rail",
+      Self::Irc => "IRC",
     }
   }
 
-  /// Width of the layout's resizable column (the Google Chat sidebar, or the Messages or Rail list) until the user
-  /// drags it.
+  /// Width of the layout's resizable column (the Google Chat sidebar, or the Messages, Rail or IRC list) until the
+  /// user drags it.
   pub const fn default_width(self) -> f32 {
     match self {
       Self::GoogleChat => 264.,
       Self::Messages => 340.,
       Self::Rail => 320.,
+      Self::Irc => 200.,
     }
   }
 
   /// A conversation list stays beside the open conversation, so opening one never leaves the list and Escape
   /// does not go back to Home.
   pub const fn keeps_list(self) -> bool {
-    matches!(self, Self::Messages | Self::Rail)
+    matches!(self, Self::Messages | Self::Rail | Self::Irc)
   }
 }
 
@@ -115,6 +123,65 @@ impl Sort {
     match self {
       Self::Recent => "Sort by most recent",
       Self::Alphabetical => "Sort alphabetically",
+    }
+  }
+}
+
+/// How lately a space or a group chat must have been active to stay in the conversation list of the Messages, Rail and
+/// IRC layouts. Older ones wait behind the button at the end of the list. One-to-one chats always stay.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ListWindow {
+  Week,
+  TwoWeeks,
+  Month,
+  ThreeMonths,
+  /// Every conversation, whenever it was last active.
+  #[default]
+  All,
+}
+
+impl ListWindow {
+  pub const ALL: [Self; 5] = [Self::Week, Self::TwoWeeks, Self::Month, Self::ThreeMonths, Self::All];
+
+  pub const fn label(self) -> &'static str {
+    match self {
+      Self::Week => "1 week",
+      Self::TwoWeeks => "15 days",
+      Self::Month => "1 month",
+      Self::ThreeMonths => "3 months",
+      Self::All => "All",
+    }
+  }
+
+  /// The days of activity the list keeps; `None` keeps everything.
+  pub const fn days(self) -> Option<u32> {
+    match self {
+      Self::Week => Some(7),
+      Self::TwoWeeks => Some(15),
+      Self::Month => Some(30),
+      Self::ThreeMonths => Some(90),
+      Self::All => None,
+    }
+  }
+}
+
+/// Where a thread opens.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ThreadView {
+  /// A panel beside the conversation, which stays until closed.
+  Side,
+  /// A window over the main window, which a click outside it or Escape closes.
+  #[default]
+  Modal,
+}
+
+impl ThreadView {
+  pub const ALL: [Self; 2] = [Self::Modal, Self::Side];
+
+  pub const fn label(self) -> &'static str {
+    match self {
+      Self::Side => "Side panel",
+      Self::Modal => "Pop-up",
     }
   }
 }
@@ -277,7 +344,7 @@ pub struct Settings {
   /// The font of code spans and code blocks, by family name. Absent is the system monospaced font
   /// (`theme::SYSTEM_MONO`).
   pub mono_font: Option<String>,
-  pub density: Density,
+  pub message_style: MessageStyle,
   pub layout: Layout,
   pub sidebar: SidebarMode,
   pub sidebar_side: SidebarSide,
@@ -295,6 +362,9 @@ pub struct Settings {
   pub column_widths: BTreeMap<Layout, f32>,
   /// Order of Home and of the Messages and Rail list.
   pub list_sort: Sort,
+  /// Which spaces and group chats the Messages, Rail and IRC list shows before its "older" button.
+  pub list_window: ListWindow,
+  pub thread_view: ThreadView,
   /// Order of each Google Chat sidebar section, by `Section::key`. A section without an entry uses its own
   /// default: A to Z for people, newest first elsewhere, as the web app does.
   pub section_sort: BTreeMap<String, Sort>,
@@ -350,7 +420,7 @@ impl Default for Settings {
       light_theme: theme::DEFAULT_LIGHT.into(),
       font: None,
       mono_font: None,
-      density: Density::default(),
+      message_style: MessageStyle::default(),
       layout: Layout::default(),
       sidebar: SidebarMode::default(),
       sidebar_side: SidebarSide::default(),
@@ -360,6 +430,8 @@ impl Default for Settings {
       show_meet: true,
       column_widths: BTreeMap::new(),
       list_sort: Sort::default(),
+      list_window: ListWindow::default(),
+      thread_view: ThreadView::default(),
       section_sort: BTreeMap::new(),
       camera_off: false,
       meet_builtin: true,

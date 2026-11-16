@@ -19,7 +19,7 @@ use crate::emoji_picker;
 use crate::images::Images;
 use crate::menu::{self, MenuItem};
 use crate::receipt_logic;
-use crate::settings::{Density, Settings};
+use crate::settings::{MessageStyle, Settings};
 use crate::text_panel;
 use crate::theme::{
   ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, BUBBLE_OWN, CODE_BG, FIELD, MARK, MUTED, PANEL, PLACEHOLDER, POPOVER, RED,
@@ -211,6 +211,8 @@ pub struct MsgCtx<'a> {
   /// Who has read up to this message: their avatars sit on its bottom corner, out of the row's layout. Empty in a
   /// conversation with read receipts off.
   pub readers: &'a [ReadReceipt],
+  /// IRC style: the width of the sender column, as wide as the longest name among the rows (`irc_nick_width`).
+  pub nick_width: f32,
 }
 
 /// What a message's toolbar asks the conversation to do.
@@ -232,6 +234,9 @@ pub type Actor = Rc<dyn Fn(Act, &Arc<Message>, &mut Window, &mut App)>;
 
 pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
   let msg = &row.msg;
+  if cx.global::<Settings>().message_style == MessageStyle::Irc {
+    return irc_row(row, ctx, cx);
+  }
   let focused = ctx.focus == Some(msg.id.as_str());
   let mut out = v_flex().w_full().items_center().when(focused, |row| row.bg(rgb(ACCENT_BG)));
   if let Some(date) = &row.date {
@@ -264,7 +269,7 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
   }
 
   // Comfortable layout: the user's own messages sit on the right, with only their time above.
-  let aside = row.own && cx.global::<Settings>().density == Density::Comfortable;
+  let aside = row.own && cx.global::<Settings>().message_style == MessageStyle::Comfortable;
   let name = if row.own {
     "You".to_string()
   } else {
@@ -308,7 +313,7 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
     .when(msg.pending, |d| d.opacity(0.55));
   // What the message shows, top to bottom, and where in it the text bubble, the last attachment and the last card are.
   let mut body: Vec<AnyElement> = Vec::new();
-  let (mut bubble_at, mut attachment_at, mut card_at) = (None, None, None);
+  let mut bubble_at = None;
   if row.head {
     let time = div()
       .text_size(px(11.))
@@ -390,6 +395,62 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
     body.push(bubble.into_any_element());
   }
 
+  let (attachment_at, card_at) = push_extras(&mut body, row, bubble_bg, ctx, cx);
+  content = place_readers(content, body, [bubble_at, attachment_at, card_at], aside, &msg.id, ctx, cx);
+
+  // Floats over the top edge of the first bubble, as in Google Chat, so it can reach over the row above.
+  // Only the message under the pointer has one, and it swallows the pointer: the row beneath it does not
+  // count as pointed at, so two toolbars never show together. It always sits on its bubble, which on a row
+  // that starts a run puts it over the sender's name while the pointer is there.
+  if let Some(tools) = floating_tools(row, ctx) {
+    // Where the first bubble starts: below the name or time line of a row that starts a run.
+    let bubble_top = match (row.head, aside) {
+      (true, false) => 24.,
+      (true, true) => 19.,
+      (false, _) => 0.,
+    };
+    content = content.child(
+      tools
+        .top(px(bubble_top - 26.))
+        .when(aside, |tools| tools.right(px(12.)))
+        .when(!aside, |tools| tools.left(px(12.))),
+    );
+  }
+  let (act, entered) = (ctx.act.clone(), msg.clone());
+  let out = out.child(
+    h_flex()
+      .id(SharedString::from(format!("{}-row", msg.id)))
+      .w_full()
+      .max_w(px(780.))
+      .px(px(ROW_PAD))
+      .pt(if row.head { px(10.) } else { px(2.) })
+      .gap_2()
+      .items_start()
+      .on_hover(move |hovered, window, cx| {
+        if *hovered {
+          act(Act::Hover, &entered, window, cx);
+        }
+      })
+      .children(avatar_col)
+      .child(content),
+  );
+  match (row.thread, ctx.open_thread) {
+    (Some(info), None) => out.child(thread_divider(info)).into_any_element(),
+    _ => out.into_any_element(),
+  }
+}
+
+/// What a message shows under its text, in `body` after what is already there: attachments, the starred mark, cards,
+/// reactions, the failed note, and the thread footer. Answers where in `body` the last attachment and the last card are.
+fn push_extras(
+  body: &mut Vec<AnyElement>,
+  row: &Row,
+  bubble_bg: Tone,
+  ctx: &MsgCtx,
+  cx: &App,
+) -> (Option<usize>, Option<usize>) {
+  let msg = &row.msg;
+  let (mut attachment_at, mut card_at) = (None, None);
   for (i, attachment) in msg.attachments.iter().enumerate() {
     let id = SharedString::from(format!("{}-a{i}", msg.id));
     attachment_at = Some(body.len());
@@ -426,11 +487,23 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
   if let (Some(info), Some(open)) = (row.thread, ctx.open_thread) {
     body.push(thread_footer(&msg.id, info, open.clone()));
   }
-  // The avatars of whoever has read up to here sit on the bottom corner of the text bubble, or else of the last
-  // attachment, or else of the last card, never below the reactions, the cards, or the thread footer; a message with
-  // none of those has them on the last thing it shows.
-  let mark = bubble_at.or(attachment_at).or(card_at).or_else(|| body.len().checked_sub(1));
-  let mut readers = readers_group(aside, &msg.id, ctx, cx);
+  (attachment_at, card_at)
+}
+
+/// `body` into `content`, with the avatars of whoever has read up to the message on the first of `marks` there is (the
+/// text, else the last attachment, else the last card), never below the reactions, the cards, or the thread footer; a
+/// message with none of those has them on the last thing it shows.
+fn place_readers(
+  mut content: Div,
+  body: Vec<AnyElement>,
+  marks: [Option<usize>; 3],
+  aside: bool,
+  msg_id: &str,
+  ctx: &MsgCtx,
+  cx: &App,
+) -> Div {
+  let mark = marks.into_iter().flatten().next().or_else(|| body.len().checked_sub(1));
+  let mut readers = readers_group(aside, msg_id, ctx, cx);
   for (ix, part) in body.into_iter().enumerate() {
     content = content.child(if mark == Some(ix) {
       read_mark(part, readers.take(), aside).into_any_element()
@@ -438,59 +511,241 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
       part
     });
   }
+  content
+}
 
-  // Floats over the top edge of the first bubble, as in Google Chat, so it can reach over the row above.
-  // Only the message under the pointer has one, and it swallows the pointer: the row beneath it does not
-  // count as pointed at, so two toolbars never show together. It always sits on its bubble, which on a row
-  // that starts a run puts it over the sender's name while the pointer is there.
-  if !msg.pending && !msg.failed && ctx.hovered == Some(msg.id.as_str()) {
-    // Where the first bubble starts: below the name or time line of a row that starts a run.
-    let bubble_top = match (row.head, aside) {
-      (true, false) => 24.,
-      (true, true) => 19.,
-      (false, _) => 0.,
-    };
-    let (on_tools, act, left) = (ctx.on_tools.clone(), ctx.act.clone(), msg.clone());
-    content = content.child(
+/// The reactions and toolbar that float over the message under the pointer, unplaced: `None` on any other message and
+/// on one still going out or failed. It swallows the pointer, and leaving it lets the conversation check what is
+/// pointed at.
+fn floating_tools(row: &Row, ctx: &MsgCtx) -> Option<Stateful<Div>> {
+  let msg = &row.msg;
+  if msg.pending || msg.failed || ctx.hovered != Some(msg.id.as_str()) {
+    return None;
+  }
+  let (on_tools, act, left) = (ctx.on_tools.clone(), ctx.act.clone(), msg.clone());
+  Some(
+    h_flex()
+      .id(SharedString::from(format!("{}-tools", msg.id)))
+      .absolute()
+      .gap_1()
+      .occlude()
+      .on_hover(move |hovered, window, cx| {
+        on_tools.set(*hovered);
+        if !*hovered {
+          act(Act::Leave, &left, window, cx);
+        }
+      })
+      .child(quick_reactions(msg, ctx.core))
+      .child(toolbar(row, ctx)),
+  )
+}
+
+/// Width of the IRC style's time column: `12:59 PM` in the monospaced font, which never wraps.
+const IRC_TIME: f32 = 68.;
+/// The fewest and the most characters the IRC style's sender column makes room for: a longer name ends in an ellipsis.
+const IRC_NICK_CHARS: (usize, usize) = (3, 14);
+/// How wide one character of the monospaced font is at the IRC style's text size, a little over most fonts' 0.6 em.
+const IRC_CHAR: f32 = 8.;
+
+/// The width of the IRC style's sender column for `rows`: room for the longest sender's name, so short names do not
+/// leave a gap after the time. `cache` keeps the answer while the count of rows stays the same.
+pub fn irc_nick_width(rows: &[Row], cache: &std::cell::Cell<(usize, f32)>) -> f32 {
+  let (count, width) = cache.get();
+  if count == rows.len() && width > 0. {
+    return width;
+  }
+  let (least, most) = IRC_NICK_CHARS;
+  let chars = rows
+    .iter()
+    .filter(|row| !row.msg.system)
+    .map(|row| row.msg.sender_name.chars().count())
+    .max()
+    .unwrap_or(least)
+    .clamp(least, most);
+  #[expect(clippy::cast_precision_loss, reason = "at most 14 characters")]
+  let width = chars as f32 * IRC_CHAR;
+  cache.set((rows.len(), width));
+  width
+}
+
+/// A row in the IRC style, as WeeChat draws a buffer: each message on its own lines of time, sender and text in the
+/// monospaced font, the senders right-aligned against a rule that runs down the list, and wrapped text hanging under
+/// the text column. No avatars, no bubbles, no runs: every row names its sender and time. What the message shows
+/// after its text (attachments, cards, reactions, the thread footer) stacks under the text in the same column.
+fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
+  let msg = &row.msg;
+  let focused = ctx.focus == Some(msg.id.as_str());
+  let mut out = v_flex()
+    .w_full()
+    .font_family(crate::theme::mono())
+    .text_size(px(13.))
+    .line_height(px(18.))
+    .when(focused, |row| row.bg(rgb(ACCENT_BG)));
+  if let Some(date) = &row.date {
+    out = out.child(
       h_flex()
-        .id(SharedString::from(format!("{}-tools", msg.id)))
-        .absolute()
-        .top(px(bubble_top - 26.))
-        .when(aside, |tools| tools.right(px(12.)))
-        .when(!aside, |tools| tools.left(px(12.)))
-        .gap_1()
-        .occlude()
-        .on_hover(move |hovered, window, cx| {
-          on_tools.set(*hovered);
-          if !*hovered {
-            act(Act::Leave, &left, window, cx);
-          }
-        })
-        .child(quick_reactions(msg, ctx.core))
-        .child(toolbar(row, ctx)),
+        .w_full()
+        .px(px(ROW_PAD))
+        .py_1()
+        .gap_2()
+        .items_center()
+        .text_size(px(12.))
+        .text_color(rgb(MUTED))
+        .child(div().w(px(24.)).h(px(1.)).flex_shrink_0().bg(rgb(BORDER)))
+        .child(div().flex_shrink_0().child(date.clone()))
+        .child(div().flex_1().h(px(1.)).bg(rgb(BORDER))),
     );
   }
+  // A message that shows more than text (an attachment, a card, reactions) stands clear of the rows over and under
+  // it. The space is inside its columns, so the rule between them still runs on unbroken.
+  let blocks = !msg.attachments.is_empty() || !msg.cards.is_empty() || !msg.reactions.is_empty();
+  let time = div()
+    .w(px(IRC_TIME))
+    .flex_shrink_0()
+    .whitespace_nowrap()
+    .when(blocks, gpui_kit::Styled::pt_1p5)
+    .text_color(rgb(MUTED))
+    .child(util::message_time(msg.time));
+  let nick = div()
+    .w(px(ctx.nick_width))
+    .ml_1()
+    .flex_shrink_0()
+    .when(blocks, gpui_kit::Styled::pt_1p5)
+    .text_right()
+    .truncate();
+  // The rule between the senders and the text, as tall as the row, so it runs on from one row to the next.
+  let rule = div().w(px(1.)).flex_shrink_0().self_stretch().mx_2().bg(rgb(BORDER));
+  if msg.system {
+    return out
+      .child(
+        h_flex()
+          .w_full()
+          .px(px(ROW_PAD))
+          .items_start()
+          .child(time)
+          .child(nick.text_color(rgb(MUTED)).child("*"))
+          .child(rule)
+          .child(div().flex_1().min_w_0().text_color(rgb(MUTED)).child(marked_plain(
+            &msg.text,
+            ctx.find,
+            ctx.find_hit.as_ref(),
+          ))),
+      )
+      .into_any_element();
+  }
+
+  // The user's own messages carry their name, in the accent color; someone else's name opens the chat with them.
+  let name = if row.own && msg.sender_name.is_empty() {
+    "You".to_string()
+  } else {
+    msg.sender_name.clone()
+  };
+  let color = if row.own {
+    rgb(ACCENT).into()
+  } else {
+    nick_color(&msg.sender_id)
+  };
+  let nick = nick
+    .id(SharedString::from(format!("{}-name", msg.id)))
+    .text_color(color)
+    .child(name);
+  let nick = if row.own {
+    nick
+  } else {
+    let (user_id, open) = (msg.sender_id.clone(), ctx.open_person.clone());
+    nick
+      .cursor_pointer()
+      .hover(gpui_kit::Styled::underline)
+      .on_click(move |_, window, cx| open(&user_id, window, cx))
+  };
+
+  let mut column = v_flex()
+    .relative()
+    .flex_1()
+    .min_w_0()
+    .items_start()
+    .gap_0p5()
+    .when(blocks, gpui_kit::Styled::py_1p5)
+    .when(msg.pending, |d| d.opacity(0.55));
+  let mut body: Vec<AnyElement> = Vec::new();
+  let mut text_at = None;
+  let has_text = !msg.text.trim().is_empty();
+  if has_text || msg.quote.is_some() {
+    // A click on the text, its quote included, opens it in the panel where it can be selected, as on a bubble.
+    let mut text = v_flex()
+      .id(SharedString::from(format!("{}-bubble", msg.id)))
+      .min_w_0()
+      // No bubble for the readers' avatars to tuck into: the text keeps them a gap away (`read_mark`).
+      .pr(px(READER_TUCK + 6.))
+      .text_color(rgb(TEXT))
+      .when(has_text, |text| {
+        let msg = msg.clone();
+        text.on_click(move |event, window, cx| text_panel::show(event.position(), &msg.text, window, cx))
+      });
+    if let Some(quote) = &msg.quote {
+      let quoted = quote.text.split_whitespace().collect::<Vec<_>>().join(" ");
+      text = text.child(div().max_w_full().truncate().text_color(rgb(MUTED)).child(format!(
+        "> {}: {}",
+        quote.sender_name,
+        clip(&quoted, 240)
+      )));
+    }
+    if has_text {
+      let rich = rich_text(&msg.id, &msg.text, &msg.spans, ctx.find, ctx.find_hit.as_ref(), ctx.open_person);
+      // The mark has a line of its own under the text, which keeps the text free to wrap at the column's edge.
+      text = text.child(rich);
+      if msg.edited {
+        text = text.child(div().text_color(rgb(MUTED)).child("(edited)"));
+      }
+    }
+    text_at = Some(body.len());
+    body.push(text.into_any_element());
+  }
+  let (attachment_at, card_at) = push_extras(&mut body, row, BUBBLE, ctx, cx);
+  column = place_readers(column, body, [text_at, attachment_at, card_at], false, &msg.id, ctx, cx);
+  // Over the right end of the row above, clear of the sender and the start of the text.
+  if let Some(tools) = floating_tools(row, ctx) {
+    column = column.child(tools.top(px(-26.)).right(px(12.)));
+  }
+
   let (act, entered) = (ctx.act.clone(), msg.clone());
   let out = out.child(
     h_flex()
       .id(SharedString::from(format!("{}-row", msg.id)))
       .w_full()
-      .max_w(px(780.))
       .px(px(ROW_PAD))
-      .pt(if row.head { px(10.) } else { px(2.) })
-      .gap_2()
       .items_start()
       .on_hover(move |hovered, window, cx| {
         if *hovered {
           act(Act::Hover, &entered, window, cx);
         }
       })
-      .children(avatar_col)
-      .child(content),
+      .child(time)
+      .child(nick)
+      .child(rule)
+      .child(column),
   );
   match (row.thread, ctx.open_thread) {
     (Some(info), None) => out.child(thread_divider(info)).into_any_element(),
     _ => out.into_any_element(),
+  }
+}
+
+/// Where on the color wheel a sender's name sits in the IRC style, from 0 up to 1: the same for the same id on every
+/// row and every run (FNV-1a over its bytes), so a person keeps their color.
+fn nick_hue(id: &str) -> f32 {
+  let hash = id
+    .bytes()
+    .fold(0x811c_9dc5_u32, |hash, byte| (hash ^ u32::from(byte)).wrapping_mul(0x0100_0193));
+  f32::from(u16::try_from(hash % 360).unwrap_or_default()) / 360.
+}
+
+/// A sender's name color in the IRC style: their hue at the accent's saturation and lightness, which the theme tunes
+/// to read on its surfaces.
+fn nick_color(id: &str) -> Hsla {
+  Hsla {
+    h: nick_hue(id),
+    ..Hsla::from(rgb(ACCENT))
   }
 }
 
@@ -1716,6 +1971,20 @@ mod tests {
   fn reply_label_plural() {
     assert_eq!(super::reply_label(1), "1 reply");
     assert_eq!(super::reply_label(2), "2 replies");
+  }
+
+  #[test]
+  fn nick_hue_is_stable_and_on_the_wheel() {
+    let ids = ["user/human/101", "user/human/202", "jpark@example.com", ""];
+    for id in ids {
+      let hue = super::nick_hue(id);
+      assert_eq!(hue.to_bits(), super::nick_hue(id).to_bits());
+      assert!((0.0..1.0).contains(&hue), "{id}: {hue}");
+    }
+    assert_ne!(
+      super::nick_hue("user/human/101").to_bits(),
+      super::nick_hue("user/human/202").to_bits()
+    );
   }
 
   #[test]

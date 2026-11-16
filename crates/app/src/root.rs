@@ -775,8 +775,12 @@ impl RootView {
     } else if self.store.read(cx).view != View::Home {
       let conv = self.store.read(cx).conv.clone();
       let closed = conv.is_some_and(|conv| {
+        // A thread pop-up closes first: it covers the find bar and the main composer's draft.
         conv.update(cx, |conv, cx| {
-          conv.close_find(window, cx) || conv.cancel_draft(window, cx) || conv.close_thread(window, cx)
+          conv.close_thread_popup(window, cx)
+            || conv.close_find(window, cx)
+            || conv.cancel_draft(window, cx)
+            || conv.close_thread(window, cx)
         })
       });
       // Messages and Rail keep their list beside the conversation: there is no Home to go back to.
@@ -794,6 +798,17 @@ impl RootView {
       || self.theme_picker.is_some()
       || self.new_chat.is_some()
       || self.calendar.read(cx).has_modal()
+  }
+
+  /// The open conversation's thread as a pop-up over the window, when one is open and the setting asks for that.
+  fn thread_popup(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    let store = self.store.read(cx);
+    if !matches!(store.view, View::Conversation(_)) {
+      return None;
+    }
+    let conv = store.conv.clone()?;
+    let viewport = window.viewport_size();
+    conv.update(cx, |conv, cx| conv.thread_popup(viewport, cx))
   }
 
   /// Whether a navigation hotkey goes through: a modal over the window keeps it out, and the media viewer closes
@@ -900,12 +915,12 @@ impl RootView {
       })
   }
 
-  /// The column(s) of the layout, left to right: the sidebar, the list, or the rail and the list, with the rail at
-  /// the window's edge on either side.
+  /// The column(s) of the layout, left to right: the sidebar, the list (Messages' or IRC's buffer list), or the rail
+  /// and the list, with the rail at the window's edge on either side.
   fn columns(&self, cx: &App) -> Vec<AnyElement> {
     match self.layout {
       Layout::GoogleChat => vec![self.sidebar.clone().into_any_element()],
-      Layout::Messages => vec![self.conv_list.clone().into_any_element()],
+      Layout::Messages | Layout::Irc => vec![self.conv_list.clone().into_any_element()],
       Layout::Rail => {
         let mut columns = vec![self.rail.clone().into_any_element(), self.conv_list.clone().into_any_element()];
         if Self::sidebar_side(cx) == SidebarSide::Right {
@@ -1255,6 +1270,7 @@ impl Render for RootView {
       .children(self.switcher.as_ref().map(|(switcher, _)| switcher.clone()))
       .children(self.theme_picker.as_ref().map(|(picker, _)| picker.clone()))
       .children(self.new_chat.as_ref().map(|(view, _)| view.clone()))
+      .children(self.thread_popup(window, cx))
       .children(self.settings.as_ref().map(|(view, _)| view.clone()))
       .children(self.calendar.read(cx).overlays())
       .child(self.viewer.clone())
