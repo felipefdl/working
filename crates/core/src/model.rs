@@ -408,10 +408,37 @@ pub struct Message {
   pub failed: bool,
 }
 
+/// The sidebar and notification line of a message that has no text and holds a Meet link.
+pub(crate) const MEET_PREVIEW: &str = "Shared a Meet link";
+/// The sidebar and notification line of a message that has no text and nothing more telling.
+pub(crate) const ATTACHMENT_PREVIEW: &str = "Sent an attachment";
+
 impl Message {
   /// True for a reply inside a thread: it follows the message that started the topic, whose id is the topic id.
   pub fn is_thread_reply(&self) -> bool {
     !self.topic_id.is_empty() && self.id != self.topic_id
+  }
+
+  /// The message on one line, for the sidebar and notifications: its text, else what it carries (a Meet link, a
+  /// card's title, or an attachment).
+  pub fn preview(&self) -> String {
+    let text = self.text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !text.is_empty() {
+      return text;
+    }
+    if self
+      .attachments
+      .iter()
+      .any(|attachment| attachment.kind == AttachmentKind::Meet)
+    {
+      return MEET_PREVIEW.into();
+    }
+    self
+      .cards
+      .first()
+      .map(|card| card.title.clone())
+      .filter(|title| !title.is_empty())
+      .unwrap_or_else(|| ATTACHMENT_PREVIEW.into())
   }
 }
 

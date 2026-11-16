@@ -2379,16 +2379,11 @@ impl Engine {
     }
 
     if is_new && let Some(group) = state.groups.get_mut(&message.group) {
-      let text = if message.text.trim().is_empty() {
-        "Sent an attachment".to_string()
-      } else {
-        message.text.clone()
-      };
       group.sort_time = group.sort_time.max(message.time);
       group.snippet = Some(Snippet {
         sender_id: message.sender_id.clone(),
         sender_name: message.sender_name.clone(),
-        text: text.split_whitespace().collect::<Vec<_>>().join(" "),
+        text: message.preview(),
         time: message.time,
       });
       if message.sender_id == me_id {

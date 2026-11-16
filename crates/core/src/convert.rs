@@ -303,7 +303,14 @@ pub fn snippet(message: &proto::Message, users: &Users) -> Option<Snippet> {
   let (sender_id, sender_name, _) = sender(message, users);
   let text = match message.text_body.as_deref() {
     Some(text) if !text.trim().is_empty() => text.split_whitespace().collect::<Vec<_>>().join(" "),
-    _ => "Sent an attachment".to_string(),
+    _ if message
+      .annotations
+      .iter()
+      .any(|annotation| annotation.r#type == Some(proto::AnnotationType::VideoCall as i32)) =>
+    {
+      crate::model::MEET_PREVIEW.to_string()
+    },
+    _ => crate::model::ATTACHMENT_PREVIEW.to_string(),
   };
   Some(Snippet {
     sender_id,

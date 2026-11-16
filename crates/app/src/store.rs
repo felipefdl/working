@@ -822,14 +822,10 @@ impl Store {
       return;
     }
     let direct = matches!(conv.g.kind, GroupKind::Dm | GroupKind::App);
-    let body = if message.text.trim().is_empty() {
-      "Sent an attachment"
-    } else {
-      message.text.as_str()
-    };
+    let body = message.preview();
     let sound = cx.global::<crate::settings::Settings>().sound.resolved();
     let space = (!direct).then_some(conv.g.name.as_str());
-    crate::notify::post(&message.id, &message.group.key(), &message.sender_name, space, body, sound);
+    crate::notify::post(&message.id, &message.group.key(), &message.sender_name, space, &body, sound);
     self.notified.entry(message.group.clone()).or_default().push(message.id.clone());
   }
 

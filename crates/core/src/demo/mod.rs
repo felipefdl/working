@@ -511,7 +511,7 @@ impl Demo {
     }
     if is_new {
       self.update_group(&group, |group| {
-        let text = data::snippet_text(message);
+        let text = message.preview();
         group.sort_time = group.sort_time.max(message.time);
         group.snippet = Some(Snippet {
           sender_id: message.sender_id.clone(),

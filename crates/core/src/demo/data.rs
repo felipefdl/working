@@ -40,18 +40,6 @@ pub struct World {
   pub read: HashMap<GroupId, HashMap<String, Micros>>,
 }
 
-/// A message's sidebar line: its text on one line, else its card's title.
-pub fn snippet_text(message: &Message) -> String {
-  let text = message.text.split_whitespace().collect::<Vec<_>>().join(" ");
-  if !text.is_empty() {
-    return text;
-  }
-  message
-    .cards
-    .first()
-    .map_or_else(|| "Sent an attachment".into(), |card| card.title.clone())
-}
-
 fn person(id: &str, name: &str, email: &str) -> User {
   User {
     id: id.into(),
@@ -367,7 +355,7 @@ impl Builder {
       group.snippet = Some(Snippet {
         sender_id: last.sender_id.clone(),
         sender_name: last.sender_name.clone(),
-        text: snippet_text(last),
+        text: last.preview(),
         time: last.time,
       });
     }
