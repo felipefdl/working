@@ -248,41 +248,149 @@ pub fn ping() -> proto::StreamEventsRequest {
 }
 
 /// Splits the stream into payloads. Each is prefixed by its length in UTF-16 code units and a newline.
+///
+/// Every byte is looked at once however many pushes a payload arrives in: the length prefix, the body's start,
+/// and how far the body has been counted are kept between calls.
 #[derive(Default)]
 struct ChunkParser {
   buffer: Vec<u8>,
+  /// Start of the payload being read (its length prefix).
+  start: usize,
+  /// Where reading goes on: in the prefix while `body` is `None`, else in the body.
+  position: usize,
+  /// Once the prefix is read: the body's length in UTF-16 units, and where it starts.
+  body: Option<(usize, usize)>,
+  /// UTF-16 units of the body counted so far, up to `position`.
+  counted: usize,
 }
 
 impl ChunkParser {
   fn push(&mut self, bytes: &[u8]) {
+    // What earlier payloads used goes once per push, not once per payload.
+    if self.start > 0 {
+      self.buffer.drain(..self.start);
+      self.position -= self.start;
+      if let Some((_, body)) = &mut self.body {
+        *body -= self.start;
+      }
+      self.start = 0;
+    }
     self.buffer.extend_from_slice(bytes);
   }
 
   fn next(&mut self) -> Option<String> {
-    let newline = self.buffer.iter().position(|&byte| byte == b'\n')?;
-    let units: usize = std::str::from_utf8(&self.buffer[..newline]).ok()?.trim().parse().ok()?;
-    let body = &self.buffer[newline + 1..];
-    // The tail may end inside a multi-byte character; only the valid prefix counts.
-    let text = match std::str::from_utf8(body) {
-      Ok(text) => text,
-      Err(error) => std::str::from_utf8(&body[..error.valid_up_to()]).ok()?,
+    let (units, body) = if let Some(body) = self.body {
+      body
+    } else {
+      let rest = self.buffer.get(self.position..)?;
+      let Some(newline) = rest.iter().position(|&byte| byte == b'\n') else {
+        self.position = self.buffer.len();
+        return None;
+      };
+      let newline = self.position + newline;
+      let prefix = self.buffer.get(self.start..newline)?;
+      let units: usize = std::str::from_utf8(prefix).ok()?.trim().parse().ok()?;
+      self.body = Some((units, newline + 1));
+      self.position = newline + 1;
+      self.counted = 0;
+      (units, newline + 1)
     };
-    let mut seen = 0;
-    let mut end = None;
-    for (index, character) in text.char_indices() {
-      if seen == units {
-        end = Some(index);
+    while self.counted < units {
+      let rest = self.buffer.get(self.position..)?;
+      let wanted = units - self.counted;
+      // Payloads are JSON with base64, so nearly always ASCII: one byte, one unit.
+      let window = rest.get(..wanted.min(rest.len()))?;
+      let ascii = if window.is_ascii() {
+        window.len()
+      } else {
+        window.iter().position(|byte| !byte.is_ascii()).unwrap_or(window.len())
+      };
+      self.position += ascii;
+      self.counted += ascii;
+      if self.counted == units {
         break;
       }
-      seen += character.len_utf16();
+      let rest = rest.get(ascii..)?;
+      let &lead = rest.first()?;
+      let width = match lead {
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        // A continuation byte cannot start a character: the stream is not UTF-8.
+        _ => return None,
+      };
+      // The tail may end inside a multi-byte character; it is counted once the rest arrives.
+      let character = std::str::from_utf8(rest.get(..width)?).ok()?.chars().next()?;
+      self.position += width;
+      self.counted += character.len_utf16();
     }
-    let end = match end {
-      Some(end) => end,
-      None if seen == units => text.len(),
-      None => return None,
-    };
-    let payload = text[..end].to_string();
-    self.buffer.drain(..newline + 1 + end);
+    let payload = std::str::from_utf8(self.buffer.get(body..self.position)?).ok()?.to_string();
+    self.start = self.position;
+    self.body = None;
+    self.counted = 0;
     Some(payload)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::ChunkParser;
+
+  fn drain(parser: &mut ChunkParser) -> Vec<String> {
+    std::iter::from_fn(|| parser.next()).collect()
+  }
+
+  #[test]
+  fn several_payloads_in_one_push() {
+    let mut parser = ChunkParser::default();
+    parser.push(b"5\n[1,2]3\n[3]0\n");
+    assert_eq!(drain(&mut parser), ["[1,2]", "[3]", ""]);
+  }
+
+  #[test]
+  fn prefix_split_across_pushes() {
+    let mut parser = ChunkParser::default();
+    parser.push(b"1");
+    assert_eq!(parser.next(), None);
+    parser.push(b"2");
+    assert_eq!(parser.next(), None);
+    parser.push(b"\n[\"abcdefgh\"]4\n");
+    assert_eq!(drain(&mut parser), ["[\"abcdefgh\"]"]);
+    parser.push(b"[12]");
+    assert_eq!(drain(&mut parser), ["[12]"]);
+  }
+
+  #[test]
+  fn body_split_inside_a_character() {
+    let text = "\"Jordan é\"";
+    let bytes = format!("10\n{text}");
+    let bytes = bytes.as_bytes();
+    let split = bytes.len() - 2;
+    let mut parser = ChunkParser::default();
+    parser.push(bytes.get(..split).unwrap_or_default());
+    assert_eq!(parser.next(), None);
+    parser.push(bytes.get(split..).unwrap_or_default());
+    assert_eq!(drain(&mut parser), [text]);
+  }
+
+  #[test]
+  fn characters_beyond_the_bmp_count_as_two_units() {
+    let mut parser = ChunkParser::default();
+    parser.push("4\n\"😀\"3\n\"é\"".as_bytes());
+    assert_eq!(drain(&mut parser), ["\"😀\"", "\"é\""]);
+  }
+
+  #[test]
+  fn body_split_in_many_pushes() {
+    let payload = "[\"Riley Brooks 😀 ünïcödé\",42]";
+    let units = payload.encode_utf16().count();
+    let stream = format!("{units}\n{payload}{units}\n{payload}");
+    let mut parser = ChunkParser::default();
+    let mut found = Vec::new();
+    for byte in stream.as_bytes() {
+      parser.push(std::slice::from_ref(byte));
+      found.extend(drain(&mut parser));
+    }
+    assert_eq!(found, [payload, payload]);
   }
 }

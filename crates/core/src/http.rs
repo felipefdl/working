@@ -169,7 +169,9 @@ pub struct Http {
   /// session's cookies and saves the new ones to that file; they are read again when the old ones stop working.
   jar: Arc<SessionJar>,
   cookie_path: std::path::PathBuf,
-  xsrf: RwLock<Option<String>>,
+  xsrf: RwLock<Xsrf>,
+  /// One bootstrap read at a time: callers that wait on it take what the read before them found.
+  refreshing: tokio::sync::Mutex<()>,
   /// Token the web app's page RPCs require, read with the XSRF token.
   page_token: RwLock<Option<String>>,
   request_id: AtomicU64,
@@ -197,7 +199,8 @@ impl Http {
       stream_client: builder().build()?,
       jar,
       cookie_path: path.to_path_buf(),
-      xsrf: RwLock::new(None),
+      xsrf: RwLock::new(Xsrf::default()),
+      refreshing: tokio::sync::Mutex::new(()),
       page_token: RwLock::new(None),
       request_id: AtomicU64::new(1),
       refused: AtomicBool::new(false),
@@ -228,15 +231,49 @@ impl Http {
   }
 
   pub fn xsrf(&self) -> Option<String> {
-    self.xsrf.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    self
+      .xsrf
+      .read()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .token
+      .clone()
+  }
+
+  /// The token held and the generation it belongs to, read together.
+  fn xsrf_state(&self) -> (Option<String>, u64) {
+    let xsrf = self.xsrf.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+    (xsrf.token.clone(), xsrf.generation)
   }
 
   pub fn set_xsrf(&self, token: String) {
-    *self.xsrf.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(token);
+    let mut xsrf = self.xsrf.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+    xsrf.token = Some(token);
+    xsrf.refused = None;
+    xsrf.generation += 1;
   }
 
   /// Reads the XSRF token from the web app's bootstrap page. Also the cheapest check that the session is alive.
+  /// A read already under way is waited for and its answer taken, rather than a second one made.
   pub async fn refresh_xsrf(&self) -> Result<String> {
+    let (_, generation) = self.xsrf_state();
+    self.refresh_since(generation).await
+  }
+
+  /// Reads the bootstrap page again unless a read finished after the token of `seen` was held: then its new
+  /// token, or its refusal, is the answer.
+  async fn refresh_since(&self, seen: u64) -> Result<String> {
+    let _refreshing = self.refreshing.lock().await;
+    {
+      let xsrf = self.xsrf.read().unwrap_or_else(std::sync::PoisonError::into_inner);
+      if xsrf.generation != seen {
+        if let Some(reason) = &xsrf.refused {
+          return Err(SignedOut(reason.clone()).into());
+        }
+        if let Some(token) = &xsrf.token {
+          return Ok(token.clone());
+        }
+      }
+    }
     let result = match self.read_bootstrap().await {
       Err(error) if error.downcast_ref::<SignedOut>().is_some() => {
         // The cookies in use were rotated away (by a Meet call): take the saved ones and try once more.
@@ -247,8 +284,15 @@ impl Http {
     };
     match &result {
       Ok(_) => self.refused.store(false, Ordering::Relaxed),
-      Err(error) if error.downcast_ref::<SignedOut>().is_some() => self.note_refused(),
-      Err(_) => {},
+      Err(error) => {
+        if let Some(SignedOut(reason)) = error.downcast_ref::<SignedOut>() {
+          let mut xsrf = self.xsrf.write().unwrap_or_else(std::sync::PoisonError::into_inner);
+          xsrf.refused = Some(reason.clone());
+          xsrf.generation += 1;
+          drop(xsrf);
+          self.note_refused();
+        }
+      },
     }
     result
   }
@@ -373,21 +417,33 @@ impl Http {
 
   /// Calls a Chat API endpoint with a binary protobuf body and decodes the protobuf answer.
   pub async fn api<Req: Message, Resp: Message + Default>(&self, endpoint: &str, request: &Req) -> Result<Resp> {
-    let body = request.encode_to_vec();
-    match self.api_once(endpoint, body.clone()).await {
-      Err(error) if error.downcast_ref::<StaleToken>().is_some() => {
-        self.refresh_xsrf().await?;
+    let body = prost::bytes::Bytes::from(request.encode_to_vec());
+    let result = self.api_once(endpoint, body.clone()).await;
+    match stale(&result) {
+      Some(seen) => {
+        self.refresh_since(seen).await?;
         self.api_once(endpoint, body).await
       },
-      other => other,
+      None => result,
     }
   }
 
-  async fn api_once<Resp: Message + Default>(&self, endpoint: &str, body: Vec<u8>) -> Result<Resp> {
-    let token = match self.xsrf() {
-      Some(token) => token,
-      None => self.refresh_xsrf().await?,
-    };
+  /// The token to send and its generation, read from the bootstrap page when none is held.
+  async fn token(&self) -> Result<(String, u64)> {
+    match self.xsrf_state() {
+      (Some(token), generation) => Ok((token, generation)),
+      (None, generation) => {
+        self.refresh_since(generation).await?;
+        match self.xsrf_state() {
+          (Some(token), generation) => Ok((token, generation)),
+          (None, _) => bail!("bootstrap data has no XSRF token"),
+        }
+      },
+    }
+  }
+
+  async fn api_once<Resp: Message + Default>(&self, endpoint: &str, body: prost::bytes::Bytes) -> Result<Resp> {
+    let (token, generation) = self.token().await?;
     let counter = self.request_id.fetch_add(1, Ordering::Relaxed).to_string();
     let response = self
       .client
@@ -406,7 +462,7 @@ impl Http {
       .is_some_and(|value| value == "base64");
     let bytes = response.bytes().await?;
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-      return Err(StaleToken.into());
+      return Err(StaleToken(generation).into());
     }
     if !status.is_success() {
       let body = String::from_utf8_lossy(&bytes);
@@ -414,30 +470,28 @@ impl Http {
       bail!("{endpoint} answered {status}: {body}");
     }
     let decoded = if base64_encoded {
-      BASE64.decode(&bytes)?
+      Resp::decode(BASE64.decode(&bytes)?.as_slice())
     } else {
-      bytes.to_vec()
+      Resp::decode(bytes)
     };
-    Resp::decode(decoded.as_slice()).with_context(|| format!("{endpoint} answer does not decode"))
+    decoded.with_context(|| format!("{endpoint} answer does not decode"))
   }
 
   /// Calls a Chat API endpoint the way the web app does for requests the protobuf schema here cannot express: the
   /// body and the answer are the positional JSON form of the protobuf messages (index `n` is field `n + 1`).
   pub async fn api_json(&self, endpoint: &str, request: &serde_json::Value) -> Result<serde_json::Value> {
-    match self.api_json_once(endpoint, request).await {
-      Err(error) if error.downcast_ref::<StaleToken>().is_some() => {
-        self.refresh_xsrf().await?;
+    let result = self.api_json_once(endpoint, request).await;
+    match stale(&result) {
+      Some(seen) => {
+        self.refresh_since(seen).await?;
         self.api_json_once(endpoint, request).await
       },
-      other => other,
+      None => result,
     }
   }
 
   async fn api_json_once(&self, endpoint: &str, request: &serde_json::Value) -> Result<serde_json::Value> {
-    let token = match self.xsrf() {
-      Some(token) => token,
-      None => self.refresh_xsrf().await?,
-    };
+    let (token, generation) = self.token().await?;
     let counter = self.request_id.fetch_add(1, Ordering::Relaxed).to_string();
     let response = self
       .client
@@ -452,7 +506,7 @@ impl Http {
     let status = response.status();
     let text = response.text().await?;
     if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-      return Err(StaleToken.into());
+      return Err(StaleToken(generation).into());
     }
     if !status.is_success() {
       let body = text.chars().take(300).collect::<String>();
@@ -470,7 +524,8 @@ impl Http {
     if !status.is_success() {
       bail!("GET answered {status}");
     }
-    Ok(response.bytes().await?.to_vec())
+    // Reuses the answer's buffer when it holds it alone.
+    Ok(Vec::from(response.bytes().await?))
   }
 
   /// Uploads a file to attach to a message in the conversation with the plain id `group`. The answer is what
@@ -518,8 +573,9 @@ impl Http {
   }
 }
 
+/// The API refused the XSRF token of the generation it carries.
 #[derive(Debug)]
-struct StaleToken;
+struct StaleToken(u64);
 
 impl std::fmt::Display for StaleToken {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -528,6 +584,20 @@ impl std::fmt::Display for StaleToken {
 }
 
 impl std::error::Error for StaleToken {}
+
+/// The generation of the token the API refused, when that is why `result` failed.
+fn stale<T>(result: &Result<T>) -> Option<u64> {
+  result.as_ref().err()?.downcast_ref::<StaleToken>().map(|stale| stale.0)
+}
+
+/// The XSRF token, with a generation that moves each time the token changes or a bootstrap read is refused.
+#[derive(Default)]
+struct Xsrf {
+  token: Option<String>,
+  generation: u64,
+  /// Why the last bootstrap read was refused, until a token arrives.
+  refused: Option<String>,
+}
 
 /// Header every API request carries: who we are and which features the answers may use.
 pub fn request_header() -> proto::RequestHeader {

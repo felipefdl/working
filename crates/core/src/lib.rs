@@ -20,6 +20,7 @@ mod proto;
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 pub use calendar::{EVENT_COLORS, boundary_date, local_midnight};
 pub use engine::device_time_zone;
@@ -99,6 +100,10 @@ pub struct Core {
   commands: flume::Sender<Command>,
   events: flume::Receiver<Event>,
   fetcher: Arc<engine::Fetcher>,
+  /// Ends the core's command loop (`shutdown`).
+  stop: flume::Sender<()>,
+  /// Disconnects once the core finished: its last cache writes are on disk.
+  stopped: flume::Receiver<()>,
 }
 
 impl Core {
@@ -108,12 +113,24 @@ impl Core {
   pub fn start() -> Self {
     let (commands, command_rx) = flume::unbounded();
     let (event_tx, events) = flume::unbounded();
+    let (stop, stop_rx) = flume::bounded(1);
+    let (done, stopped) = flume::bounded(1);
     let fetcher = if demo_mode() {
+      // The demo writes nothing to disk: it is done at once.
+      drop((stop_rx, done));
       demo::spawn(command_rx, event_tx)
     } else {
-      engine::spawn(command_rx, event_tx)
+      engine::spawn(command_rx, event_tx, stop_rx, done)
     };
-    Self { commands, events, fetcher }
+    Self { commands, events, fetcher, stop, stopped }
+  }
+
+  /// Stops the core for the app's quit: its command loop ends, and the history changes it still holds back from the
+  /// disk cache are written. Blocks the calling thread until that is done or `timeout` passes, whichever is first.
+  /// Every clone of this handle shares the one core, so commands sent afterwards are not handled.
+  pub fn shutdown(&self, timeout: Duration) {
+    let _ = self.stop.try_send(());
+    let _ = self.stopped.recv_timeout(timeout);
   }
 
   /// Enqueue a command. Dropped only if the core thread has stopped.

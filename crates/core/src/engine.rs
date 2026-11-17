@@ -26,8 +26,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use tokio::sync::Semaphore;
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::{Notify as Wake, Semaphore};
 
 use crate::cache::{Cache, HistoryCache, WorldCache};
 use crate::channel::{Channel, ChannelEvent};
@@ -48,6 +48,15 @@ const OLDER_PAGE: i32 = 30;
 /// Conversations whose history is fetched right after start, so the first click on them is instant.
 const PREFETCH_GROUPS: usize = 16;
 const XSRF_MAX_AGE_SECS: u64 = 6 * 3600;
+/// Conversations held in memory besides the open one; one used longer ago leaves memory, and the disk cache brings
+/// it back when it is opened again.
+const HELD_HISTORIES: usize = 24;
+/// Topics of a conversation the disk cache keeps: the first screen, as `LATEST_PAGE` asks for it.
+const SAVED_TOPICS: usize = 40;
+/// Quiet time after the last change before the queued histories are written.
+const SAVE_PAUSE: Duration = Duration::from_secs(2);
+/// Longest a queued history waits while changes keep coming.
+const SAVE_WAIT_MAX: Duration = Duration::from_secs(10);
 
 pub(crate) type FetchReply = flume::Sender<Result<Arc<Vec<u8>>, String>>;
 
@@ -73,8 +82,14 @@ impl Fetcher {
   }
 }
 
-/// Starts the core thread and returns a handle for image fetches.
-pub fn spawn(commands: flume::Receiver<Command>, events: flume::Sender<Event>) -> Arc<Fetcher> {
+/// Starts the core thread and returns a handle for image fetches. A message on `stop` (or every sender of it gone)
+/// ends the command loop; `done` is dropped once what was queued for the disk cache is written.
+pub fn spawn(
+  commands: flume::Receiver<Command>,
+  events: flume::Sender<Event>,
+  stop: flume::Receiver<()>,
+  done: flume::Sender<()>,
+) -> Arc<Fetcher> {
   let (requests, fetches) = flume::unbounded();
   std::thread::Builder::new()
     .name("gchat-core".into())
@@ -88,7 +103,8 @@ pub fn spawn(commands: flume::Receiver<Command>, events: flume::Sender<Event>) -
           tracing::error!("the core runtime did not start: {error}");
           std::process::exit(1);
         });
-      runtime.block_on(run(commands, events, fetches));
+      runtime.block_on(run(commands, events, fetches, stop));
+      drop(done);
     })
     .unwrap_or_else(|error| {
       tracing::error!("the core thread did not start: {error}");
@@ -135,6 +151,99 @@ struct History {
   /// Sort time of the newest topic held while detached: where the next newer page starts.
   newest: Micros,
   loading_newer: bool,
+  /// Made by a message being sent before the conversation was loaded: it is not what the disk cache holds, and
+  /// opening the conversation reads the cache under it.
+  partial: bool,
+  /// Sort time of each topic held, by topic id.
+  topic_times: HashMap<String, Micros>,
+  /// When it was last used, on `State::clock`.
+  used: u64,
+  /// Loaded from the server since the stream last went offline.
+  fetched: bool,
+}
+
+impl History {
+  /// Loaded from the server and not made out of date by the stream going offline since.
+  const fn loaded(&self) -> bool {
+    !self.partial && (self.fresh || self.fetched)
+  }
+
+  /// What the disk cache keeps: the newest `SAVED_TOPICS` topics, without messages still being sent. A window that
+  /// leaves older topics out starts at its oldest topic, so the older pages load again.
+  fn saved(&self) -> HistoryCache {
+    let messages: Vec<&Arc<Message>> = self.messages.iter().filter(|message| !message.pending).collect();
+    let mut topics = 0;
+    let mut start = messages.len();
+    let mut current: Option<&str> = None;
+    for (index, message) in messages.iter().enumerate().rev() {
+      let same = !message.topic_id.is_empty() && current == Some(message.topic_id.as_str());
+      if !same {
+        if topics == SAVED_TOPICS {
+          break;
+        }
+        topics += 1;
+        current = Some(message.topic_id.as_str());
+      }
+      start = index;
+    }
+    let first = messages.get(start).filter(|_| start > 0);
+    HistoryCache {
+      reached_start: first.is_none() && self.reached_start,
+      anchor: first.map_or(self.anchor, |first| {
+        self.topic_times.get(&first.topic_id).copied().unwrap_or(first.time)
+      }),
+      messages: messages.into_iter().skip(start).cloned().collect(),
+    }
+  }
+
+  /// The topics held, oldest first, each with its sort time and its messages, without messages still being sent.
+  fn topics(&self) -> Vec<(Micros, Vec<Arc<Message>>)> {
+    let mut topics: Vec<(Micros, Vec<Arc<Message>>)> = Vec::new();
+    for message in self.messages.iter().filter(|message| !message.pending) {
+      match topics.last_mut() {
+        Some((time, messages))
+          if !message.topic_id.is_empty()
+            && messages.first().is_some_and(|first| first.topic_id == message.topic_id) =>
+        {
+          *time = (*time).max(message.time);
+          messages.push(message.clone());
+        },
+        _ => topics.push((message.time, vec![message.clone()])),
+      }
+    }
+    for (index, (time, messages)) in topics.iter_mut().enumerate() {
+      let known = messages.first().and_then(|first| self.topic_times.get(&first.topic_id));
+      match known {
+        Some(known) => *time = *known,
+        // The oldest topic held is where the next older page starts.
+        None if index == 0 && self.anchor > 0 => *time = self.anchor,
+        None => {},
+      }
+    }
+    topics.sort_by_key(|(time, _)| *time);
+    topics
+  }
+
+  /// Notes the sort time of the topic a new message lands in.
+  fn note_topic(&mut self, message: &Message) {
+    if !message.topic_id.is_empty() {
+      self
+        .topic_times
+        .entry(message.topic_id.clone())
+        .and_modify(|time| *time = (*time).max(message.time))
+        .or_insert(message.time);
+    }
+  }
+}
+
+/// One page of messages as converted: oldest topic first, replies after their first message.
+#[derive(Default)]
+struct Converted {
+  messages: Vec<Arc<Message>>,
+  /// Sort time of the oldest topic.
+  anchor: Micros,
+  /// Sort time of each topic, by topic id.
+  topic_times: HashMap<String, Micros>,
 }
 
 /// What was last published of one conversation's read receipts.
@@ -174,17 +283,77 @@ pub(crate) enum Page {
 #[derive(Default)]
 struct State {
   me: Option<User>,
-  users: Users,
+  users: Arc<Users>,
   items: HashMap<GroupId, proto::WorldItemLite>,
   groups: HashMap<GroupId, Group>,
   histories: HashMap<GroupId, History>,
+  /// Ticks on every use of a history, to find the one used longest ago.
+  clock: u64,
   open: Option<GroupId>,
   connection: Option<Connection>,
   world_refresh_queued: bool,
   /// Names of the user's own sidebar sections, by section id.
   sections: HashMap<String, String>,
+  /// Section ids already looked up on the web app's page, found or not: each is read once a session.
+  section_lookups: HashSet<String>,
+  /// The users changed since `Event::People` was last sent.
+  people_stale: bool,
+  /// Conversations whose history prefetch is queued or running.
+  prefetching: HashSet<GroupId>,
   /// Who has read each conversation, as last published to the UI.
   receipts: HashMap<GroupId, Receipts>,
+}
+
+impl State {
+  /// Marks a held history as just used.
+  fn touch(&mut self, group: &GroupId) {
+    self.clock += 1;
+    if let Some(history) = self.histories.get_mut(group) {
+      history.used = self.clock;
+    }
+  }
+
+  /// The history of `group`, made empty when none is held, marked as just used. Making one lets the history used
+  /// longest ago go when more than `HELD_HISTORIES` besides the open one are held.
+  fn hold(&mut self, group: &GroupId) -> &mut History {
+    if !self.histories.contains_key(group) {
+      while self.histories.len() > HELD_HISTORIES {
+        let oldest = self
+          .histories
+          .iter()
+          .filter(|(id, _)| self.open.as_ref() != Some(*id))
+          .min_by_key(|(_, history)| history.used)
+          .map(|(id, _)| id.clone());
+        let Some(oldest) = oldest else { break };
+        self.histories.remove(&oldest);
+      }
+    }
+    self.clock += 1;
+    let clock = self.clock;
+    let history = self.histories.entry(group.clone()).or_default();
+    history.used = clock;
+    history
+  }
+
+  /// Adds or updates users; marks the people list stale when one changed.
+  fn add_users(&mut self, users: impl IntoIterator<Item = User>) {
+    let changed: Vec<User> = users
+      .into_iter()
+      .filter(|user| self.users.get(&user.id) != Some(user))
+      .collect();
+    if changed.is_empty() {
+      return;
+    }
+    let held = Arc::make_mut(&mut self.users);
+    for user in changed {
+      held.insert(user.id.clone(), user);
+    }
+    self.people_stale = true;
+  }
+
+  fn me_id(&self) -> String {
+    self.me.as_ref().map_or_default(|me| me.id.clone())
+  }
 }
 
 pub(crate) struct Engine {
@@ -203,6 +372,18 @@ pub(crate) struct Engine {
   calendar: crate::calendar::Client,
   /// The range `Command::LoadEvents` last asked for, read again after a calendar write.
   calendar_range: Mutex<Option<(Micros, Micros)>>,
+  /// Conversations waiting for `history_writer`, each as it was last changed.
+  unsaved: Mutex<HashMap<GroupId, HistoryCache>>,
+  /// Wakes `history_writer` when a history is queued.
+  history_queued: Wake,
+  /// Held while histories are written, so a later snapshot of a conversation always lands last.
+  writing: tokio::sync::Mutex<()>,
+  /// Wakes `statuses_loop` when the conversation list is rebuilt.
+  groups_changed: Wake,
+  /// Wakes the polling loops when a sign-in brings the session back.
+  session_restored: Wake,
+  /// Room for three history prefetches at a time.
+  prefetch_slots: Semaphore,
 }
 
 /// One page of a conversation as an agent reads it: topics oldest first, each with its sort time (the cursor
@@ -220,15 +401,18 @@ struct PendingStart {
   presence: Option<Presence>,
 }
 
+/// Waits signed out until the app asks to connect. `None` once the app stops the core.
 async fn wait_for_session(
   commands: &flume::Receiver<Command>,
   fetches: &flume::Receiver<(String, FetchReply)>,
+  stop: &flume::Receiver<()>,
   cache: &Cache,
   events: &flume::Sender<Event>,
 ) -> Option<(Http, PendingStart)> {
   let mut pending = PendingStart::default();
   loop {
     tokio::select! {
+      _ = stop.recv_async() => return None,
       command = commands.recv_async() => {
         let Ok(command) = command else {
           return None;
@@ -265,8 +449,13 @@ async fn run(
   commands: flume::Receiver<Command>,
   events: flume::Sender<Event>,
   fetches: flume::Receiver<(String, FetchReply)>,
+  stop: flume::Receiver<()>,
 ) {
   let cache = Cache::open();
+  tokio::task::spawn_blocking({
+    let cache = cache.clone();
+    move || cache.trim_images()
+  });
   let world = cache.world();
   if let Some(me) = &world.me {
     let _ = events.send(Event::Me(me.clone()));
@@ -284,7 +473,7 @@ async fn run(
     Ok(http) => http,
     Err(error) => {
       let _ = events.send(Event::SignedOut(error.to_string()));
-      match wait_for_session(&commands, &fetches, &cache, &events).await {
+      match wait_for_session(&commands, &fetches, &stop, &cache, &events).await {
         Some((http, held)) => {
           pending = held;
           http
@@ -305,7 +494,7 @@ async fn run(
 
   let state = State {
     me: world.me,
-    users: world.users.into_iter().map(|user| (user.id.clone(), user)).collect(),
+    users: Arc::new(world.users.into_iter().map(|user| (user.id.clone(), user)).collect()),
     sections: world.sections,
     groups: world.groups.into_iter().map(|group| (group.id.clone(), group)).collect(),
     ..Default::default()
@@ -321,6 +510,12 @@ async fn run(
     presence: Mutex::new(None),
     calendar: crate::calendar::Client::new(crate::config_dir().join("cookies.json")),
     calendar_range: Mutex::new(None),
+    unsaved: Mutex::new(HashMap::new()),
+    history_queued: Wake::new(),
+    writing: tokio::sync::Mutex::new(()),
+    groups_changed: Wake::new(),
+    session_restored: Wake::new(),
+    prefetch_slots: Semaphore::new(3),
   });
 
   tokio::spawn(serve_fetches(engine.clone(), fetches));
@@ -333,12 +528,14 @@ async fn run(
   tokio::spawn(engine.clone().presence_loop());
   tokio::spawn(engine.clone().statuses_loop());
   tokio::spawn(engine.clone().session_loop());
+  tokio::spawn(engine.clone().history_writer());
   tokio::spawn({
     let engine = engine.clone();
     async move {
-      let result = engine.sync_world().await;
+      // The cached list already names the recent conversations: their histories load while the list refreshes.
+      engine.prefetch_histories();
+      let result = engine.sync_world(true).await;
       engine.report(result);
-      engine.prefetch_histories().await;
     }
   });
 
@@ -349,9 +546,18 @@ async fn run(
     engine.handle(Command::SetPresence(presence));
   }
 
-  while let Ok(command) = commands.recv_async().await {
-    engine.handle(command);
+  loop {
+    tokio::select! {
+      _ = stop.recv_async() => break,
+      command = commands.recv_async() => match command {
+        Ok(command) => engine.handle(command),
+        Err(_) => break,
+      },
+    }
   }
+  // The app stopped the core or let go of it: what is still queued for the disk cache is written before the runtime
+  // stops.
+  engine.write_histories().await;
 }
 
 async fn serve_fetches(engine: Arc<Engine>, fetches: flume::Receiver<(String, FetchReply)>) {
@@ -399,32 +605,20 @@ impl Engine {
   }
 
   fn me_id(&self) -> String {
-    self
-      .state
-      .lock()
-      .unwrap_or_else(std::sync::PoisonError::into_inner)
-      .me
-      .as_ref()
-      .map_or_default(|me| me.id.clone())
+    self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).me_id()
+  }
+
+  /// The users known now. Converting with them happens outside the state lock.
+  fn users(&self) -> Arc<Users> {
+    Arc::clone(&self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).users)
   }
 
   // ---- Conversation list ----
 
-  async fn sync_world(self: &Arc<Self>) -> Result<()> {
-    let mut me_id = self.me_id();
-    if me_id.is_empty() {
-      let request = proto::GetSelfUserStatusRequest {
-        request_header: Some(request_header()),
-        ..Default::default()
-      };
-      let status: proto::GetSelfUserStatusResponse = self.http.api("get_self_user_status", &request).await?;
-      me_id = status
-        .user_status
-        .and_then(|status| status.user_id)
-        .and_then(|id| id.id)
-        .unwrap_or_default();
-    }
-
+  /// Reads the conversation list again and publishes it. With `prefetch`, the recent conversations' histories start
+  /// loading as soon as the list is in.
+  async fn sync_world(self: &Arc<Self>, prefetch: bool) -> Result<()> {
+    let known_me = self.me_id();
     let request = proto::PaginatedWorldRequest {
       request_header: Some(request_header()),
       fetch_from_user_spaces: Some(true),
@@ -436,7 +630,26 @@ impl Engine {
       }],
       ..Default::default()
     };
-    let response: proto::PaginatedWorldResponse = self.http.api("paginated_world", &request).await?;
+    let world = self.http.api::<_, proto::PaginatedWorldResponse>("paginated_world", &request);
+    // The signed-in user's id is needed only once the list is in: both are asked for at once.
+    let (me_id, response) = if known_me.is_empty() {
+      let status_request = proto::GetSelfUserStatusRequest {
+        request_header: Some(request_header()),
+        ..Default::default()
+      };
+      let status = self
+        .http
+        .api::<_, proto::GetSelfUserStatusResponse>("get_self_user_status", &status_request);
+      let (status, response) = tokio::join!(status, world);
+      let me_id = status?
+        .user_status
+        .and_then(|status| status.user_id)
+        .and_then(|id| id.id)
+        .unwrap_or_default();
+      (me_id, response?)
+    } else {
+      (known_me, world.await?)
+    };
     let items: Vec<proto::WorldItemLite> = response.world_items.into_iter().filter(convert::is_member).collect();
 
     let mut needed: HashSet<String> = HashSet::from([me_id.clone()]);
@@ -449,12 +662,8 @@ impl Engine {
       }
     }
     {
-      let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-      needed.retain(|id| !id.is_empty() && !state.users.contains_key(id));
-    }
-
-    {
       let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      needed.retain(|id| !id.is_empty() && !state.users.contains_key(id));
       state.items = items
         .into_iter()
         .filter_map(|item| Some((convert::group_id(item.group_id.as_ref()?)?, item)))
@@ -462,34 +671,65 @@ impl Engine {
     }
     // Paint with the names already known, then again once the missing people are resolved.
     self.rebuild_groups(&me_id);
+    if prefetch {
+      self.prefetch_histories();
+    }
     if !needed.is_empty() {
       self.fetch_users(needed.into_iter().collect()).await?;
       self.rebuild_groups(&me_id);
     }
     self.save_world();
     // Section names are not in the list answer; they are read from the web app's page when one is unknown.
-    let unnamed = {
-      let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-      state.groups.values().any(|group| match &group.placement {
-        Placement::Custom { id, .. } => !state.sections.contains_key(id),
-        _ => false,
-      })
+    let unnamed: Vec<String> = {
+      let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      let state = &mut *guard;
+      let ids: HashSet<String> = state
+        .groups
+        .values()
+        .filter_map(|group| match &group.placement {
+          Placement::Custom { id, .. } if !state.sections.contains_key(id) && !state.section_lookups.contains(id) => {
+            Some(id.clone())
+          },
+          _ => None,
+        })
+        .collect();
+      state.section_lookups.extend(ids.iter().cloned());
+      ids.into_iter().collect()
     };
-    if unnamed {
-      let page = self.http.get_bytes("https://chat.google.com/u/0/app/home").await?;
-      let names = convert::section_names(&String::from_utf8_lossy(&page));
-      if !names.is_empty() {
+    if !unnamed.is_empty() {
+      tokio::spawn(self.clone().name_sections(unnamed, me_id));
+    }
+    Ok(())
+  }
+
+  /// Reads the names of the user's own sections from the web app's page and publishes the list with them. A failed
+  /// read lets the next list refresh look `ids` up again.
+  async fn name_sections(self: Arc<Self>, ids: Vec<String>, me_id: String) {
+    let page = match self.http.get_bytes("https://chat.google.com/u/0/app/home").await {
+      Ok(page) => page,
+      Err(error) => {
         self
           .state
           .lock()
           .unwrap_or_else(std::sync::PoisonError::into_inner)
-          .sections
-          .extend(names);
-        self.rebuild_groups(&me_id);
-        self.save_world();
-      }
+          .section_lookups
+          .retain(|id| !ids.contains(id));
+        return self.report(Err(error));
+      },
+    };
+    let names = tokio::task::spawn_blocking(move || convert::section_names(&String::from_utf8_lossy(&page)))
+      .await
+      .unwrap_or_default();
+    if !names.is_empty() {
+      self
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .sections
+        .extend(names);
+      self.rebuild_groups(&me_id);
+      self.save_world();
     }
-    Ok(())
   }
 
   async fn fetch_users(self: &Arc<Self>, ids: Vec<String>) -> Result<()> {
@@ -516,15 +756,16 @@ impl Engine {
     while let Some(joined) = requests.join_next().await {
       match joined? {
         Ok(response) => {
-          let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-          for user in response
+          let users = response
             .members
             .iter()
             .filter_map(|member| member.user.as_ref())
-            .filter_map(convert::user)
-          {
-            state.users.insert(user.id.clone(), user);
-          }
+            .filter_map(convert::user);
+          self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add_users(users);
         },
         Err(error) => first_error = first_error.or(Some(error)),
       }
@@ -534,7 +775,8 @@ impl Engine {
 
   /// Converts the raw conversation list with the users known now and publishes it.
   fn rebuild_groups(&self, me_id: &str) {
-    let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = &mut *guard;
     if state.me.as_ref().is_none_or(|me| me.name.is_empty())
       && let Some(me) = state.users.get(me_id).cloned()
     {
@@ -549,28 +791,40 @@ impl Engine {
       .collect();
     state.groups = groups;
     self.emit(Event::World(Arc::new(state.groups.values().cloned().collect())));
-    let me = me_id.to_string();
-    let users: Vec<User> = state.users.values().cloned().collect();
-    drop(state);
-    self.emit(Event::People(people_list(&users, &me)));
+    // The people list goes out again only when someone was added or changed.
+    let people = std::mem::take(&mut state.people_stale).then(|| Arc::clone(&state.users));
+    drop(guard);
+    if let Some(users) = people {
+      self.emit(Event::People(people_list(users.values(), me_id)));
+    }
+    self.groups_changed.notify_one();
   }
 
+  /// Saves the conversation list; the cache leaves the file alone when nothing in it changed.
   fn save_world(&self) {
-    let world = {
+    let (me, users, groups, sections) = {
       let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-      let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-      WorldCache {
-        me: state.me.clone(),
-        users: state.users.values().cloned().collect(),
-        groups: state.groups.values().cloned().collect(),
-        xsrf: self.http.xsrf().map(|token| (token, now)),
-        sections: state.sections.clone(),
-      }
+      (
+        state.me.clone(),
+        Arc::clone(&state.users),
+        state.groups.values().cloned().collect::<Vec<Group>>(),
+        state.sections.clone(),
+      )
     };
+    let now = SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map_or(0, |elapsed| elapsed.as_secs());
+    let xsrf = self.http.xsrf().map(|token| (token, now));
     let cache = self.cache.clone();
-    tokio::task::spawn_blocking(move || cache.save_world(&world));
+    tokio::task::spawn_blocking(move || {
+      cache.save_world(WorldCache {
+        me,
+        users: users.values().cloned().collect(),
+        groups,
+        xsrf,
+        sections,
+      });
+    });
   }
 
   /// Coalesces bursts of list-changing events into one refresh.
@@ -590,43 +844,54 @@ impl Engine {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .world_refresh_queued = false;
-      let result = engine.sync_world().await;
+      let result = engine.sync_world(false).await;
       engine.report(result);
     });
   }
 
   // ---- History ----
 
-  async fn prefetch_histories(self: &Arc<Self>) {
-    let mut recent: Vec<(Micros, GroupId)> = {
-      let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-      state
-        .groups
-        .values()
-        .filter(|group| !group.hidden && !group.blocked)
-        .map(|group| (group.sort_time, group.id.clone()))
-        .collect()
-    };
+  /// Loads the latest messages of the most recent conversations not loaded yet, three at a time, so the first click
+  /// on them is instant.
+  fn prefetch_histories(self: &Arc<Self>) {
+    let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = &mut *guard;
+    let mut recent: Vec<(Micros, GroupId)> = state
+      .groups
+      .values()
+      .filter(|group| !group.hidden && !group.blocked)
+      .map(|group| (group.sort_time, group.id.clone()))
+      .collect();
     recent.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-    let slots = Arc::new(Semaphore::new(3));
     for (_, group) in recent.into_iter().take(PREFETCH_GROUPS) {
+      let loaded = state.histories.get(&group).is_some_and(History::loaded);
+      if loaded || !state.prefetching.insert(group.clone()) {
+        continue;
+      }
       let engine = self.clone();
-      let slots = slots.clone();
       tokio::spawn(async move {
-        let _slot = slots.acquire().await;
-        if !engine
+        let slot = engine.prefetch_slots.acquire().await;
+        let loaded = engine
           .state
           .lock()
           .unwrap_or_else(std::sync::PoisonError::into_inner)
           .histories
           .get(&group)
-          .is_some_and(|history| history.fresh)
+          .is_some_and(History::loaded);
+        // Prefetch is opportunistic: the conversation reports the failure itself when it is opened.
+        if slot.is_ok()
+          && !loaded
+          && let Err(error) = engine.refresh_history(group.clone()).await
         {
-          // Prefetch is opportunistic: the conversation reports the failure itself when it is opened.
-          if let Err(error) = engine.refresh_history(group).await {
-            tracing::warn!("history prefetch failed: {error:#}");
-          }
+          tracing::warn!("history prefetch failed: {error:#}");
         }
+        drop(slot);
+        engine
+          .state
+          .lock()
+          .unwrap_or_else(std::sync::PoisonError::into_inner)
+          .prefetching
+          .remove(&group);
       });
     }
   }
@@ -646,19 +911,51 @@ impl Engine {
     });
   }
 
+  /// Queues a conversation for the disk cache; `history_writer` writes it once its changes pause.
   fn save_history(&self, group: &GroupId, history: &History) {
-    // A window into the past is not what the next start should show.
-    if history.detached {
+    // A window into the past is not what the next start should show, and a partial one is not the conversation.
+    if history.detached || history.partial {
       return;
     }
-    let snapshot = HistoryCache {
-      messages: history.messages.iter().filter(|message| !message.pending).cloned().collect(),
-      reached_start: history.reached_start,
-      anchor: history.anchor,
-    };
+    self
+      .unsaved
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .insert(group.clone(), history.saved());
+    self.history_queued.notify_one();
+  }
+
+  /// Writes the queued histories once their changes pause for `SAVE_PAUSE`, and at the latest `SAVE_WAIT_MAX` after
+  /// the first of them was queued.
+  async fn history_writer(self: Arc<Self>) {
+    loop {
+      self.history_queued.notified().await;
+      let deadline = tokio::time::Instant::now() + SAVE_WAIT_MAX;
+      loop {
+        let pause = (tokio::time::Instant::now() + SAVE_PAUSE).min(deadline);
+        tokio::select! {
+          () = tokio::time::sleep_until(pause) => break,
+          () = self.history_queued.notified() => {},
+        }
+      }
+      self.write_histories().await;
+    }
+  }
+
+  /// Writes every queued history, the latest snapshot of each, one file at a time.
+  async fn write_histories(&self) {
+    let _writing = self.writing.lock().await;
+    let unsaved = std::mem::take(&mut *self.unsaved.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    if unsaved.is_empty() {
+      return;
+    }
     let cache = self.cache.clone();
-    let group = group.clone();
-    tokio::task::spawn_blocking(move || cache.save_history(&group, &snapshot));
+    let _ = tokio::task::spawn_blocking(move || {
+      for (group, history) in &unsaved {
+        cache.save_history(group, history);
+      }
+    })
+    .await;
   }
 
   /// Publishes who has read `group`, unless that is what was published last (see `Receipts::updated`).
@@ -723,19 +1020,32 @@ impl Engine {
     self.http.api("list_topics", &request).await
   }
 
-  /// Flattens topics into messages, oldest topic first, replies right after their first message.
-  fn convert_topics(&self, response: &proto::ListTopicsResponse) -> (Vec<Arc<Message>>, Micros) {
-    let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+  /// Flattens topics into messages, oldest topic first, replies right after their first message. The conversion
+  /// runs outside the state lock.
+  fn convert_topics(&self, response: &proto::ListTopicsResponse) -> Converted {
+    let users = self.users();
     let mut topics: Vec<&proto::Topic> = response.topics.iter().collect();
     topics.sort_by_key(|topic| topic.sort_time.unwrap_or(0));
-    let anchor = topics.first().and_then(|topic| topic.sort_time).unwrap_or(0);
-    let messages = topics
-      .iter()
-      .flat_map(|topic| &topic.replies)
-      .filter_map(|message| convert::message(message, &state.users))
-      .map(Arc::new)
-      .collect();
-    (messages, anchor)
+    let mut converted = Converted {
+      anchor: topics.first().and_then(|topic| topic.sort_time).unwrap_or(0),
+      ..Default::default()
+    };
+    for topic in topics {
+      let start = converted.messages.len();
+      converted.messages.extend(
+        topic
+          .replies
+          .iter()
+          .filter_map(|message| convert::message(message, &users))
+          .map(Arc::new),
+      );
+      if let Some(first) = converted.messages.get(start) {
+        converted
+          .topic_times
+          .insert(first.topic_id.clone(), topic.sort_time.unwrap_or(first.time));
+      }
+    }
+    converted
   }
 
   async fn refresh_history(&self, group: GroupId) -> Result<()> {
@@ -752,10 +1062,10 @@ impl Engine {
     }
     let response = self.list_topics(&group, Page::Latest).await?;
     self.note_page_receipts(&group, &response);
-    let (fetched, anchor) = self.convert_topics(&response);
+    let Converted { messages: fetched, anchor, topic_times } = self.convert_topics(&response);
     let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let online = state.connection == Some(Connection::Online);
-    let history = state.histories.entry(group.clone()).or_default();
+    let history = state.hold(&group);
     // A jump landed while this page was on its way: the window wins.
     if history.detached {
       return Ok(());
@@ -784,10 +1094,13 @@ impl Engine {
     if !kept_older {
       history.reached_start = response.contains_first_topic.unwrap_or(false);
       history.anchor = anchor;
+      history.topic_times.clear();
     }
+    history.topic_times.extend(topic_times);
     history.messages = messages;
     history.fresh = online;
-    let history = &state.histories[&group];
+    history.fetched = true;
+    history.partial = false;
     self.emit_history(&group, history, 0);
     self.save_history(&group, history);
     Ok(())
@@ -813,7 +1126,12 @@ impl Engine {
     };
     history.loading_older = false;
     let response = result?;
-    let (older, new_anchor) = converted.unwrap_or_default();
+    let Converted {
+      messages: older,
+      anchor: new_anchor,
+      topic_times,
+    } = converted.unwrap_or_default();
+    history.topic_times.extend(topic_times);
     let held: HashSet<&str> = history.messages.iter().map(|message| message.id.as_str()).collect();
     let mut merged: Vec<Arc<Message>> = older
       .into_iter()
@@ -842,8 +1160,10 @@ impl Engine {
     let (around, after) = (around?, after?);
     self.note_page_receipts(&group, &around);
     self.note_page_receipts(&group, &after);
-    let (mut messages, anchor) = self.convert_topics(&around);
-    let (newer, _) = self.convert_topics(&after);
+    let Converted { mut messages, anchor, mut topic_times } = self.convert_topics(&around);
+    let newer = self.convert_topics(&after);
+    topic_times.extend(newer.topic_times);
+    let newer = newer.messages;
     let held: HashSet<String> = messages.iter().map(|message| message.id.clone()).collect();
     messages.extend(newer.into_iter().filter(|message| !held.contains(&message.id)));
     let newest = around
@@ -855,17 +1175,21 @@ impl Engine {
       .unwrap_or(time);
     let complete = after.contains_last_topic.unwrap_or(false);
     let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let history = History {
+    let fresh = complete && state.connection == Some(Connection::Online);
+    let history = state.hold(&group);
+    *history = History {
       messages,
       reached_start: around.contains_first_topic.unwrap_or(false),
       anchor,
-      fresh: complete && state.connection == Some(Connection::Online),
+      fresh,
       detached: !complete,
       newest,
+      topic_times,
+      used: history.used,
+      fetched: true,
       ..Default::default()
     };
-    self.emit_history_focused(&group, &history, 0, Some(message_id));
-    state.histories.insert(group, history);
+    self.emit_history_focused(&group, history, 0, Some(message_id));
     Ok(())
   }
 
@@ -890,11 +1214,12 @@ impl Engine {
     };
     history.loading_newer = false;
     let response = result?;
-    let (newer, _) = converted.unwrap_or_default();
+    let newer = converted.unwrap_or_default();
+    history.topic_times.extend(newer.topic_times);
     let held: HashSet<String> = history.messages.iter().map(|message| message.id.clone()).collect();
     history
       .messages
-      .extend(newer.into_iter().filter(|message| !held.contains(&message.id)));
+      .extend(newer.messages.into_iter().filter(|message| !held.contains(&message.id)));
     history.newest = response
       .topics
       .iter()
@@ -1038,28 +1363,37 @@ impl Engine {
   }
 
   async fn open(&self, group: GroupId) -> Result<()> {
-    let held = self
+    // A partial history holds only what was sent before the conversation was loaded: the cache goes under it.
+    let needs_cache = self
       .state
       .lock()
       .unwrap_or_else(std::sync::PoisonError::into_inner)
       .histories
-      .contains_key(&group);
-    if !held {
+      .get(&group)
+      .is_none_or(|history| history.partial);
+    if needs_cache {
       let cache = self.cache.clone();
       let key = group.clone();
       let cached = tokio::task::spawn_blocking(move || cache.history(&key)).await?;
       let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      let loaded = state.histories.get(&group).is_some_and(|history| !history.partial);
       if let Some(cached) = cached
-        && !state.histories.contains_key(&group)
+        && !loaded
       {
-        let history = History {
-          messages: cached.messages,
-          reached_start: cached.reached_start,
-          anchor: cached.anchor,
-          ..Default::default()
-        };
-        self.emit_history(&group, &history, 0);
-        state.histories.insert(group.clone(), history);
+        let history = state.hold(&group);
+        let ids: HashSet<&str> = cached.messages.iter().map(|message| message.id.as_str()).collect();
+        let sent: Vec<Arc<Message>> = std::mem::take(&mut history.messages)
+          .into_iter()
+          .filter(|message| !ids.contains(message.id.as_str()))
+          .collect();
+        drop(ids);
+        let mut messages = cached.messages;
+        messages.extend(sent);
+        history.messages = messages;
+        history.reached_start = cached.reached_start;
+        history.anchor = cached.anchor;
+        history.partial = false;
+        self.emit_history(&group, history, 0);
       }
     }
     let fresh = self
@@ -1099,7 +1433,9 @@ impl Engine {
           if let Some(held) = state.receipts.get(&group) {
             self.emit_receipts(&group, held);
           }
-          if let Some(history) = state.histories.get(&group) {
+          state.touch(&group);
+          // A partial history is not the conversation: `open` puts the cache under it first.
+          if let Some(history) = state.histories.get(&group).filter(|history| !history.partial) {
             self.emit_history(&group, history, 0);
           }
         }
@@ -1158,10 +1494,12 @@ impl Engine {
           }
           match engine.http.refresh_xsrf().await {
             Ok(_) => {
+              engine.session_restored.notify_waiters();
               engine.emit(Event::Connection(Connection::Connecting));
-              let result = engine.sync_world().await;
+              let result = engine.sync_world(true).await;
               engine.report(result);
-              engine.prefetch_histories().await;
+              // Also when the list failed to load: the held one names the recent conversations.
+              engine.prefetch_histories();
             },
             Err(error) => engine.report(Err(error)),
           }
@@ -1231,7 +1569,7 @@ impl Engine {
       },
       Command::RefreshWorld => {
         tokio::spawn(async move {
-          let result = engine.sync_world().await;
+          let result = engine.sync_world(false).await;
           engine.report(result);
         });
       },
@@ -1310,12 +1648,7 @@ impl Engine {
           };
           let result = engine.http.api::<_, proto::EditMessageResponse>("edit_message", &request).await;
           let answered = result.as_ref().ok().and_then(|response| response.message.as_ref());
-          let converted = answered.and_then(|message| {
-            convert::message(
-              message,
-              &engine.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).users,
-            )
-          });
+          let converted = answered.and_then(|message| convert::message(message, &engine.users()));
           match converted {
             Some(message) => engine.upsert_message(Arc::new(message), None),
             None if result.is_err() => engine.upsert_message(original, None),
@@ -2161,12 +2494,7 @@ impl Engine {
         response.topic.and_then(|topic| topic.replies.into_iter().next())
       },
     };
-    let converted = sent.and_then(|message| {
-      convert::message(
-        &message,
-        &self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).users,
-      )
-    });
+    let converted = sent.and_then(|message| convert::message(&message, &self.users()));
     let message = converted.ok_or_else(|| anyhow!("the server accepted the message but did not return it"))?;
     self.upsert_message(Arc::new(message), Some(local_id));
     Ok(())
@@ -2186,17 +2514,16 @@ impl Engine {
         ..Default::default()
       };
       let response: proto::ListMembersResponse = self.http.api("list_members", &request).await?;
-      {
-        let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for user in response
-          .members
-          .iter()
-          .filter_map(|member| member.user.as_ref())
-          .filter_map(convert::user)
-        {
-          state.users.insert(user.id.clone(), user);
-        }
-      }
+      let users = response
+        .members
+        .iter()
+        .filter_map(|member| member.user.as_ref())
+        .filter_map(convert::user);
+      self
+        .state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .add_users(users);
       let joined = proto::MembershipState::MemberJoined as i32;
       ids.extend(
         response
@@ -2276,12 +2603,7 @@ impl Engine {
     };
     let response: proto::CreateTopicResponse = self.http.api("create_topic", &request).await?;
     let sent = response.topic.and_then(|topic| topic.replies.into_iter().next());
-    let converted = sent.and_then(|message| {
-      convert::message(
-        &message,
-        &self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).users,
-      )
-    });
+    let converted = sent.and_then(|message| convert::message(&message, &self.users()));
     let message = converted.ok_or_else(|| anyhow!("the server accepted the meeting but did not return it"))?;
     let url = message
       .attachments
@@ -2327,42 +2649,67 @@ impl Engine {
   /// Stores a message and publishes it, updating the conversation's preview. `local_id` names the pending
   /// message this one confirms.
   fn upsert_message(&self, message: Arc<Message>, local_id: Option<&str>) {
-    let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let me_id = state.me.as_ref().map_or_default(|me| me.id.clone());
+    self.upsert_listed(message, local_id);
+  }
+
+  /// Puts a message in its conversation and tells the UI. Answers whether the conversation is in the list and not
+  /// hidden. A conversation not loaded keeps its disk cache as it is: only a message being sent is held before it
+  /// is loaded, in a partial history.
+  fn upsert_listed(&self, message: Arc<Message>, local_id: Option<&str>) -> bool {
+    let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = &mut *guard;
+    let me_id = state.me_id();
     let open = state.open.as_ref() == Some(&message.group);
-    let history = state.histories.entry(message.group.clone()).or_default();
-    let by_id = history.messages.iter().position(|held| held.id == message.id);
-    let by_local = local_id.and_then(|local| history.messages.iter().position(|held| held.pending && held.id == local));
-    let is_new = by_id.is_none() && by_local.is_none();
+    let listed = state.groups.get(&message.group).is_some_and(|group| !group.hidden);
+    if message.pending && !state.histories.contains_key(&message.group) {
+      state.hold(&message.group).partial = true;
+    }
     let mut replaces = None;
     let mut shown = true;
-    match (by_id, by_local) {
-      (Some(index), stale_pending) => {
-        history.messages[index] = message.clone();
-        // The stream confirmed it first; the pending copy is now a duplicate.
-        if let Some(pending) = stale_pending.filter(|pending| *pending != index) {
-          replaces = Some(history.messages.remove(pending).id.clone());
-        }
-      },
-      (None, Some(index)) => {
-        replaces = Some(history.messages[index].id.clone());
-        history.messages[index] = message.clone();
-      },
-      (None, None) => {
-        // A reply joins its topic; everything else is the newest message.
-        let topic_end = (!message.topic_id.is_empty())
-          .then(|| history.messages.iter().rposition(|held| held.topic_id == message.topic_id))
-          .flatten();
-        match topic_end {
-          Some(index) => history.messages.insert(index + 1, message.clone()),
-          // A window into the past does not grow at the end; the message shows once the latest are loaded.
-          None if history.detached => shown = false,
-          None => history.messages.push(message.clone()),
-        }
-      },
-    }
-    if !message.pending {
-      self.save_history(&message.group, &state.histories[&message.group]);
+    // Without a history to compare with, an edit or the message the list already shows is not new.
+    let mut is_new = !message.edited
+      && state.groups.get(&message.group).is_none_or(|group| {
+        group
+          .snippet
+          .as_ref()
+          .is_none_or(|snippet| snippet.time != message.time || snippet.sender_id != message.sender_id)
+      });
+    if let Some(history) = state.histories.get_mut(&message.group) {
+      let by_id = history.messages.iter().position(|held| held.id == message.id);
+      let by_local =
+        local_id.and_then(|local| history.messages.iter().position(|held| held.pending && held.id == local));
+      is_new = by_id.is_none() && by_local.is_none();
+      match (by_id, by_local) {
+        (Some(index), stale_pending) => {
+          history.messages[index] = message.clone();
+          // The stream confirmed it first; the pending copy is now a duplicate.
+          if let Some(pending) = stale_pending.filter(|pending| *pending != index) {
+            replaces = Some(history.messages.remove(pending).id.clone());
+          }
+        },
+        (None, Some(index)) => {
+          replaces = Some(history.messages[index].id.clone());
+          history.messages[index] = message.clone();
+        },
+        (None, None) => {
+          // A reply joins its topic; everything else is the newest message.
+          let topic_end = (!message.topic_id.is_empty())
+            .then(|| history.messages.iter().rposition(|held| held.topic_id == message.topic_id))
+            .flatten();
+          match topic_end {
+            Some(index) => history.messages.insert(index + 1, message.clone()),
+            // A window into the past does not grow at the end; the message shows once the latest are loaded.
+            None if history.detached => shown = false,
+            None => history.messages.push(message.clone()),
+          }
+        },
+      }
+      if is_new && !message.pending {
+        history.note_topic(&message);
+      }
+      if !message.pending {
+        self.save_history(&message.group, history);
+      }
     }
     if shown {
       // A hidden or blocked conversation does not notify.
@@ -2393,6 +2740,7 @@ impl Engine {
       }
       self.emit(Event::GroupUpsert(group.clone()));
     }
+    listed
   }
 
   /// Marks a held message starred or not and tells the UI.
@@ -2511,18 +2859,21 @@ impl Engine {
       .collect()
   }
 
-  /// Fetches one page of a conversation without touching what the app shows.
+  /// One page of a conversation without touching what the app shows. The latest page of a conversation the stream
+  /// has kept complete since it was loaded comes from what is held; anything else is fetched.
   pub(crate) async fn topics(&self, group: &GroupId, page: Page) -> Result<TopicPage> {
+    if matches!(page, Page::Latest)
+      && let Some(held) = self.held_latest(group)
+    {
+      return Ok(held);
+    }
     let response = self.list_topics(group, page).await?;
-    let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let users = self.users();
     let mut topics: Vec<(Micros, Vec<Arc<Message>>)> = response
       .topics
       .iter()
       .map(|topic| {
-        let messages = topic
-          .replies
-          .iter()
-          .filter_map(|message| convert::message(message, &state.users));
+        let messages = topic.replies.iter().filter_map(|message| convert::message(message, &users));
         (topic.sort_time.unwrap_or(0), messages.map(Arc::new).collect())
       })
       .collect();
@@ -2531,6 +2882,24 @@ impl Engine {
       topics,
       reached_start: response.contains_first_topic.unwrap_or(false),
       reached_end: response.contains_last_topic.unwrap_or(false),
+    })
+  }
+
+  /// The newest `LATEST_PAGE` topics of a conversation held complete and current, as `list_topics` would answer them.
+  fn held_latest(&self, group: &GroupId) -> Option<TopicPage> {
+    let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let history = state
+      .histories
+      .get(group)
+      .filter(|history| history.fresh && !history.detached && !history.partial)?;
+    let mut topics = history.topics();
+    let older = topics.len().saturating_sub(SAVED_TOPICS);
+    let reached_start = history.reached_start && older == 0;
+    drop(state);
+    Some(TopicPage {
+      topics: topics.split_off(older),
+      reached_start,
+      reached_end: true,
     })
   }
 
@@ -2603,6 +2972,7 @@ impl Engine {
           }
           for history in state.histories.values_mut() {
             history.fresh = false;
+            history.fetched = false;
           }
         },
         ChannelEvent::Event(event) => self.on_event(*event),
@@ -2614,25 +2984,18 @@ impl Engine {
     use proto::event::EventType;
     let event_group = event.group_id.as_ref().and_then(convert::group_id);
     let bodies = event.body.iter().chain(&event.bodies);
+    // One look at the state for the whole event; messages convert outside the lock.
+    let (users, me) = {
+      let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      (Arc::clone(&state.users), state.me_id())
+    };
     for body in bodies {
-      if let Some(posted) = body.message_posted.as_ref().and_then(|posted| posted.message.as_ref()) {
-        let converted = convert::message(
-          posted,
-          &self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner).users,
-        );
-        if let Some(message) = converted {
-          // A new message may bring a hidden conversation back; the server's list says whether it did.
-          let listed = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .groups
-            .get(&message.group)
-            .is_some_and(|group| !group.hidden);
-          self.upsert_message(Arc::new(message), posted.local_id.as_deref());
-          if !listed {
-            self.queue_world_refresh();
-          }
+      if let Some(posted) = body.message_posted.as_ref().and_then(|posted| posted.message.as_ref())
+        && let Some(message) = convert::message(posted, &users)
+      {
+        // A new message may bring a hidden conversation back; the server's list says whether it did.
+        if !self.upsert_listed(Arc::new(message), posted.local_id.as_deref()) {
+          self.queue_world_refresh();
         }
       }
       if let Some(deleted) = &body.message_deleted {
@@ -2664,7 +3027,7 @@ impl Engine {
           self.set_marked_unread(&group, mark);
         }
         let marked_unread = mark.unwrap_or(0) > 0;
-        let me = self.me_id();
+        let me = me.as_str();
         self.update_group(&group, |group| {
           group.last_read_time = group.last_read_time.max(read_time.unwrap_or(0));
           let newer = group
@@ -2698,7 +3061,7 @@ impl Engine {
         && let Some(status) = &updated.user_status
       {
         let id = status.user_id.as_ref().and_then(|id| id.id.as_deref()).unwrap_or("");
-        if id.is_empty() || id == self.me_id() {
+        if id.is_empty() || id == me {
           self.emit(Event::Mine(mine_from(status)));
         }
       }
@@ -2876,16 +3239,25 @@ impl Engine {
   }
 
   async fn presence_loop(self: Arc<Self>) {
+    let mut refused: u32 = 0;
     loop {
-      tokio::time::sleep(HEARTBEAT).await;
+      tokio::select! {
+        () = tokio::time::sleep(backoff(HEARTBEAT, refused)) => {},
+        () = self.session_restored.notified() => refused = 0,
+      }
       let presence = *self.presence.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
       if let Some(presence) = presence {
-        self.heartbeat(presence).await;
+        refused = if self.heartbeat(presence).await {
+          refused.saturating_add(1)
+        } else {
+          0
+        };
       }
     }
   }
 
-  async fn heartbeat(&self, presence: Presence) {
+  /// Tells the server whether the user is there. True when the session was refused.
+  async fn heartbeat(&self, presence: Presence) -> bool {
     use proto::heartbeat_request::presence_update_request::UserState;
     let state = if presence == Presence::Active {
       UserState::Active
@@ -2900,7 +3272,12 @@ impl Engine {
       }),
     };
     // A lost heartbeat is made up for by the next one.
-    let _ = self.http.api::<_, proto::HeartbeatResponse>("heartbeat", &request).await;
+    self
+      .http
+      .api::<_, proto::HeartbeatResponse>("heartbeat", &request)
+      .await
+      .err()
+      .is_some_and(|error| is_signed_out(&error))
   }
 
   /// The schedules sit behind two of the web app's page RPCs. Both speak the same shape:
@@ -2957,40 +3334,66 @@ const STATUSES_EVERY: Duration = Duration::from_secs(60);
 impl Engine {
   /// Keeps the status of the people the user talks to one-to-one current.
   async fn statuses_loop(self: Arc<Self>) {
+    let mut mine_at: Option<tokio::time::Instant> = None;
+    let mut refused: u32 = 0;
     loop {
-      self.refresh_mine().await;
+      // The stream reports changes to the user's own status; this read catches what it missed.
+      let mut signed_out = if mine_at.is_none_or(|at| at.elapsed() >= STATUSES_EVERY) {
+        mine_at = Some(tokio::time::Instant::now());
+        self.refresh_mine().await
+      } else {
+        false
+      };
       let people: Vec<String> = {
         let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let direct = state.groups.values().filter(|group| group.kind == GroupKind::Dm);
+        let direct = state
+          .groups
+          .values()
+          .filter(|group| group.kind == GroupKind::Dm && !group.hidden && !group.blocked);
         direct
           .flat_map(|group| group.member_ids.iter().cloned())
           .collect::<HashSet<_>>()
           .into_iter()
           .collect()
       };
-      // Until the conversations are known there is nobody to ask about.
-      if people.is_empty() {
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        continue;
+      if !signed_out && !people.is_empty() {
+        signed_out = self.refresh_statuses(&people).await;
       }
-      let request = proto::GetUserPresenceRequest {
-        request_header: Some(request_header()),
-        user_ids: people
-          .iter()
-          .map(|id| proto::UserId {
-            id: Some(id.clone()),
-            ..Default::default()
-          })
-          .collect(),
-        include_active_until: Some(true),
-        include_user_status: Some(true),
+      refused = if signed_out {
+        refused.saturating_add(1)
+      } else {
+        0
       };
-      // A failed read leaves the last known statuses up until the next one.
-      if let Ok(answer) = self
-        .http
-        .api::<_, proto::GetUserPresenceResponse>("get_user_presence", &request)
-        .await
-      {
+      // Until the conversations name somebody to ask about, a rebuilt list wakes the loop early.
+      tokio::select! {
+        () = tokio::time::sleep(backoff(STATUSES_EVERY, refused)) => {},
+        () = self.session_restored.notified() => refused = 0,
+        () = self.groups_changed.notified(), if people.is_empty() => {},
+      }
+    }
+  }
+
+  /// Reads the status of `people`. True when the session was refused.
+  async fn refresh_statuses(&self, people: &[String]) -> bool {
+    let request = proto::GetUserPresenceRequest {
+      request_header: Some(request_header()),
+      user_ids: people
+        .iter()
+        .map(|id| proto::UserId {
+          id: Some(id.clone()),
+          ..Default::default()
+        })
+        .collect(),
+      include_active_until: Some(true),
+      include_user_status: Some(true),
+    };
+    // A failed read leaves the last known statuses up until the next one.
+    match self
+      .http
+      .api::<_, proto::GetUserPresenceResponse>("get_user_presence", &request)
+      .await
+    {
+      Ok(answer) => {
         let statuses = answer.user_presences.iter().filter_map(|person| {
           let id = person.user_id.as_ref()?.id.clone()?;
           let status = if person.dnd_state == Some(proto::DndStateState::Dnd as i32) {
@@ -3003,23 +3406,30 @@ impl Engine {
           Some((id, status))
         });
         self.emit(Event::Statuses(statuses.collect()));
-      }
-      tokio::time::sleep(STATUSES_EVERY).await;
+        false
+      },
+      Err(error) => is_signed_out(&error),
     }
   }
 
-  async fn refresh_mine(&self) {
+  /// Reads the user's own status. True when the session was refused.
+  async fn refresh_mine(&self) -> bool {
     let request = proto::GetSelfUserStatusRequest {
       request_header: Some(request_header()),
       ..Default::default()
     };
-    if let Ok(answer) = self
+    match self
       .http
       .api::<_, proto::GetSelfUserStatusResponse>("get_self_user_status", &request)
       .await
-      && let Some(status) = answer.user_status
     {
-      self.emit(Event::Mine(mine_from(&status)));
+      Ok(answer) => {
+        if let Some(status) = answer.user_status {
+          self.emit(Event::Mine(mine_from(&status)));
+        }
+        false
+      },
+      Err(error) => is_signed_out(&error),
     }
   }
 
@@ -3163,13 +3573,24 @@ fn mine_from(status: &proto::UserStatus) -> MyStatus {
   }
 }
 
-fn people_list(users: &[User], me: &str) -> Vec<User> {
+/// Whether an error is the session being refused.
+fn is_signed_out(error: &anyhow::Error) -> bool {
+  error.downcast_ref::<SignedOut>().is_some()
+}
+
+/// How long a polling loop waits after `refused` refusals of the session in a row: twice as long each time, up to 16
+/// times `every`.
+fn backoff(every: Duration, refused: u32) -> Duration {
+  every.saturating_mul(1 << refused.min(4))
+}
+
+fn people_list<'a>(users: impl IntoIterator<Item = &'a User>, me: &str) -> Vec<User> {
   let mut people: Vec<User> = users
-    .iter()
+    .into_iter()
     .filter(|user| !user.is_bot && !user.deleted && user.id != me && !user.name.is_empty())
     .cloned()
     .collect();
-  people.sort_by_key(|a| a.name.to_lowercase());
+  people.sort_by_cached_key(|user| user.name.to_lowercase());
   people
 }
 
@@ -3578,5 +3999,69 @@ mod tests {
     assert!(!cleared.enabled && cleared.people.is_empty());
     assert!(publish(Some(&cleared), &off, false).is_none());
     assert!(publish(None, &off, false).is_some_and(|first| !first.enabled));
+  }
+
+  fn posted(id: &str, topic: &str, time: i64) -> std::sync::Arc<crate::model::Message> {
+    std::sync::Arc::new(crate::model::Message {
+      id: id.into(),
+      topic_id: topic.into(),
+      group: GroupId::Space("AAAA".into()),
+      sender_id: "u1".into(),
+      sender_name: "Jordan Park".into(),
+      sender_avatar: None,
+      text: String::new(),
+      spans: Vec::new(),
+      time,
+      update_time: 0,
+      edited: false,
+      system: false,
+      reactions: Vec::new(),
+      attachments: Vec::new(),
+      cards: Vec::new(),
+      quote: None,
+      starred: false,
+      pending: false,
+      failed: false,
+    })
+  }
+
+  #[test]
+  fn the_disk_cache_keeps_the_newest_topics_and_loads_the_rest_again() {
+    // Topic 0 has a reply; 41 more topics follow, then a message still being sent.
+    let mut messages = vec![posted("m0", "t0", 100), posted("r0", "t0", 150)];
+    messages.extend((1..=41).map(|n| posted(&format!("m{n}"), &format!("t{n}"), 100 + n * 10)));
+    let mut sending = (*posted("local", "", 999)).clone();
+    sending.pending = true;
+    messages.push(std::sync::Arc::new(sending));
+    let history = super::History {
+      messages,
+      reached_start: true,
+      anchor: 100,
+      topic_times: std::collections::HashMap::from([("t2".to_string(), 125)]),
+      ..Default::default()
+    };
+    let saved = history.saved();
+    let ids: Vec<&str> = saved.messages.iter().map(|message| message.id.as_str()).collect();
+    assert_eq!(ids.len(), 40);
+    assert_eq!(ids.first(), Some(&"m2"));
+    assert_eq!(ids.last(), Some(&"m41"));
+    assert!(!saved.reached_start);
+    assert_eq!(saved.anchor, 125);
+
+    // A history that fits keeps where it starts; a reply stays with its topic.
+    let short = super::History {
+      messages: vec![posted("m0", "t0", 100), posted("r0", "t0", 150), posted("m1", "t1", 200)],
+      reached_start: true,
+      anchor: 90,
+      ..Default::default()
+    };
+    let saved = short.saved();
+    assert_eq!(saved.messages.len(), 3);
+    assert!(saved.reached_start);
+    assert_eq!(saved.anchor, 90);
+    let topics = short.topics();
+    assert_eq!(topics.len(), 2);
+    assert_eq!(topics.first().map(|(time, messages)| (*time, messages.len())), Some((90, 2)));
+    assert_eq!(topics.last().map(|(time, _)| *time), Some(200));
   }
 }

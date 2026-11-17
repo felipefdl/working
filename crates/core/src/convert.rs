@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::LazyLock;
 
 use crate::markup::Parsed;
 use crate::model::{
@@ -55,26 +56,34 @@ fn absolute(url: &str) -> Option<String> {
   }
 }
 
-pub fn user(user: &proto::User) -> Option<User> {
-  let id = user.user_id.as_ref()?.id.clone()?;
-  let bot = user.bot_info.as_ref();
-  let name = user
+/// The name a profile shows: its own, else its bot's.
+fn profile_name(user: &proto::User) -> Option<&str> {
+  user
     .name
-    .clone()
+    .as_deref()
     .filter(|name| !name.is_empty())
-    .or_else(|| bot.and_then(|bot| bot.bot_name.clone()));
-  let avatar = user
+    .or_else(|| user.bot_info.as_ref()?.bot_name.as_deref())
+}
+
+/// The picture a profile shows: its own, else its bot's.
+fn profile_avatar(user: &proto::User) -> Option<String> {
+  user
     .avatar_url
     .as_deref()
     .and_then(absolute)
-    .or_else(|| bot?.bot_avatar_url.as_deref().and_then(absolute));
+    .or_else(|| user.bot_info.as_ref()?.bot_avatar_url.as_deref().and_then(absolute))
+}
+
+pub fn user(user: &proto::User) -> Option<User> {
+  let id = user.user_id.as_ref()?.id.clone()?;
   Some(User {
     id,
-    name: name.unwrap_or_default(),
+    name: profile_name(user).map_or_default(str::to_string),
     first_name: user.first_name.clone().unwrap_or_default(),
     email: user.email.clone().unwrap_or_default(),
-    avatar_url: avatar,
-    is_bot: bot.is_some() || user.user_id.as_ref().and_then(|id| id.r#type) == Some(proto::UserType::Bot as i32),
+    avatar_url: profile_avatar(user),
+    is_bot: user.bot_info.is_some()
+      || user.user_id.as_ref().and_then(|id| id.r#type) == Some(proto::UserType::Bot as i32),
     deleted: user.deleted.unwrap_or(false),
   })
 }
@@ -256,9 +265,13 @@ pub const fn room_state(notify: Notify) -> i32 {
 /// Names of the user's own sidebar sections, read from the data embedded in the web app's page. Each section
 /// there starts with `[[13,"<id>"` and ends with `["<name>",n,null,[..],n,null,n],[]]`.
 pub fn section_names(page: &str) -> HashMap<String, String> {
-  let head = regex::Regex::new(r#"\[\[13,"(-?\d+)""#).expect("valid pattern");
-  let tail = regex::Regex::new(r#"\["((?:[^"\\]|\\.)*)",\d+,null,\[[\d,]*\],\d+,null,\d+\],\[[^\]]*\]\]"#)
-    .expect("valid pattern");
+  static HEAD: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r#"\[\[13,"(-?\d+)""#).expect("valid pattern"));
+  static TAIL: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r#"\["((?:[^"\\]|\\.)*)",\d+,null,\[[\d,]*\],\d+,null,\d+\],\[[^\]]*\]\]"#)
+      .expect("valid pattern")
+  });
+  let (head, tail) = (&*HEAD, &*TAIL);
   let mut names = HashMap::new();
   for section in head.captures_iter(page) {
     let start = section.get(0).map_or(0, |found| found.end());
@@ -279,18 +292,19 @@ pub fn section_names(page: &str) -> HashMap<String, String> {
 fn person(profile: Option<&proto::User>, users: &Users) -> (String, String, Option<String>) {
   let id = profile
     .and_then(|profile| profile.user_id.as_ref())
-    .and_then(|id| id.id.clone())
-    .unwrap_or_default();
+    .and_then(|id| id.id.as_ref());
+  // A profile without an id is no one's: only `users` can name it.
+  let profile = profile.filter(|_| id.is_some());
+  let id = id.cloned().unwrap_or_default();
   let known = users.get(&id);
-  let converted = profile.and_then(user);
-  let name = converted
-    .as_ref()
-    .map(|user| user.name.clone())
+  let name = profile
+    .and_then(profile_name)
     .filter(|name| !name.is_empty())
+    .map(str::to_string)
     .or_else(|| known.map(|user| user.name.clone()))
     .unwrap_or_default();
-  let avatar = converted
-    .and_then(|user| user.avatar_url)
+  let avatar = profile
+    .and_then(profile_avatar)
     .or_else(|| known.and_then(|user| user.avatar_url.clone()));
   (id, name, avatar)
 }
@@ -364,18 +378,38 @@ pub fn read_receipts(set: &proto::ReadReceiptSet, me: &str, users: &Users) -> Op
 /// Byte offset of each UTF-16 code unit boundary in `text`.
 struct Utf16Index<'a> {
   text: &'a str,
+  /// In ASCII text a unit is a byte.
+  ascii: bool,
+  /// Otherwise, the byte offset of each UTF-16 unit, and of the end; a unit inside a surrogate pair maps to the
+  /// next character. Built on first use.
+  offsets: std::cell::OnceCell<Vec<usize>>,
 }
 
-impl Utf16Index<'_> {
-  fn byte(&self, units: usize) -> usize {
-    let mut seen = 0;
-    for (index, character) in self.text.char_indices() {
-      if seen >= units {
-        return index;
-      }
-      seen += character.len_utf16();
+impl<'a> Utf16Index<'a> {
+  const fn new(text: &'a str) -> Self {
+    Self {
+      text,
+      ascii: text.is_ascii(),
+      offsets: std::cell::OnceCell::new(),
     }
-    self.text.len()
+  }
+
+  fn byte(&self, units: usize) -> usize {
+    if self.ascii {
+      return units.min(self.text.len());
+    }
+    let offsets = self.offsets.get_or_init(|| {
+      let mut offsets = Vec::with_capacity(self.text.len() + 1);
+      for (index, character) in self.text.char_indices() {
+        offsets.push(index);
+        if character.len_utf16() == 2 {
+          offsets.push(index + character.len_utf8());
+        }
+      }
+      offsets.push(self.text.len());
+      offsets
+    });
+    offsets.get(units).copied().unwrap_or(self.text.len())
   }
 
   fn range(&self, start: i32, length: i32) -> std::ops::Range<usize> {
@@ -558,7 +592,7 @@ fn positive(value: Option<i32>) -> Option<u32> {
 fn annotations(text: &str, annotations: &[proto::Annotation]) -> (Vec<Span>, Vec<Attachment>) {
   use proto::AnnotationType as Type;
   use proto::format_metadata::FormatType as Format;
-  let index = Utf16Index { text };
+  let index = Utf16Index::new(text);
   let mut spans = Vec::new();
   let mut attachments = Vec::new();
   for annotation in annotations {
@@ -977,12 +1011,37 @@ mod tests {
   use std::collections::HashMap;
 
   use super::{
-    Users, absolute, annotations, emoji_text, format_annotations, group, group_id, is_member, merge_receipts, notify,
-    pending_spans, proto_group_id, read_receipts, room_state, strip_tags, user, with_links,
+    Users, Utf16Index, absolute, annotations, emoji_text, format_annotations, group, group_id, is_member,
+    merge_receipts, notify, pending_spans, proto_group_id, read_receipts, room_state, strip_tags, user, with_links,
   };
   use crate::markup::parse;
   use crate::model::{Chip, ChipKind, GroupId, Notify, ReadReceipt, Span, SpanKind, User};
   use crate::proto;
+
+  #[test]
+  fn utf16_offsets_map_to_character_boundaries() {
+    // Each unit maps to the first character boundary at or after it.
+    let walk = |text: &str, units: usize| {
+      let mut seen = 0;
+      for (index, character) in text.char_indices() {
+        if seen >= units {
+          return index;
+        }
+        seen += character.len_utf16();
+      }
+      text.len()
+    };
+    for text in ["", "Jordan Park", "Riley Brooks: café ünïcödé", "hi 😀 there 👋🏽!", "😀"] {
+      let index = Utf16Index::new(text);
+      for units in 0..text.encode_utf16().count() + 3 {
+        assert_eq!(index.byte(units), walk(text, units), "{text:?} at {units}");
+      }
+    }
+    let index = Utf16Index::new("a😀b");
+    assert_eq!(index.range(1, 2), 1..5);
+    assert_eq!(index.byte(2), 5);
+    assert_eq!(index.range(3, 1), 5..6);
+  }
 
   #[test]
   fn notify_reads_the_levels_the_web_client_writes() {
