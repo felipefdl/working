@@ -549,7 +549,13 @@ fn line(message: &Message, me: &str) -> String {
     let mut parts: Vec<String> = vec![card.title.clone(), card.subtitle.clone()];
     for section in &card.sections {
       parts.push(section.header.clone());
-      parts.extend(section.lines.iter().cloned());
+      parts.extend(section.lines.iter().map(|line| {
+        if line.label.is_empty() {
+          line.text.clone()
+        } else {
+          format!("{}: {}", line.label, line.text)
+        }
+      }));
       parts.extend(section.buttons.iter().map(|button| match &button.url {
         Some(url) => format!("{}: {url}", button.label),
         None => format!("[{}]", button.label),

@@ -470,7 +470,7 @@ fn push_extras(
   }
   for (i, card) in msg.cards.iter().enumerate() {
     card_at = Some(body.len());
-    body.push(card_view(card, msg, ctx.core, i));
+    body.push(card_view(card, msg, ctx, cx, i));
   }
   if !msg.reactions.is_empty() {
     body.push(reactions_view(&msg.reactions, msg, ctx.core));
@@ -1768,7 +1768,8 @@ fn chip(att: &Attachment, id: SharedString, viewer_first: bool) -> AnyElement {
 }
 
 /// An app card as Google Chat draws it: a bordered box, the header first, then each section with a divider above it.
-fn card_view(card: &Card, msg: &Message, core: &Core, ix: usize) -> AnyElement {
+fn card_view(card: &Card, msg: &Message, ctx: &MsgCtx, cx: &App, ix: usize) -> AnyElement {
+  let core = ctx.core;
   let msg_id = msg.id.as_str();
   let block = |first: bool| {
     v_flex()
@@ -1786,15 +1787,22 @@ fn card_view(card: &Card, msg: &Message, core: &Core, ix: usize) -> AnyElement {
     .text_size(px(13.))
     .text_color(rgb(TEXT));
   let mut first = true;
-  if !card.title.is_empty() || !card.subtitle.is_empty() {
-    let mut header = block(first);
+  if !card.title.is_empty() || !card.subtitle.is_empty() || card.image.is_some() {
+    let mut titles = v_flex().gap_1().min_w_0();
     if !card.title.is_empty() {
-      header = header.child(div().text_size(px(15.)).child(card.title.clone()));
+      titles = titles.child(div().text_size(px(15.)).child(card.title.clone()));
     }
     if !card.subtitle.is_empty() {
-      header = header.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(card.subtitle.clone()));
+      titles = titles.child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(card.subtitle.clone()));
     }
-    body = body.child(header);
+    let picture = card.image.as_deref().map(|url| {
+      let frame = div().size(px(36.)).flex_shrink_0().rounded(px(8.)).bg(rgb(PLACEHOLDER));
+      match ctx.images.get(url, 144, cx) {
+        Some(image) => frame.child(img(image).size_full().rounded(px(8.)).object_fit(ObjectFit::Cover)),
+        None => frame,
+      }
+    });
+    body = body.child(block(first).flex_row().items_center().gap_3().children(picture).child(titles));
     first = false;
   }
   for (s, section) in card.sections.iter().enumerate() {
@@ -1810,7 +1818,27 @@ fn card_view(card: &Card, msg: &Message, core: &Core, ix: usize) -> AnyElement {
       );
     }
     for line in &section.lines {
-      out = out.child(div().child(line.clone()));
+      let bold: Vec<(Range<usize>, HighlightStyle)> = line
+        .bold
+        .iter()
+        .map(|range| {
+          (
+            range.clone(),
+            HighlightStyle {
+              font_weight: Some(FontWeight::BOLD),
+              ..HighlightStyle::default()
+            },
+          )
+        })
+        .collect();
+      let text = StyledText::new(line.text.clone()).with_highlights(bold);
+      out = out.child(if line.label.is_empty() {
+        div().child(text)
+      } else {
+        v_flex()
+          .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(line.label.clone()))
+          .child(text)
+      });
     }
     if !section.buttons.is_empty() {
       let mut row = h_flex().flex_wrap().gap_2().pt_2();

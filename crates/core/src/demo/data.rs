@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use super::image::{BEANS, HERO_DARK, HERO_LIGHT, Photo, RAMEN};
 use crate::model::{
-  Attachment, AttachmentKind, Card, CardAction, CardButton, CardSection, Group, GroupId, GroupKind, Message, Micros,
-  Notify, Placement, Quote, Reaction, SlashCommand, Snippet, Span, SpanKind, User,
+  Attachment, AttachmentKind, Card, CardAction, CardButton, CardLine, CardSection, Group, GroupId, GroupKind, Message,
+  Micros, Notify, Placement, Quote, Reaction, SlashCommand, Snippet, Span, SpanKind, User,
 };
 
 const MINUTE: Micros = 60 * 1_000_000;
@@ -190,9 +190,12 @@ pub fn deploy_card(id: &str, build: &str, waiting: bool, outcome: &str) -> Card 
   } else {
     Vec::new()
   };
-  let mut lines = vec![format!("Build {build} passed 412 tests."), "Target: production".into()];
+  let mut lines = vec![
+    CardLine::new("", &format!("Build {build} passed 412 tests.")),
+    CardLine::new("Target", "production"),
+  ];
   if !outcome.is_empty() {
-    lines.push(outcome.into());
+    lines.push(CardLine::new("", outcome));
   }
   Card {
     id: id.into(),
@@ -203,6 +206,7 @@ pub fn deploy_card(id: &str, build: &str, waiting: bool, outcome: &str) -> Card 
     }
     .into(),
     subtitle: format!("web-app · build {build}"),
+    image: None,
     sections: vec![
       CardSection { header: "Checks".into(), lines, buttons },
       CardSection {
@@ -224,12 +228,13 @@ pub fn status_card(id: &str) -> Card {
     id: id.into(),
     title: "Build status".into(),
     subtitle: "web-app · main".into(),
+    image: None,
     sections: vec![CardSection {
       header: "Last 3 builds".into(),
       lines: vec![
-        "#1842 passed in 6m 12s".into(),
-        "#1841 passed in 6m 40s".into(),
-        "#1840 failed: 2 flaky tests".into(),
+        CardLine::new("", "#1842 passed in 6m 12s"),
+        CardLine::new("", "#1841 passed in 6m 40s"),
+        CardLine::new("", "#1840 failed: 2 flaky tests"),
       ],
       buttons: vec![CardButton {
         label: "Open dashboard".into(),

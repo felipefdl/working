@@ -304,6 +304,8 @@ pub struct Card {
   pub title: String,
   /// Card subtitle.
   pub subtitle: String,
+  /// Header image, when the app gave one.
+  pub image: Option<String>,
   /// Sections in order; Google Chat draws a divider between them.
   pub sections: Vec<CardSection>,
 }
@@ -314,9 +316,31 @@ pub struct CardSection {
   /// Section header, when it has one.
   pub header: String,
   /// Text lines.
-  pub lines: Vec<String>,
+  pub lines: Vec<CardLine>,
   /// Buttons, in order.
   pub buttons: Vec<CardButton>,
+}
+
+/// One text line of a card section.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CardLine {
+  /// The small label Google Chat draws over the text, when the widget has one.
+  pub label: String,
+  /// The text.
+  pub text: String,
+  /// Byte ranges of `text` that are bold, in order, on char boundaries.
+  pub bold: Vec<Range<usize>>,
+}
+
+impl CardLine {
+  /// A line with no bold text; `label` may be empty.
+  pub fn new(label: &str, text: &str) -> Self {
+    Self {
+      label: label.into(),
+      text: text.into(),
+      bold: Vec::new(),
+    }
+  }
 }
 
 /// A card button.

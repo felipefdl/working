@@ -17,8 +17,8 @@ use std::ops::Range;
 
 use crate::markup::Parsed;
 use crate::model::{
-  Attachment, AttachmentKind, Card, CardAction, CardButton, CardSection, Chip, ChipKind, Group, GroupId, GroupKind,
-  Message, Notify, Placement, Quote, Reaction, ReadReceipt, SlashCommand, Snippet, Span, SpanKind, User,
+  Attachment, AttachmentKind, Card, CardAction, CardButton, CardLine, CardSection, Chip, ChipKind, Group, GroupId,
+  GroupKind, Message, Notify, Placement, Quote, Reaction, ReadReceipt, SlashCommand, Snippet, Span, SpanKind, User,
 };
 use crate::proto;
 
@@ -704,53 +704,91 @@ pub fn with_links(text: &str, mut spans: Vec<Span>) -> Vec<Span> {
   spans
 }
 
-/// Removes the HTML subset cards use (`<b>`, `<a href>`, `<br>`, `<font>`), keeping the text.
-fn strip_tags(html: &str) -> String {
+/// The text of the HTML subset cards use (`<b>`, `<a href>`, `<br>`, `<font>`), and the byte ranges `<b>` makes bold.
+fn strip_tags(html: &str) -> (String, Vec<Range<usize>>) {
+  let decode = |chunk: &str| {
+    chunk
+      .replace("&amp;", "&")
+      .replace("&lt;", "<")
+      .replace("&gt;", ">")
+      .replace("&quot;", "\"")
+      .replace("&#39;", "'")
+      .replace("&nbsp;", " ")
+  };
   let mut text = String::with_capacity(html.len());
+  let mut bold = Vec::new();
+  let mut bold_from = None;
   let mut rest = html;
   while let Some(open) = rest.find('<') {
-    text.push_str(&rest[..open]);
+    text.push_str(&decode(&rest[..open]));
     let Some(close) = rest[open..].find('>') else {
       rest = &rest[open..];
       break;
     };
     let tag = rest[open + 1..open + close].trim().to_ascii_lowercase();
-    if tag.starts_with("br") {
-      text.push('\n');
+    match tag.as_str() {
+      "b" | "strong" => {
+        if bold_from.is_none() {
+          bold_from = Some(text.len());
+        }
+      },
+      "/b" | "/strong" => {
+        if let Some(from) = bold_from.take() {
+          bold.push(from..text.len());
+        }
+      },
+      tag if tag.starts_with("br") => text.push('\n'),
+      _ => {},
     }
     rest = &rest[open + close + 1..];
   }
-  text.push_str(rest);
-  text
-    .replace("&amp;", "&")
-    .replace("&lt;", "<")
-    .replace("&gt;", ">")
-    .replace("&quot;", "\"")
-    .replace("&#39;", "'")
-    .replace("&nbsp;", " ")
+  text.push_str(&decode(rest));
+  if let Some(from) = bold_from {
+    bold.push(from..text.len());
+  }
+  (text, bold)
 }
 
-fn formatted(text: Option<&proto::JAddOnsFormattedText>) -> String {
-  use proto::j_add_ons_formatted_text::formatted_text_element::styled_text::Style;
+/// A card text without the space around it, and the byte ranges of its bold parts.
+fn rich(text: Option<&proto::JAddOnsFormattedText>) -> (String, Vec<Range<usize>>) {
+  use proto::j_add_ons_formatted_text::formatted_text_element::styled_text::{FontWeight, Style};
   let Some(text) = text else {
-    return String::new();
+    return (String::new(), Vec::new());
   };
-  if text.formatted_text_elements.is_empty() {
-    return strip_tags(text.original_text.as_deref().unwrap_or_default()).trim().to_string();
-  }
-  let mut out = String::new();
+  let (mut out, mut bold) = if text.formatted_text_elements.is_empty() {
+    strip_tags(text.original_text.as_deref().unwrap_or_default())
+  } else {
+    (String::new(), Vec::new())
+  };
   for element in &text.formatted_text_elements {
     if let Some(styled) = &element.styled_text {
       if styled.styles.contains(&(Style::Br as i32)) {
         out.push('\n');
       }
+      let from = out.len();
       out.push_str(styled.text.as_deref().unwrap_or_default());
+      if styled.styles.contains(&(Style::BoldDeprecated as i32)) || styled.font_weight == Some(FontWeight::Bold as i32)
+      {
+        bold.push(from..out.len());
+      }
     }
     if let Some(link) = &element.hyperlink {
       out.push_str(link.text.as_deref().or(link.link.as_deref()).unwrap_or_default());
     }
   }
-  out.trim().to_string()
+  let start = out.len() - out.trim_start().len();
+  let trimmed = out.trim();
+  let end = start + trimmed.len();
+  let bold = bold
+    .into_iter()
+    .map(|range| range.start.clamp(start, end) - start..range.end.clamp(start, end) - start)
+    .filter(|range| !range.is_empty())
+    .collect();
+  (trimmed.to_string(), bold)
+}
+
+fn formatted(text: Option<&proto::JAddOnsFormattedText>) -> String {
+  rich(text).0
 }
 
 fn click_url(click: Option<&proto::JAddOnsOnClick>) -> Option<String> {
@@ -790,43 +828,33 @@ fn card(item: &proto::JAddOnsCardItem, id: &str) -> Card {
   if let Some(header) = &item.header {
     card.title = formatted(header.title.as_ref());
     card.subtitle = formatted(header.subtitle.as_ref());
+    card.image = header.image_url.as_deref().and_then(absolute);
   }
   for section in &item.sections {
     let mut out = CardSection {
       header: formatted(section.header.as_ref()),
       ..CardSection::default()
     };
-    let mut line = |text: String| {
-      if !text.is_empty() {
-        out.lines.push(text);
+    let mut line = |label: String, (text, bold): (String, Vec<Range<usize>>)| {
+      if !label.is_empty() || !text.is_empty() {
+        out.lines.push(CardLine { label, text, bold });
       }
     };
     let mut buttons = Vec::new();
     for widget in &section.widgets {
       if let Some(paragraph) = &widget.text_paragraph {
-        line(formatted(paragraph.text.as_ref()));
+        line(String::new(), rich(paragraph.text.as_ref()));
       }
       if let Some(pair) = &widget.text_key_value {
-        let key = formatted(pair.key.as_ref());
-        let value = formatted(pair.text.as_ref());
-        line(if key.is_empty() {
-          value
-        } else {
-          format!("{key}: {value}")
-        });
+        line(formatted(pair.key.as_ref()), rich(pair.text.as_ref()));
       }
       if let Some(pair) = &widget.image_key_value {
-        line(formatted(pair.text.as_ref()));
+        line(String::new(), rich(pair.text.as_ref()));
       }
       if let Some(pair) = &widget.key_value {
-        let label = formatted(pair.top_label.as_ref());
-        let content = formatted(pair.content.as_ref());
-        line(if label.is_empty() {
-          content.clone()
-        } else {
-          format!("{label}: {content}")
-        });
-        line(formatted(pair.bottom_label.as_ref()));
+        let (content, bold) = rich(pair.content.as_ref());
+        line(formatted(pair.top_label.as_ref()), (content.clone(), bold));
+        line(String::new(), rich(pair.bottom_label.as_ref()));
         if let Some(url) = click_url(pair.on_click.as_ref()) {
           buttons.push(CardButton {
             label: if content.is_empty() {
@@ -1201,8 +1229,11 @@ mod tests {
 
   #[test]
   fn strip_tags_keeps_text_and_breaks() {
-    assert_eq!(strip_tags("a<br>b &amp; c"), "a\nb & c");
-    assert_eq!(strip_tags("plain"), "plain");
+    assert_eq!(strip_tags("a<br>b &amp; c"), ("a\nb & c".to_string(), vec![]));
+    assert_eq!(
+      strip_tags("<b>4f2a9c1</b> by <b>&lt;jpark&gt;</b>"),
+      ("4f2a9c1 by <jpark>".to_string(), vec![0..7, 11..18])
+    );
   }
 
   #[test]
