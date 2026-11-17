@@ -360,14 +360,30 @@ fn status_badge(status: PersonStatus, avatar: f32) -> Div {
   }
 }
 
+/// How the other person of a one-to-one conversation shows right now, once known. Nothing for any other conversation.
+pub fn person_status(group: &Group, cx: &App) -> Option<PersonStatus> {
+  let person = (group.kind == GroupKind::Dm).then(|| group.member_ids.first()).flatten()?;
+  cx.try_global::<People>()?.0.get(person).copied()
+}
+
+/// A person's status as a small mark in a line of text: green when active, a hollow ring when away, red for do not
+/// disturb.
+pub fn status_dot(status: PersonStatus) -> Div {
+  let dot = div().size(px(7.)).flex_shrink_0().rounded_full();
+  match status {
+    PersonStatus::Active => dot.bg(rgb(GREEN)),
+    PersonStatus::Away => dot.border(px(1.5)).border_color(rgb(MUTED)),
+    PersonStatus::DoNotDisturb => dot.bg(rgb(RED)),
+  }
+}
+
 pub fn group_avatar(images: &Images, cx: &App, group: &Group, size: f32) -> AnyElement {
   let plain = group.emoji.is_some() || group.avatar_url.is_some() || group.member_avatars.len() < 2;
   if plain {
     let url = group.avatar_url.as_deref().or(group.member_avatars.first().map(String::as_str));
     let picture = avatar(images, cx, url, group.emoji.as_deref(), &group.name, size);
     // A one-to-one conversation shows how the other person is.
-    let person = (group.kind == GroupKind::Dm).then(|| group.member_ids.first()).flatten();
-    let status = person.and_then(|id| cx.try_global::<People>()?.0.get(id).copied());
+    let status = person_status(group, cx);
     return match status {
       Some(status) => div()
         .size(px(size))

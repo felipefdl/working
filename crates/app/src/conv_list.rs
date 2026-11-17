@@ -20,7 +20,7 @@ use crate::new_chat::OpenNewChat;
 use crate::settings::{Layout, Place, Settings};
 use crate::store::{Conv, Kind, ListRow, Pane, Store, View};
 use crate::theme::{ACCENT, ACCENT_BG, BORDER, FIELD, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, mono, rgb};
-use crate::ui::{Icon, icon};
+use crate::ui::{Icon, icon, person_status, status_dot};
 
 /// A list row: the shared conversation row with a sliver of air above and below, so selected rows stand apart.
 const LIST_ROW_HEIGHT: f32 = ROW_HEIGHT + 4.0;
@@ -168,7 +168,7 @@ impl ConvList {
       };
       let selected = open == Some(&conv.g.id);
       if irc {
-        out.push(self.buffer_row(ix, conv, selected).into_any_element());
+        out.push(self.buffer_row(ix, conv, selected, cx).into_any_element());
         continue;
       }
       let marks = RowMarks { selected, pin: true };
@@ -223,9 +223,10 @@ impl ConvList {
     }
   }
 
-  /// IRC: a conversation as one line of its buffer name, after `@` while pinned, bold in the accent color with the
-  /// unread dot while unread. A click opens it and a right-click shows its menu, as on the Messages row.
-  fn buffer_row(&self, ix: usize, conv: &Conv, selected: bool) -> Stateful<Div> {
+  /// IRC: a conversation as one line of its buffer name, after `@` while pinned, bold in the accent color while
+  /// unread. A person's row ends with their status. A click opens it and a right-click shows its menu, as on the
+  /// Messages row.
+  fn buffer_row(&self, ix: usize, conv: &Conv, selected: bool, cx: &App) -> Stateful<Div> {
     let g = &conv.g;
     let opened = g.id.clone();
     let right_click = conversation_menu(&self.store, g.id.clone());
@@ -266,9 +267,7 @@ impl ConvList {
             buffer_name(g)
           })),
       )
-      .when(g.unread, |row| {
-        row.child(div().size(px(6.)).flex_shrink_0().rounded_full().bg(rgb(ACCENT)))
-      })
+      .when_some(person_status(g, cx), |row, status| row.child(status_dot(status)))
   }
 
   /// Messages: the title with buttons for Mentions, Starred, Calendar, Meet, and New chat, then the filter chips. A
