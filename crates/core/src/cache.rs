@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Group, GroupId, Message, Micros, User};
+use crate::model::{Group, GroupId, Message, Micros, SearchHit, Shortcut, User};
 
 /// Bytes of images and downloads kept; the ones used longest ago go first.
 const IMAGE_BUDGET: u64 = 512 * 1024 * 1024;
@@ -112,6 +112,22 @@ impl Cache {
 
   pub fn save_history(&self, group: &GroupId, history: &HistoryCache) {
     let _ = self.write(&self.dir.join("history").join(format!("{}.json", group.key())), history);
+  }
+
+  fn shortcut_path(&self, shortcut: Shortcut) -> PathBuf {
+    self.dir.join(match shortcut {
+      Shortcut::Mentions => "mentions.json",
+      Shortcut::Starred => "starred.json",
+    })
+  }
+
+  /// The newest page of a shortcut's messages, as last loaded.
+  pub fn shortcut(&self, shortcut: Shortcut) -> Option<Vec<SearchHit>> {
+    self.read(self.shortcut_path(shortcut))
+  }
+
+  pub fn save_shortcut(&self, shortcut: Shortcut, hits: &[SearchHit]) {
+    let _ = self.write(&self.shortcut_path(shortcut), &hits);
   }
 
   /// Where a URL's bytes are kept: named by the SHA-1 of the URL, the same on every build.

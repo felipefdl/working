@@ -1321,9 +1321,21 @@ impl Engine {
     Ok((hits, next))
   }
 
-  /// One page of a shortcut's messages.
+  /// One page of a shortcut's messages. The newest page is answered twice: from the disk cache at once, without a
+  /// cursor, then from the network, which the cache keeps for the next time.
   async fn load_shortcut(&self, shortcut: Shortcut, cursor: Option<String>) -> Result<()> {
     let appended = cursor.is_some();
+    if !appended {
+      let cache = self.cache.clone();
+      if let Some(hits) = tokio::task::spawn_blocking(move || cache.shortcut(shortcut)).await? {
+        self.emit(Event::Shortcut {
+          shortcut,
+          hits: Arc::new(hits),
+          appended: false,
+          cursor: None,
+        });
+      }
+    }
     let (hits, cursor) = match shortcut {
       Shortcut::Mentions => {
         let me = self.me_id();
@@ -1334,12 +1346,13 @@ impl Engine {
       },
       Shortcut::Starred => (self.starred().await?, None),
     };
-    self.emit(Event::Shortcut {
-      shortcut,
-      hits: Arc::new(hits),
-      appended,
-      cursor,
-    });
+    let hits = Arc::new(hits);
+    if !appended {
+      let cache = self.cache.clone();
+      let hits = hits.clone();
+      tokio::task::spawn_blocking(move || cache.save_shortcut(shortcut, &hits));
+    }
+    self.emit(Event::Shortcut { shortcut, hits, appended, cursor });
     Ok(())
   }
 

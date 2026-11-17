@@ -607,7 +607,7 @@ pub enum McpStatus {
 }
 
 /// One message found by `Command::Search`, or listed by a shortcut.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchHit {
   /// Conversation that holds the hit.
   pub group: GroupId,
