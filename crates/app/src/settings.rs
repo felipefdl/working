@@ -2,7 +2,8 @@
 //! read them are redrawn when they change.
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use gchat_core::{Command, Core, GroupId, McpConfig, McpStatus, Shortcut};
 use gpui_kit::component::{Theme, ThemeMode};
@@ -514,29 +515,65 @@ impl Settings {
   pub fn preview(cx: &mut App, change: impl FnOnce(&mut Self)) -> bool {
     let mut settings = cx.global::<Self>().clone();
     change(&mut settings);
-    if &settings == cx.global::<Self>() {
+    let held = cx.global::<Self>();
+    if &settings == held {
       return false;
     }
+    let restyled = !settings.same_look(held);
     cx.set_global(settings);
-    apply_appearance(cx);
+    if restyled {
+      apply_appearance(cx);
+    }
     true
   }
 
-  /// Saves the settings as they are now.
+  /// Whether `other` puts the same theme and fonts on the windows.
+  fn same_look(&self, other: &Self) -> bool {
+    self.appearance == other.appearance
+      && self.light_theme == other.light_theme
+      && self.dark_theme == other.dark_theme
+      && self.font == other.font
+      && self.mono_font == other.mono_font
+  }
+
+  /// Saves the settings as they are now. The file is written off the UI thread, through a temporary file renamed over
+  /// it, so quitting mid-write leaves the old one whole; of two saves close together, the later one's settings are
+  /// what the file keeps.
   pub fn commit(cx: &App) {
-    match serde_json::to_string_pretty(cx.global::<Self>()) {
-      Ok(text) => {
-        let path = path();
-        let written = path
-          .parent()
-          .map_or(Ok(()), std::fs::create_dir_all)
-          .and_then(|()| std::fs::write(&path, text));
-        if let Err(error) = written {
-          tracing::warn!("could not save settings: {error}");
-        }
+    Self::save(cx).detach();
+  }
+
+  /// `commit`, as a task that ends once the file is written: what quitting waits for.
+  pub fn save(cx: &App) -> Task<()> {
+    /// The number of the latest save asked for.
+    static ASKED: AtomicU64 = AtomicU64::new(0);
+    /// The number of the save the file holds.
+    static WRITTEN: Mutex<u64> = Mutex::new(0);
+    let text = match serde_json::to_string_pretty(cx.global::<Self>()) {
+      Ok(text) => text,
+      Err(error) => {
+        tracing::warn!("could not save settings: {error}");
+        return Task::ready(());
       },
-      Err(error) => tracing::warn!("could not save settings: {error}"),
-    }
+    };
+    let save = ASKED.fetch_add(1, Ordering::Relaxed) + 1;
+    cx.background_executor().spawn(async move {
+      let mut written = WRITTEN.lock().unwrap_or_else(PoisonError::into_inner);
+      if *written > save {
+        return;
+      }
+      let path = path();
+      let partial = path.with_extension("json.tmp");
+      let saved = path
+        .parent()
+        .map_or(Ok(()), std::fs::create_dir_all)
+        .and_then(|()| std::fs::write(&partial, text))
+        .and_then(|()| std::fs::rename(&partial, &path));
+      match saved {
+        Ok(()) => *written = save,
+        Err(error) => tracing::warn!("could not save settings: {error}"),
+      }
+    })
   }
 
   /// The number key that opens `place`.
@@ -590,14 +627,18 @@ impl Settings {
     }
   }
 
-  /// The interface family windows draw with: the saved one when it is installed, else the system font.
+  /// The interface family windows draw with: the saved one when it is installed, else the system font. Without a
+  /// saved one the installed families are not listed.
   pub fn shown_font(&self, cx: &App) -> Option<SharedString> {
-    installed_family(self.font.as_deref(), installed_fonts(cx))
+    let saved = self.font.as_deref()?;
+    installed_family(Some(saved), installed_fonts(cx))
   }
 
   /// The monospace family windows draw with: the saved one when it is installed, else the system monospaced font.
+  /// Without a saved one the installed families are not listed.
   pub fn shown_mono_font(&self, cx: &App) -> Option<SharedString> {
-    installed_family(self.mono_font.as_deref(), installed_fonts(cx))
+    let saved = self.mono_font.as_deref()?;
+    installed_family(Some(saved), installed_fonts(cx))
   }
 
   /// Index in `THEMES` of the theme windows show now.
@@ -651,13 +692,27 @@ fn installed_family(saved: Option<&str>, installed: &[String]) -> Option<SharedS
     .then(|| SharedString::from(saved.to_string()))
 }
 
+/// How many times the MCP token was replaced while the app runs: a new count makes `keep_mcp` read the token again.
+#[derive(Default)]
+struct TokenRotations(u64);
+
+impl Global for TokenRotations {}
+
 /// Starts the MCP server when the settings ask for it, and restarts or stops it whenever they (or its token)
-/// change.
+/// change. The token file is read only when one of those changed, not on every settings change.
 pub fn keep_mcp(core: Core, cx: &mut App) {
   cx.set_global(McpState::default());
   let mut running = None;
+  let mut asked = None;
   let mut follow = move |cx: &mut App| {
-    let wanted = cx.global::<Settings>().mcp_config();
+    let settings = cx.global::<Settings>();
+    let rotations = cx.try_global::<TokenRotations>().map_or(0, |rotations| rotations.0);
+    let ask = (settings.mcp, settings.mcp_port, settings.mcp_send, rotations);
+    if asked == Some(ask) {
+      return;
+    }
+    asked = Some(ask);
+    let wanted = settings.mcp_config();
     if wanted != running {
       running = wanted.clone();
       core.send(Command::SetMcp(wanted));
@@ -672,6 +727,7 @@ pub fn replace_mcp_token(cx: &mut App) {
   if let Err(error) = gchat_core::mcp::rotate_token() {
     tracing::warn!("could not store the MCP token: {error}");
   }
+  cx.default_global::<TokenRotations>().0 += 1;
   // Tells whoever follows the settings to look again: the server restarts with the new token.
   let settings = cx.global::<Settings>().clone();
   cx.set_global(settings);

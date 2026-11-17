@@ -100,10 +100,11 @@ pub fn presence(settings: &Settings) -> Presence {
   }
 }
 
-/// Keeps the core told how the user should show, as the settings, the clock and the keyboard change it.
+/// Keeps the core told how the user should show, as the settings, the clock and the keyboard change it. Only a change
+/// is sent; `apply` sends at once when the status button changes it.
 pub fn keep_presence(core: Core, cx: &mut App) {
   cx.spawn(async move |cx| {
-    // The core passes on only what changed.
+    let mut sent = None;
     loop {
       let presence = cx.update(|cx| {
         if cx.global::<Settings>().away {
@@ -112,7 +113,10 @@ pub fn keep_presence(core: Core, cx: &mut App) {
           presence(cx.global::<Settings>())
         }
       });
-      core.send(Command::SetPresence(presence));
+      if sent != Some(presence) {
+        sent = Some(presence);
+        core.send(Command::SetPresence(presence));
+      }
       cx.background_executor().timer(Duration::from_secs(5)).await;
     }
   })

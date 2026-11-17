@@ -438,7 +438,7 @@ impl Viewer {
     if self.state.is_none() {
       self.previous_focus = window.focused(cx);
     }
-    self.drop_state(cx);
+    self.drop_state(window, cx);
     self.generation += 1;
     let generation = self.generation;
     window.focus(&self.focus, cx);
@@ -454,22 +454,27 @@ impl Viewer {
     if self.state.is_none() {
       return;
     }
-    self.drop_state(cx);
+    self.drop_state(window, cx);
     if let Some(handle) = self.previous_focus.take() {
       window.focus(&handle, cx);
     }
     cx.notify();
   }
 
-  /// Drops the open item, stopping any playback first, and deletes its temp file in the background.
-  fn drop_state(&mut self, cx: &mut Context<Self>) {
+  /// Drops the open item, stopping any playback first, takes its full-size image out of the windows' sprite atlases,
+  /// and deletes its temp file in the background.
+  fn drop_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let Some(open) = self.state.take() else {
       return;
     };
-    if let Body::File(FileState::Preview { web: Some(web), .. }) = &open.body {
-      let raw = web.read(cx).raw();
-      raw.evaluate_script("document.querySelectorAll('video,audio').forEach(function(m){m.pause();m.removeAttribute('src');m.load();});").ok();
-      raw.load_url("about:blank").ok();
+    match &open.body {
+      Body::Image(ImageView { full: Some(full), .. }) => cx.drop_image(full.clone(), Some(window)),
+      Body::File(FileState::Preview { web: Some(web), .. }) => {
+        let raw = web.read(cx).raw();
+        raw.evaluate_script("document.querySelectorAll('video,audio').forEach(function(m){m.pause();m.removeAttribute('src');m.load();});").ok();
+        raw.load_url("about:blank").ok();
+      },
+      _ => {},
     }
     if let Some(path) = open.temp {
       cx.background_executor()
@@ -532,7 +537,10 @@ impl Viewer {
       return;
     }
     view.loading = false;
-    view.full = image;
+    // Called outside a window's update: every window's atlas is reached without one.
+    if let Some(old) = std::mem::replace(&mut view.full, image) {
+      cx.drop_image(old, None);
+    }
     cx.notify();
   }
 
@@ -887,7 +895,10 @@ impl Viewer {
     let Some(Open { att, body: Body::Image(view), .. }) = &mut self.state else {
       return (None, div().into_any_element());
     };
-    let thumb = view.thumb_url.as_deref().and_then(|url| self.images.get(url, 1600, cx));
+    let thumb = view
+      .thumb_url
+      .as_deref()
+      .and_then(|url| self.images.thumb(url, crate::message::THUMB_MAX, scale_factor, cx));
     let image = view.full.clone().or(thumb);
     if view.natural.is_none()
       && let Some(image) = &image

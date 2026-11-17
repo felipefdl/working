@@ -3,6 +3,7 @@
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Duration;
 
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -22,16 +23,28 @@ use crate::util;
 /// Height of a conversation or message row.
 pub const ROW_HEIGHT: f32 = 56.0;
 
+/// The window root draws it as a cached view, so it redraws itself whenever what it draws changes: the store, the
+/// settings, an image arriving, or the minute its rows' times count.
 pub struct HomeView {
   store: Entity<Store>,
   scroll: UniformListScrollHandle,
+  _subs: [Subscription; 3],
+  _clock: Task<()>,
 }
 
 impl HomeView {
-  pub fn new(store: Entity<Store>) -> Self {
+  pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
+    let tick = store.read(cx).images.tick().clone();
+    let subs = [
+      cx.observe(&store, |_, _, cx| cx.notify()),
+      cx.observe_global::<Settings>(|_, cx| cx.notify()),
+      cx.observe(&tick, |_, _, cx| cx.notify()),
+    ];
     Self {
       store,
       scroll: UniformListScrollHandle::new(),
+      _subs: subs,
+      _clock: minute_clock(cx),
     }
   }
 
@@ -58,6 +71,18 @@ impl HomeView {
     }
     out
   }
+}
+
+/// Redraws a view each minute, for the times its rows show ("4 min").
+pub fn minute_clock<V: 'static>(cx: &Context<V>) -> Task<()> {
+  cx.spawn(async move |this, cx| {
+    loop {
+      cx.background_executor().timer(Duration::from_secs(60)).await;
+      if this.update(cx, |_, cx| cx.notify()).is_err() {
+        break;
+      }
+    }
+  })
 }
 
 /// The conversations Home lists. Beside a conversation list (`kept`) they are already there, so Home has none.
@@ -259,20 +284,6 @@ pub fn conv_row(
   cx: &App,
 ) -> Stateful<Div> {
   let g = &conv.g;
-  let me = store.me.as_ref().map_or("", |u| u.id.as_str());
-  let snippet = g.snippet.as_ref().map(|s| {
-    let sender = if !me.is_empty() && s.sender_id == me {
-      "You"
-    } else {
-      s.sender_name.as_str()
-    };
-    let text: String = s.text.chars().take(240).map(|c| if c == '\n' { ' ' } else { c }).collect();
-    if sender.is_empty() {
-      text
-    } else {
-      format!("{sender}: {text}")
-    }
-  });
   let time = g.snippet.as_ref().map_or(g.sort_time, |s| s.time);
   let opened = g.id.clone();
   let right_click = conversation_menu(handle, g.id.clone());
@@ -304,7 +315,7 @@ pub fn conv_row(
             .text_size(px(14.))
             .text_color(rgb(TEXT))
             .when(g.unread, |d| d.font_weight(FontWeight::SEMIBOLD))
-            .child(g.name.clone()),
+            .child(conv.name.clone()),
         )
         .child(
           div()
@@ -312,7 +323,7 @@ pub fn conv_row(
             .text_size(px(13.))
             .text_color(rgb(MUTED))
             .when(g.unread, |d| d.text_color(rgb(TEXT)))
-            .child(emoji_font::text(snippet.unwrap_or_default())),
+            .child(emoji_font::text(conv.preview.clone())),
         ),
     )
     .child(

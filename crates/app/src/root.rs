@@ -296,12 +296,12 @@ pub struct RootView {
 
 impl RootView {
   pub fn new(core: Core, store: Entity<Store>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-    let sidebar = cx.new(|_| Sidebar::new(store.clone()));
-    let conv_list = cx.new(|_| ConvList::new(store.clone()));
-    let rail = cx.new(|_| Rail::new(store.clone()));
+    let sidebar = cx.new(|cx| Sidebar::new(store.clone(), cx));
+    let conv_list = cx.new(|cx| ConvList::new(store.clone(), cx));
+    let rail = cx.new(|cx| Rail::new(store.clone(), cx));
     let layout = cx.global::<settings::Settings>().layout;
     store.update(cx, super::store::Store::sync_settings);
-    let home = cx.new(|_| HomeView::new(store.clone()));
+    let home = cx.new(|cx| HomeView::new(store.clone(), cx));
     let shortcuts = cx.new(|_| ShortcutView::new(store.clone()));
     let calendar = cx.new(|cx| CalendarView::new(store.clone(), window, cx));
     let meet = cx.new(|cx| MeetView::new(store.clone(), window, cx));
@@ -1038,13 +1038,26 @@ impl RootView {
   }
 
   /// The column(s) of the layout, left to right: the sidebar, the list (Messages' or IRC's buffer list), or the rail
-  /// and the list, with the rail at the window's edge on either side.
+  /// and the list, with the rail at the window's edge on either side. Each is a cached view laid out as its own root
+  /// lays itself out, which redraws itself when what it draws changes.
   fn columns(&self, cx: &App) -> Vec<AnyElement> {
+    let column = |width: f32| StyleRefinement::default().w(px(width)).h_full().flex_shrink_0();
+    let settings = cx.global::<settings::Settings>();
     match self.layout {
-      Layout::GoogleChat => vec![self.sidebar.clone().into_any_element()],
-      Layout::Messages | Layout::Irc => vec![self.conv_list.clone().into_any_element()],
+      Layout::GoogleChat => {
+        let width = settings.column_width(Layout::GoogleChat);
+        vec![self.sidebar.clone().cached(column(width)).into_any_element()]
+      },
+      Layout::Messages | Layout::Irc => {
+        let width = settings.column_width(self.layout);
+        vec![self.conv_list.clone().cached(column(width)).into_any_element()]
+      },
       Layout::Rail => {
-        let mut columns = vec![self.rail.clone().into_any_element(), self.conv_list.clone().into_any_element()];
+        let list = settings.column_width(Layout::Rail);
+        let mut columns = vec![
+          self.rail.clone().cached(column(RAIL_WIDTH)).into_any_element(),
+          self.conv_list.clone().cached(column(list)).into_any_element(),
+        ];
         if Self::sidebar_side(cx) == SidebarSide::Right {
           columns.reverse();
         }
@@ -1211,12 +1224,18 @@ impl Render for RootView {
       });
     }
 
+    // Home and the conversation redraw themselves when what they draw changes, so they are cached. The others redraw
+    // with the window root: Mentions and Starred, Calendar, and Meet each read more than they observe.
     let content: AnyElement = match open_conv {
-      Some(conv) => conv.into_any_element(),
+      Some(conv) => conv.cached(StyleRefinement::default().size_full()).into_any_element(),
       None if on_shortcut => self.shortcuts.clone().into_any_element(),
       None if on_calendar => self.calendar.clone().into_any_element(),
       None if on_meet => self.meet.clone().into_any_element(),
-      None => self.home.clone().into_any_element(),
+      None => self
+        .home
+        .clone()
+        .cached(StyleRefinement::default().size_full())
+        .into_any_element(),
     };
 
     // Own bar instead of a fixed-height title bar: tall enough for the search field, draggable, and with the

@@ -32,6 +32,8 @@ const CAMERA_PANE: &str = "x-apple.systempreferences:com.apple.preference.securi
 const MICROPHONE_PANE: &str = "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
 #[cfg(target_os = "macos")]
 const NOTIFICATIONS_PANE: &str = "x-apple.systempreferences:com.apple.Notifications-Settings.extension";
+/// How long typing in the rewrite instructions pauses before they are saved.
+const INSTRUCTION_SAVE_DELAY: Duration = Duration::from_millis(500);
 /// The least and the most the Settings window measures as the main window grows.
 const SETTINGS_SIZE: (Size<f32>, Size<f32>) =
   (Size { width: 780.0, height: 500.0 }, Size { width: 1120.0, height: 860.0 });
@@ -168,6 +170,9 @@ pub struct SettingsView {
   /// The instructions' reset button was clicked once: a second click within a few seconds resets them.
   reset_armed: bool,
   _reset_disarm: Option<Task<()>>,
+  /// Saves the instructions once typing pauses. While it waits, closing or quitting saves them instead.
+  instruction_save: Option<Task<()>>,
+  _pending_saves: [Subscription; 2],
   dark_theme: Entity<SelectState<Vec<ThemeChoice>>>,
   light_theme: Entity<SelectState<Vec<ThemeChoice>>>,
   font: Entity<SelectState<SearchableVec<FontChoice>>>,
@@ -222,12 +227,30 @@ impl SettingsView {
         .placeholder("How to rewrite")
     });
     rewrite_instruction.update(cx, |state, cx| state.set_value(instruction, window, cx));
-    let rewrite_sub = cx.subscribe_in(&rewrite_instruction, window, |_, field, event: &InputEvent, _, cx| {
+    // Each keystroke applies the instructions; the file is saved once typing pauses, and on closing or quitting.
+    let rewrite_sub = cx.subscribe_in(&rewrite_instruction, window, |this, field, event: &InputEvent, _, cx| {
       if matches!(event, InputEvent::Change) {
         let text = field.read(cx).value().to_string();
-        Settings::update(cx, |settings| settings.rewrite_instruction = text);
+        if Settings::preview(cx, |settings| settings.rewrite_instruction = text) {
+          this.save_instruction(cx);
+        }
       }
     });
+    let pending_saves = [
+      cx.on_release(|this: &mut Self, cx| {
+        if this.instruction_save.take().is_some() {
+          Settings::commit(cx);
+        }
+      }),
+      cx.on_app_quit(|this, cx| {
+        let save = this.instruction_save.take().map(|_| Settings::save(cx));
+        async move {
+          if let Some(save) = save {
+            save.await;
+          }
+        }
+      }),
+    ];
     let dark_theme = Self::theme_select(true, window, cx);
     let light_theme = Self::theme_select(false, window, cx);
     let theme_subs = [&dark_theme, &light_theme].map(|select| {
@@ -268,6 +291,8 @@ impl SettingsView {
       rewrite_instruction,
       reset_armed: false,
       _reset_disarm: None,
+      instruction_save: None,
+      _pending_saves: pending_saves,
       dark_theme,
       light_theme,
       font,
@@ -1451,6 +1476,17 @@ impl SettingsView {
       .update(cx, |state, cx| state.set_value(DEFAULT_REWRITE_INSTRUCTION, window, cx));
     Settings::update(cx, |settings| settings.rewrite_instruction = DEFAULT_REWRITE_INSTRUCTION.into());
     cx.notify();
+  }
+
+  /// Saves the instructions once typing has paused for a moment, instead of on every keystroke.
+  fn save_instruction(&mut self, cx: &mut Context<Self>) {
+    self.instruction_save = Some(cx.spawn(async move |this, cx| {
+      cx.background_executor().timer(INSTRUCTION_SAVE_DELAY).await;
+      let _ = this.update(cx, |this, cx| {
+        this.instruction_save = None;
+        Settings::commit(cx);
+      });
+    }));
   }
 
   fn rewrite(&self, settings: Settings, cx: &mut Context<Self>) -> Div {

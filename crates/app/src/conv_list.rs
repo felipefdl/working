@@ -12,7 +12,7 @@ use gpui_kit::*;
 
 use crate::calendar::OpenCalendar;
 use crate::emoji_font;
-use crate::home::{ROW_HEIGHT, RowMarks, conv_row, conversation_menu, hit_row, unread_toggle};
+use crate::home::{ROW_HEIGHT, RowMarks, conv_row, conversation_menu, hit_row, minute_clock, unread_toggle};
 use crate::keys;
 use crate::meet::OpenMeet;
 use crate::menu;
@@ -52,16 +52,26 @@ impl Filter {
   }
 }
 
+/// The window root draws it as a cached view, so it redraws itself whenever what it draws changes: the store, the
+/// settings, an image arriving, or the minute its rows' times count.
 pub struct ConvList {
   store: Entity<Store>,
   scroll: UniformListScrollHandle,
   filter: Filter,
   /// The open conversation the list last scrolled to.
   followed: Option<GroupId>,
+  _subs: [Subscription; 3],
+  _clock: Task<()>,
 }
 
 impl ConvList {
-  pub fn new(store: Entity<Store>) -> Self {
+  pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
+    let tick = store.read(cx).images.tick().clone();
+    let subs = [
+      cx.observe(&store, |_, _, cx| cx.notify()),
+      cx.observe_global::<Settings>(|_, cx| cx.notify()),
+      cx.observe(&tick, |_, _, cx| cx.notify()),
+    ];
     Self {
       store,
       scroll: UniformListScrollHandle::new(),
@@ -72,6 +82,8 @@ impl ConvList {
         query: String::new(),
       },
       followed: None,
+      _subs: subs,
+      _clock: minute_clock(cx),
     }
   }
 

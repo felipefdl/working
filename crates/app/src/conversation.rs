@@ -1,6 +1,7 @@
 //! An open conversation: header, bottom-anchored virtualized message list, composer.
 
 use std::cell::Cell;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -14,11 +15,11 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::completion::{self, Menu, Trigger};
+use crate::completion::{self, Member, Menu, Trigger};
 use crate::conv_list::{buffer_name, hint};
 use crate::emoji_font;
 use crate::format_logic::Format;
-use crate::images::Images;
+use crate::images::{self, Images};
 use crate::message::{self, Act, Actor, MsgCtx, Opener, Readers, Row};
 use crate::settings::{Layout, MessageStyle, RewriteTool, Settings, SidebarSide, ThreadView};
 use crate::store::{History, Store};
@@ -120,17 +121,23 @@ struct LoadState {
 /// The open thread panel: its rows (starting message first, then replies) are rebuilt with the message list.
 struct Thread {
   topic: String,
-  rows: Vec<Row>,
-  /// The IRC style's sender column for those rows (`message::irc_nick_width`).
-  nick_width: Cell<(usize, f32)>,
-  /// Who has read up to each of those messages.
-  readers: Readers,
-  list: ListState,
+  /// The rows, drawn as a cached view of their own.
+  view: Entity<MessageList>,
   composer: Entity<TextareaState>,
   /// Files that go out with the next reply.
-  files: Vec<PathBuf>,
+  files: Vec<Attached>,
   _sub: Subscription,
 }
+
+/// A file that goes out with the next message, with a small picture of it once decoded when it is one.
+struct Attached {
+  path: PathBuf,
+  image: bool,
+  thumb: Option<Arc<RenderImage>>,
+}
+
+/// The longer side, in pixels, of an attached picture's small picture beside its name.
+const CHIP_THUMB: u32 = 128;
 
 /// The message whose text is in a composer to be changed, and which composer that is.
 struct Editing {
@@ -142,8 +149,190 @@ struct Find {
   input: Entity<InputState>,
   query: String,
   hits: Vec<(String, Range<usize>)>,
+  /// The same hits by message, as the rows draw them.
+  by_message: Rc<HashMap<String, Vec<Range<usize>>>>,
   index: usize,
   _sub: Subscription,
+}
+
+/// What the rows of both lists show besides their messages: the toolbar, the outline of a search hit, the find bar's
+/// hits. The conversation hands a new one to its lists whenever it changes (`ConversationView::sync_marks`).
+#[derive(Clone, Default)]
+struct Marks {
+  hovered: Option<String>,
+  focus: Option<String>,
+  /// The find bar's hits by message, and the one it is on.
+  find: Option<(Rc<HashMap<String, Vec<Range<usize>>>>, Option<(String, Range<usize>)>)>,
+}
+
+/// What both message lists draw with, shared with the conversation.
+#[derive(Clone)]
+struct ListParts {
+  images: Images,
+  core: Core,
+  actor: Actor,
+  open_person: Opener,
+  on_tools: Rc<Cell<bool>>,
+  me_avatar: Option<String>,
+}
+
+/// A message list as a view of its own, which the conversation draws cached: typing in a composer, the `@` menu and
+/// the typing line redraw the conversation without laying out these rows again. Whatever changes what the rows show
+/// (rows, receipts, marks, images, settings) notifies this view.
+struct MessageList {
+  rows: Vec<Row>,
+  list: ListState,
+  /// The IRC style's sender column for those rows (`message::irc_nick_width`).
+  nick_width: Cell<(usize, f32)>,
+  /// Who has read up to each message.
+  readers: Readers,
+  marks: Marks,
+  parts: ListParts,
+  /// The main list's thread footers open the thread; the thread panel has none.
+  opener: Option<Opener>,
+  /// "Reply in thread" is offered: the main list of a space.
+  threads: bool,
+  /// The main list of a conversation with a thread open: under the thread pop-up it shows no toolbar.
+  under_thread: bool,
+  /// The message layout the list was measured with.
+  density: MessageStyle,
+  _subs: [Subscription; 2],
+}
+
+impl MessageList {
+  fn new(rows: Vec<Row>, parts: ListParts, opener: Option<Opener>, threads: bool, cx: &mut Context<Self>) -> Self {
+    let subs = [
+      cx.observe(parts.images.tick(), |_, _, cx| cx.notify()),
+      // Rows change height with the message layout: measure the list again.
+      cx.observe_global::<Settings>(|this, cx| {
+        let density = cx.global::<Settings>().message_style;
+        if density != this.density {
+          this.density = density;
+          this.list.reset(this.rows.len());
+        }
+        cx.notify();
+      }),
+    ];
+    Self {
+      list: ListState::new(rows.len(), ListAlignment::Bottom, px(600.)),
+      rows,
+      nick_width: Cell::default(),
+      readers: Readers::default(),
+      marks: Marks::default(),
+      parts,
+      opener,
+      threads,
+      under_thread: false,
+      density: cx.global::<Settings>().message_style,
+      _subs: subs,
+    }
+  }
+
+  /// Replaces the rows, telling the list only about the changed middle so heights and scroll stay put. Rows that stay
+  /// keep what they already worked out (`Row::adopt`).
+  fn set_rows(&mut self, mut new: Vec<Row>, prepended: usize, receipts: &[ReadReceipt], cx: &mut Context<Self>) {
+    let old = &mut self.rows;
+    let (old_len, new_len) = (old.len(), new.len());
+    let mut prefix = 0;
+    while prefix < old_len.min(new_len) && old[prefix].same(&new[prefix]) {
+      prefix += 1;
+    }
+    let mut suffix = 0;
+    while suffix < old_len - prefix
+      && suffix < new_len - prefix
+      && old[old_len - 1 - suffix].same(&new[new_len - 1 - suffix])
+    {
+      suffix += 1;
+    }
+    for (new, old) in new.iter_mut().zip(old.iter_mut()).take(prefix) {
+      new.adopt(old);
+    }
+    for (new, old) in new.iter_mut().rev().zip(old.iter_mut().rev()).take(suffix) {
+      new.adopt(old);
+    }
+    let top = self.list.logical_scroll_top();
+    let anchored = top.item_ix < old_len;
+    if prefix != old_len || prefix != new_len {
+      self.list.splice(prefix..old_len - suffix, new_len - prefix - suffix);
+    }
+    *old = new;
+    if prepended > 0 && anchored && new_len > old_len {
+      self.list.scroll_to(ListOffset {
+        item_ix: top.item_ix + (new_len - old_len),
+        offset_in_item: top.offset_in_item,
+      });
+    }
+    self.readers = Readers::place(&self.rows, receipts);
+    cx.notify();
+  }
+
+  fn set_readers(&mut self, receipts: &[ReadReceipt], cx: &mut Context<Self>) {
+    self.readers = Readers::place(&self.rows, receipts);
+    cx.notify();
+  }
+
+  fn set_marks(&mut self, marks: Marks, cx: &mut Context<Self>) {
+    self.marks = marks;
+    cx.notify();
+  }
+
+  /// Moves the list's scroll position, and redraws it there.
+  fn scroll(&mut self, cx: &mut Context<Self>, to: Option<ListOffset>) {
+    match to {
+      Some(offset) => self.list.scroll_to(offset),
+      None => self.list.scroll_to_end(),
+    }
+    cx.notify();
+  }
+
+  fn render_row(&self, ix: usize, window: &Window, cx: &App) -> AnyElement {
+    let Some(row) = self.rows.get(ix) else {
+      return div().into_any_element();
+    };
+    let id = row.msg.id.as_str();
+    let (hits, find_hit) = match &self.marks.find {
+      Some((by_message, current)) => (
+        by_message.get(id).map_or(&[][..], Vec::as_slice),
+        current.as_ref().filter(|(hit, _)| hit == id).map(|(_, range)| range.clone()),
+      ),
+      None => (&[][..], None),
+    };
+    let under_popup = self.under_thread && cx.global::<Settings>().thread_view == ThreadView::Modal;
+    let ctx = MsgCtx {
+      images: &self.parts.images,
+      core: &self.parts.core,
+      me_avatar: self.parts.me_avatar.as_deref(),
+      open_thread: self.opener.as_ref(),
+      focus: self.marks.focus.as_deref(),
+      find: hits,
+      find_hit,
+      act: &self.parts.actor,
+      open_person: &self.parts.open_person,
+      threads: self.threads,
+      // Under the thread pop-up the list shows no toolbar: the pop-up's own row has the same message.
+      hovered: self.marks.hovered.as_deref().filter(|_| !under_popup),
+      on_tools: &self.parts.on_tools,
+      readers: self.readers.of(id),
+      nick_width: message::irc_nick_width(&self.rows, &self.nick_width),
+      scale: window.scale_factor(),
+    };
+    message::render_row(row, &ctx, cx)
+  }
+}
+
+impl Render for MessageList {
+  fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    list(
+      self.list.clone(),
+      cx.processor(|this, ix: usize, window, cx| this.render_row(ix, window, cx)),
+    )
+    .size_full()
+  }
+}
+
+/// The list inside `view`, scrolled to `to` (`None`: the end) and redrawn there.
+fn scroll_list(view: &Entity<MessageList>, to: Option<ListOffset>, cx: &mut App) {
+  view.update(cx, |list, cx| list.scroll(cx, to));
 }
 
 pub struct ConversationView {
@@ -154,17 +343,13 @@ pub struct ConversationView {
   me_id: String,
   me_avatar: Option<String>,
   messages: Arc<Vec<Arc<Message>>>,
-  rows: Vec<Row>,
-  /// The IRC style's sender column for those rows (`message::irc_nick_width`).
-  nick_width: Cell<(usize, f32)>,
+  /// The last message of the list `take_messages` handed back, until `set_history` brings the next list.
+  taken_last: Option<Arc<Message>>,
+  /// The main list, drawn as a cached view of its own.
+  main: Entity<MessageList>,
   /// Who has read the conversation, as the core last said: none while Google Chat has read receipts off here.
   receipts: Arc<Vec<ReadReceipt>>,
-  /// Who has read up to each message of the main list.
-  readers: Readers,
-  /// The message layout the lists were measured with.
-  density: MessageStyle,
   thread: Option<Thread>,
-  opener: Opener,
   /// Opens the chat with the person a name or a mention names.
   open_person: Opener,
   actor: Actor,
@@ -172,7 +357,7 @@ pub struct ConversationView {
   quoting: Option<Arc<Message>>,
   editing: Option<Editing>,
   /// Files that go out with the next message from the main composer.
-  files: Vec<PathBuf>,
+  files: Vec<Attached>,
   /// The message under the pointer, which shows its toolbar.
   hovered: Option<String>,
   /// The pointer is over a message list.
@@ -183,14 +368,15 @@ pub struct ConversationView {
   /// The press on the thread pop-up's backdrop also closed the text panel: that press leaves the thread open.
   backdrop_kept: bool,
   loaded: bool,
-  list: ListState,
   composer: Entity<TextareaState>,
   load: Rc<LoadState>,
   typing_sent: bool,
   typing_task: Option<Task<()>>,
   typing: Vec<(String, String, Instant)>,
   _subs: Vec<Subscription>,
-  _expiry: Task<()>,
+  /// Drops typing people who went quiet; runs only while someone is typing (`expiring`).
+  _expiry: Option<Task<()>>,
+  expiring: bool,
   _top_check: Option<Task<()>>,
   /// The message a search hit jumped to, outlined for a moment.
   focus: Option<String>,
@@ -204,7 +390,7 @@ pub struct ConversationView {
   _rewrite_error_clear: Option<Task<()>>,
   find: Option<Find>,
   /// Who `@` offers, once `Command::LoadMembers` answered.
-  members: Option<Arc<Vec<User>>>,
+  members: Option<Vec<Member>>,
   /// The members A to Z, for IRC's nick list.
   nicks: Vec<User>,
   /// What `/` offers, once `Command::LoadSlashCommands` answered.
@@ -238,7 +424,6 @@ impl ConversationView {
     let me_id = me.as_ref().map_or_default(|u| u.id.clone());
     let me_avatar = me.and_then(|u| u.avatar_url);
     let rows = message::build_rows(&messages, &me_id);
-    let list = ListState::new(rows.len(), ListAlignment::Bottom, px(600.));
     let load = Rc::new(LoadState {
       loading: Cell::new(false),
       reached: Cell::new(reached),
@@ -247,9 +432,39 @@ impl ConversationView {
       loading_newer: Cell::new(false),
       rows: Cell::new(rows.len()),
     });
+
+    let open_person: Opener = {
+      let store = store.clone();
+      Rc::new(move |user_id, window, cx| {
+        store.update(cx, |store, cx| store.open_person(user_id, window, cx)).ok();
+      })
+    };
+    let opener: Opener = {
+      let weak = cx.weak_entity();
+      Rc::new(move |topic, window, cx| {
+        weak.update(cx, |this, cx| this.open_thread(topic, window, cx)).ok();
+      })
+    };
+    let actor: Actor = {
+      let weak = cx.weak_entity();
+      Rc::new(move |act, message, window, cx| {
+        weak.update(cx, |this, cx| this.on_act(act, message, window, cx)).ok();
+      })
+    };
+    let on_tools = Rc::new(Cell::new(false));
+    let parts = ListParts {
+      images: images.clone(),
+      core: core.clone(),
+      actor: actor.clone(),
+      open_person: open_person.clone(),
+      on_tools: on_tools.clone(),
+      me_avatar: me_avatar.clone(),
+    };
+    let threads = group.kind == GroupKind::Space;
+    let main = cx.new(|cx| MessageList::new(rows, parts, Some(opener), threads, cx));
     {
       let (load, core, id) = (load.clone(), core.clone(), group.id.clone());
-      list.set_scroll_handler(move |event, _, _| {
+      main.read(cx).list.set_scroll_handler(move |event, _, _| {
         if event.visible_range.start == 0 {
           if !load.reached.get() && !load.loading.get() && !load.stalled.get() {
             load.loading.set(true);
@@ -283,32 +498,6 @@ impl ConversationView {
     ];
     composer.update(cx, |state, cx| state.focus(window, cx));
 
-    let expiry = cx.spawn(async move |this, cx| {
-      loop {
-        cx.background_executor().timer(Duration::from_secs(1)).await;
-        if this.update(cx, Self::prune_typing).is_err() {
-          break;
-        }
-      }
-    });
-    let open_person: Opener = {
-      let store = store.clone();
-      Rc::new(move |user_id, window, cx| {
-        store.update(cx, |store, cx| store.open_person(user_id, window, cx)).ok();
-      })
-    };
-    let opener: Opener = {
-      let weak = cx.weak_entity();
-      Rc::new(move |topic, window, cx| {
-        weak.update(cx, |this, cx| this.open_thread(topic, window, cx)).ok();
-      })
-    };
-    let actor: Actor = {
-      let weak = cx.weak_entity();
-      Rc::new(move |act, message, window, cx| {
-        weak.update(cx, |this, cx| this.on_act(act, message, window, cx)).ok();
-      })
-    };
     let mut view = Self {
       store,
       core,
@@ -317,13 +506,10 @@ impl ConversationView {
       me_id,
       me_avatar,
       messages,
-      rows,
-      nick_width: Cell::default(),
+      taken_last: None,
+      main,
       receipts: Arc::default(),
-      readers: Readers::default(),
-      density: cx.global::<Settings>().message_style,
       thread: None,
-      opener,
       open_person,
       actor,
       quoting: None,
@@ -331,18 +517,18 @@ impl ConversationView {
       files: Vec::new(),
       hovered: None,
       in_list: false,
-      on_tools: Rc::new(Cell::new(false)),
+      on_tools,
       refocus: false,
       backdrop_kept: false,
       loaded,
-      list,
       composer,
       load,
       typing_sent: false,
       typing_task: None,
       typing: Vec::new(),
       _subs: subs,
-      _expiry: expiry,
+      _expiry: None,
+      expiring: false,
       _top_check: None,
       focus: None,
       _focus_clear: None,
@@ -359,19 +545,14 @@ impl ConversationView {
       asked_commands: false,
       menu: None,
     };
-    // Rows change height with the message layout: measure the lists again. Picking IRC lists a space's members.
+    // Picking IRC lists a space's members.
     view._subs.push(cx.observe_global::<Settings>(|this, cx| {
-      let density = cx.global::<Settings>().message_style;
-      if density != this.density {
-        this.density = density;
-        this.list.reset(this.rows.len());
-        if let Some(thread) = &this.thread {
-          thread.list.reset(thread.rows.len());
-        }
-      }
       this.want_members(cx);
       cx.notify();
     }));
+    // What the view draws from outside it: the header's and the `@` menu's pictures, and the header's presence dot.
+    view._subs.push(cx.observe(view.images.tick(), |_, _, cx| cx.notify()));
+    view._subs.push(cx.observe_global::<crate::ui::People>(|_, cx| cx.notify()));
     view.want_members(cx);
     view.schedule_top_check(cx);
     view
@@ -382,15 +563,47 @@ impl ConversationView {
   }
 
   pub fn set_group(&mut self, group: Group, cx: &mut Context<Self>) {
+    let threads = group.kind == GroupKind::Space;
     self.group = group;
+    self.main.update(cx, |list, cx| {
+      list.threads = threads;
+      cx.notify();
+    });
     cx.notify();
   }
 
   pub fn set_me(&mut self, me: User, cx: &mut Context<Self>) {
     self.me_avatar = me.avatar_url;
     self.me_id = me.id;
-    self.rebuild(0);
+    let avatar = self.me_avatar.clone();
+    for view in self.lists() {
+      let avatar = avatar.clone();
+      view.update(cx, |list, _| list.parts.me_avatar = avatar);
+    }
+    self.rebuild(0, cx);
     cx.notify();
+  }
+
+  /// The main list, then the thread panel's when a thread is open.
+  fn lists(&self) -> impl Iterator<Item = Entity<MessageList>> + use<> {
+    std::iter::once(self.main.clone()).chain(self.thread.as_ref().map(|thread| thread.view.clone()))
+  }
+
+  /// Hands what the rows show besides their messages (`Marks`) to both lists.
+  fn sync_marks(&self, cx: &mut App) {
+    let marks = Marks {
+      hovered: self.hovered.clone(),
+      focus: self.focus.clone(),
+      find: self
+        .find
+        .as_ref()
+        .filter(|find| !find.query.is_empty())
+        .map(|find| (find.by_message.clone(), find.hits.get(find.index).cloned())),
+    };
+    for view in self.lists() {
+      let marks = marks.clone();
+      view.update(cx, |list, cx| list.set_marks(marks, cx));
+    }
   }
 
   /// Takes who has read the conversation, and whether Google Chat has read receipts on in it: with them off, nobody's
@@ -398,11 +611,18 @@ impl ConversationView {
   /// over the rows rather than in them, so people reading on never measure the lists again.
   pub fn set_readers(&mut self, enabled: bool, receipts: Arc<Vec<ReadReceipt>>, cx: &mut Context<Self>) {
     self.receipts = if enabled { receipts } else { Arc::default() };
-    self.readers = Readers::place(&self.rows, &self.receipts);
-    if let Some(thread) = &mut self.thread {
-      thread.readers = Readers::place(&thread.rows, &self.receipts);
+    for view in self.lists() {
+      let receipts = self.receipts.clone();
+      view.update(cx, |list, cx| list.set_readers(&receipts, cx));
     }
     cx.notify();
+  }
+
+  /// Hands the message list back and leaves an empty one, so the store can change the list without copying it before
+  /// it calls `set_history` with the result. The rows stay as they are until then.
+  pub fn take_messages(&mut self) -> Arc<Vec<Arc<Message>>> {
+    self.taken_last = self.messages.last().cloned().or_else(|| self.taken_last.take());
+    std::mem::take(&mut self.messages)
   }
 
   /// Takes the full message list. Returns true when a message from someone else arrived at the end.
@@ -416,13 +636,16 @@ impl ConversationView {
     window: &mut Window,
     cx: &mut Context<Self>,
   ) -> bool {
-    let incoming = match (messages.last(), self.messages.last()) {
+    // The last message before this list: after `take_messages`, the one it kept.
+    let previous = self.messages.last().cloned().or_else(|| self.taken_last.take());
+    self.taken_last = None;
+    let incoming = match (messages.last(), previous) {
       (Some(new), Some(old)) => reached_end && new.id != old.id && !new.pending && new.sender_id != self.me_id,
       _ => false,
     };
     self.messages = messages;
     self.loaded = true;
-    self.rebuild(prepended);
+    self.rebuild(prepended, cx);
 
     if self.load.loading.get() {
       self.load.stalled.set(prepended == 0 && !reached_start);
@@ -435,7 +658,7 @@ impl ConversationView {
       self.focus_message(id, window, cx);
     } else if reached_end && self.to_latest {
       self.to_latest = false;
-      self.list.scroll_to_end();
+      scroll_list(&self.main, None, cx);
     }
     if self.find.is_some() {
       self.refresh_find(window, cx);
@@ -455,14 +678,16 @@ impl ConversationView {
     } else {
       id.clone()
     };
-    if let Some(ix) = self.rows.iter().position(|row| row.msg.id == top_level) {
+    let ix = self.main.read(cx).rows.iter().position(|row| row.msg.id == top_level);
+    if let Some(ix) = ix {
       // The hit's own row: one row above can be a tall image that pushes the hit below the fold.
-      self.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(0.) });
+      scroll_list(&self.main, Some(ListOffset { item_ix: ix, offset_in_item: px(0.) }), cx);
     }
     if message.is_thread_reply() {
       self.open_thread(&top_level, window, cx);
     }
     self.focus = Some(id);
+    self.sync_marks(cx);
     if self.find.is_some() {
       self._focus_clear = None;
       return;
@@ -471,6 +696,7 @@ impl ConversationView {
       cx.background_executor().timer(Duration::from_secs(3)).await;
       let _ = this.update(cx, |this, cx| {
         this.focus = None;
+        this.sync_marks(cx);
         cx.notify();
       });
     }));
@@ -502,6 +728,7 @@ impl ConversationView {
       input,
       query: String::new(),
       hits: Vec::new(),
+      by_message: Rc::default(),
       index: 0,
       _sub: sub,
     });
@@ -514,6 +741,7 @@ impl ConversationView {
     }
     self.focus = None;
     self._focus_clear = None;
+    self.sync_marks(cx);
     self.composer.update(cx, |state, cx| state.focus(window, cx));
     cx.notify();
     true
@@ -527,6 +755,7 @@ impl ConversationView {
     find.index = (find.index + 1) % find.hits.len();
     let id = find.hits[find.index].0.clone();
     self.focus_message(id, window, cx);
+    self.sync_marks(cx);
     cx.notify();
   }
 
@@ -542,6 +771,7 @@ impl ConversationView {
     };
     let id = find.hits[find.index].0.clone();
     self.focus_message(id, window, cx);
+    self.sync_marks(cx);
     cx.notify();
   }
 
@@ -567,8 +797,13 @@ impl ConversationView {
       .and_then(|(id, range)| hits.iter().position(|hit| hit.0 == id && hit.1 == range))
       .unwrap_or(0);
     let jump = hits.get(index).map(|(id, _)| id.clone());
+    let mut by_message: HashMap<String, Vec<Range<usize>>> = HashMap::new();
+    for (id, range) in &hits {
+      by_message.entry(id.clone()).or_default().push(range.clone());
+    }
     if let Some(find) = &mut self.find {
       find.hits = hits;
+      find.by_message = Rc::new(by_message);
       find.index = index;
     }
     if let Some(id) = jump {
@@ -578,6 +813,7 @@ impl ConversationView {
     } else {
       self.focus = None;
     }
+    self.sync_marks(cx);
     cx.notify();
   }
 
@@ -674,42 +910,54 @@ impl ConversationView {
   }
 
   /// Rebuilds the main list rows and the thread panel rows from the current messages.
-  fn rebuild(&mut self, prepended: usize) {
+  fn rebuild(&mut self, prepended: usize, cx: &mut Context<Self>) {
     let rows = message::build_rows(&self.messages, &self.me_id);
-    apply_rows(&self.list, &mut self.rows, rows, prepended);
-    self.load.rows.set(self.rows.len());
-    self.readers = Readers::place(&self.rows, &self.receipts);
-    let Some(thread) = &mut self.thread else {
+    self.load.rows.set(rows.len());
+    let receipts = self.receipts.clone();
+    self.main.update(cx, |list, cx| list.set_rows(rows, prepended, &receipts, cx));
+    let Some(thread) = &self.thread else {
       return;
     };
     if let Some(rows) = message::build_thread_rows(&self.messages, &thread.topic, &self.me_id) {
-      apply_rows(&thread.list, &mut thread.rows, rows, 0);
-      thread.readers = Readers::place(&thread.rows, &self.receipts);
+      thread.view.update(cx, |list, cx| list.set_rows(rows, 0, &receipts, cx));
     } else {
       // The starting message is gone.
       self.thread = None;
       self.refocus = true;
+      self.set_under_thread(cx);
     }
+  }
+
+  /// Tells the main list whether a thread is open, which under the pop-up hides its toolbar.
+  fn set_under_thread(&self, cx: &mut App) {
+    let open = self.thread.is_some();
+    self.main.update(cx, |list, cx| {
+      if list.under_thread != open {
+        list.under_thread = open;
+        cx.notify();
+      }
+    });
   }
 
   /// After a layout pass: when the whole history fits or the list sits at the top, ask for older messages.
   fn schedule_top_check(&mut self, cx: &mut Context<Self>) {
     self._top_check = Some(cx.spawn(async move |this, cx| {
       cx.background_executor().timer(Duration::from_millis(150)).await;
-      let _ = this.update(cx, |this, _| this.check_top());
+      let _ = this.update(cx, |this, cx| this.check_top(cx));
     }));
   }
 
-  fn check_top(&mut self) {
+  fn check_top(&self, cx: &App) {
     let load = &self.load;
     if load.reached.get() || load.loading.get() || load.stalled.get() {
       return;
     }
-    if self.list.viewport_bounds().size.height <= px(0.) {
+    let list = &self.main.read(cx).list;
+    if list.viewport_bounds().size.height <= px(0.) {
       return;
     }
-    let top = self.list.logical_scroll_top();
-    let fits = self.list.max_offset_for_scrollbar().y <= px(0.);
+    let top = list.logical_scroll_top();
+    let fits = list.max_offset_for_scrollbar().y <= px(0.);
     let at_top = top.item_ix == 0 && top.offset_in_item <= px(1.);
     if fits || at_top {
       load.loading.set(true);
@@ -724,15 +972,30 @@ impl ConversationView {
     if typing {
       self.typing.push((user_id, name, Instant::now()));
     }
+    // Who went quiet without saying so is dropped each second, while anyone is typing.
+    if !self.typing.is_empty() && !self.expiring {
+      self.expiring = true;
+      self._expiry = Some(cx.spawn(async move |this, cx| {
+        loop {
+          cx.background_executor().timer(Duration::from_secs(1)).await;
+          if !matches!(this.update(cx, Self::prune_typing), Ok(true)) {
+            break;
+          }
+        }
+      }));
+    }
     cx.notify();
   }
 
-  fn prune_typing(&mut self, cx: &mut Context<Self>) {
+  /// Drops who stopped typing a while ago. Returns whether anyone is still typing; when nobody is, the timer stops.
+  fn prune_typing(&mut self, cx: &mut Context<Self>) -> bool {
     let before = self.typing.len();
     self.typing.retain(|(_, _, at)| at.elapsed() < TYPING_EXPIRY);
     if self.typing.len() != before {
       cx.notify();
     }
+    self.expiring = !self.typing.is_empty();
+    self.expiring
   }
 
   fn on_typed(&mut self, cx: &mut Context<Self>) {
@@ -789,10 +1052,10 @@ impl ConversationView {
         topic_id: None,
         text,
         quote,
-        files,
+        files: release(files, window, cx),
         chips,
       });
-      self.list.scroll_to_end();
+      scroll_list(&self.main, None, cx);
     }
     self.stop_typing();
     self.composer.update(cx, |state, cx| state.set_value("", window, cx));
@@ -811,7 +1074,7 @@ impl ConversationView {
   fn pointer_left(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     cx.defer_in(window, |this, _, cx| {
       if !this.in_list && !this.on_tools.get() && this.hovered.take().is_some() {
-        cx.notify();
+        this.sync_marks(cx);
       }
     });
   }
@@ -822,7 +1085,7 @@ impl ConversationView {
       Act::Hover => {
         if self.hovered.as_deref() != Some(message.id.as_str()) {
           self.hovered = Some(message.id.clone());
-          cx.notify();
+          self.sync_marks(cx);
         }
         return;
       },
@@ -937,8 +1200,20 @@ impl ConversationView {
     let Some(rows) = message::build_thread_rows(&self.messages, topic, &self.me_id) else {
       return;
     };
-    let readers = Readers::place(&rows, &self.receipts);
-    let list = ListState::new(rows.len(), ListAlignment::Bottom, px(600.));
+    let parts = ListParts {
+      images: self.images.clone(),
+      core: self.core.clone(),
+      actor: self.actor.clone(),
+      open_person: self.open_person.clone(),
+      on_tools: self.on_tools.clone(),
+      me_avatar: self.me_avatar.clone(),
+    };
+    let receipts = self.receipts.clone();
+    let view = cx.new(|cx| {
+      let mut list = MessageList::new(rows, parts, None, false, cx);
+      list.readers = Readers::place(&list.rows, &receipts);
+      list
+    });
     let composer = cx.new(|cx| {
       TextareaState::new(window, cx)
         .auto_grow(1, 8)
@@ -953,22 +1228,23 @@ impl ConversationView {
     composer.update(cx, |state, cx| state.focus(window, cx));
     self.thread = Some(Thread {
       topic: topic.to_string(),
-      rows,
-      nick_width: Cell::default(),
-      readers,
-      list,
+      view,
       composer,
       files: Vec::new(),
       _sub: sub,
     });
+    self.set_under_thread(cx);
+    self.sync_marks(cx);
     cx.notify();
   }
 
   /// Closes the thread panel. Returns false when none was open.
   pub fn close_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-    if self.thread.take().is_none() {
+    let Some(thread) = self.thread.take() else {
       return false;
-    }
+    };
+    release(thread.files, window, cx);
+    self.set_under_thread(cx);
     self.editing.take_if(|editing| editing.in_thread);
     self.composer.update(cx, |state, cx| state.focus(window, cx));
     cx.notify();
@@ -979,11 +1255,6 @@ impl ConversationView {
   /// Returns false when no pop-up was open.
   pub fn close_thread_popup(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
     cx.global::<Settings>().thread_view == ThreadView::Modal && self.close_thread(window, cx)
-  }
-
-  /// A thread is open as a pop-up over the window.
-  fn popup_open(&self, cx: &App) -> bool {
-    self.thread.is_some() && cx.global::<Settings>().thread_view == ThreadView::Modal
   }
 
   fn send_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1012,10 +1283,10 @@ impl ConversationView {
         topic_id: Some(thread.topic.clone()),
         text,
         quote: None,
-        files,
+        files: release(files, window, cx),
         chips,
       });
-      thread.list.scroll_to_end();
+      scroll_list(&thread.view, None, cx);
     }
     thread.composer.update(cx, |state, cx| state.set_value("", window, cx));
     cx.notify();
@@ -1030,14 +1301,50 @@ impl ConversationView {
       (_, false) => (&mut self.files, &self.composer),
       (None, true) => return,
     };
+    let mut pictures = Vec::new();
     for path in paths {
       // A folder cannot be sent.
-      if path.is_file() && !files.contains(path) {
-        files.push(path.clone());
+      if path.is_file() && !files.iter().any(|file| file.path == *path) {
+        let image = is_image(path);
+        if image {
+          pictures.push(path.clone());
+        }
+        files.push(Attached { path: path.clone(), image, thumb: None });
       }
     }
     composer.update(cx, |state, cx| state.focus(window, cx));
+    for path in pictures {
+      Self::load_thumb(in_thread, path, cx);
+    }
     cx.notify();
+  }
+
+  /// Decodes a small picture of an attached image off the UI thread, for its chip.
+  fn load_thumb(in_thread: bool, path: PathBuf, cx: &mut Context<Self>) {
+    let read = path.clone();
+    let decoding = cx
+      .background_executor()
+      .spawn(async move { std::fs::read(&read).ok().and_then(|bytes| images::decode(&bytes, CHIP_THUMB)) });
+    cx.spawn(async move |this, cx| {
+      let Some(thumb) = decoding.await else {
+        return;
+      };
+      this
+        .update(cx, |this, cx| {
+          let files = match (&mut this.thread, in_thread) {
+            (Some(thread), true) => &mut thread.files,
+            (_, false) => &mut this.files,
+            (None, true) => return,
+          };
+          // Still attached: the file may have been taken off or sent meanwhile.
+          if let Some(file) = files.iter_mut().find(|file| file.path == path && file.thumb.is_none()) {
+            file.thumb = Some(thumb);
+            cx.notify();
+          }
+        })
+        .ok();
+    })
+    .detach();
   }
 
   /// Which composer has the keyboard: `Some(true)` the thread's, `Some(false)` the main one, `None` neither.
@@ -1072,14 +1379,14 @@ impl ConversationView {
     self.attach(in_thread, &paths, window, cx);
   }
 
-  fn detach(&mut self, in_thread: bool, ix: usize, cx: &mut Context<Self>) {
+  fn detach(&mut self, in_thread: bool, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
     let files = match (&mut self.thread, in_thread) {
       (Some(thread), true) => &mut thread.files,
       (_, false) => &mut self.files,
       (None, true) => return,
     };
     if ix < files.len() {
-      files.remove(ix);
+      release(vec![files.remove(ix)], window, cx);
     }
     cx.notify();
   }
@@ -1112,16 +1419,21 @@ impl ConversationView {
     if files.is_empty() {
       return None;
     }
-    let chips = files.iter().enumerate().map(|(ix, path)| {
-      let name = path.file_name().map_or_default(|name| name.to_string_lossy().into_owned());
-      let glyph = if is_image(path) {
-        // The backdrop is for pictures with see-through parts.
-        img(path.clone())
+    let chips = files.iter().enumerate().map(|(ix, file)| {
+      let name = file.path.file_name().map_or_default(|name| name.to_string_lossy().into_owned());
+      let glyph = if file.image {
+        // The backdrop is for pictures with see-through parts, and stands in until the picture is decoded.
+        div()
           .size(px(28.))
           .flex_shrink_0()
           .rounded(px(6.))
           .bg(rgb(PLACEHOLDER))
-          .object_fit(ObjectFit::Cover)
+          .children(
+            file
+              .thumb
+              .clone()
+              .map(|thumb| img(thumb).size_full().rounded(px(6.)).object_fit(ObjectFit::Cover)),
+          )
           .into_any_element()
       } else {
         icon(Icon::File, 16., MUTED).into_any_element()
@@ -1149,7 +1461,7 @@ impl ConversationView {
             .rounded_full()
             .cursor_pointer()
             .hover(|s| s.bg(rgb(ROW_HOVER)))
-            .on_click(cx.listener(move |this, _, _, cx| this.detach(in_thread, ix, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| this.detach(in_thread, ix, window, cx)))
             .child(icon(Icon::X, 13., MUTED)),
         )
     });
@@ -1462,10 +1774,11 @@ impl ConversationView {
 
   /// Members and commands of this conversation arrived: show them if a menu is waiting on them.
   pub fn set_members(&mut self, users: Arc<Vec<User>>, cx: &mut Context<Self>) {
-    let mut nicks = users.as_ref().clone();
-    nicks.sort_by_cached_key(|user| user.name.to_lowercase());
-    self.nicks = nicks;
-    self.members = Some(users);
+    let members: Vec<Member> = users.iter().cloned().map(Member::new).collect();
+    let mut nicks: Vec<&Member> = members.iter().collect();
+    nicks.sort_by(|a, b| a.key().cmp(b.key()));
+    self.nicks = nicks.into_iter().map(|member| member.user.clone()).collect();
+    self.members = Some(members);
     self.refresh_menus(cx);
     cx.notify();
   }
@@ -1516,7 +1829,7 @@ impl ConversationView {
       },
       _ => {},
     }
-    let members = self.members.as_deref().map_or(&[][..], Vec::as_slice);
+    let members = self.members.as_deref().unwrap_or_default();
     let commands = self.commands.as_deref().map_or(&[][..], Vec::as_slice);
     let all = self.group.kind == GroupKind::Space;
     let items = completion::items(trigger, &query, members, all, commands);
@@ -1614,76 +1927,6 @@ impl ConversationView {
     }
   }
 
-  fn find_for(&self, id: &str) -> (Option<&str>, Option<Range<usize>>) {
-    let Some(find) = &self.find else {
-      return (None, None);
-    };
-    let query = (!find.query.is_empty()).then_some(find.query.as_str());
-    let hit = find
-      .hits
-      .get(find.index)
-      .and_then(|(hit_id, range)| (hit_id == id).then(|| range.clone()));
-    (query, hit)
-  }
-
-  fn render_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-    let Some(id) = self.rows.get(ix).map(|row| row.msg.id.clone()) else {
-      return div().into_any_element();
-    };
-    let (find, find_hit) = self.find_for(&id);
-    let Some(row) = self.rows.get(ix) else {
-      return div().into_any_element();
-    };
-    let ctx = MsgCtx {
-      images: &self.images,
-      core: &self.core,
-      me_avatar: self.me_avatar.as_deref(),
-      open_thread: Some(&self.opener),
-      focus: self.focus.as_deref(),
-      find,
-      find_hit,
-      act: &self.actor,
-      open_person: &self.open_person,
-      threads: self.group.kind == GroupKind::Space,
-      // Under the thread pop-up the list shows no toolbar: the pop-up's own row has the same message.
-      hovered: self.hovered.as_deref().filter(|_| !self.popup_open(cx)),
-      on_tools: &self.on_tools,
-      readers: self.readers.of(&id),
-      nick_width: message::irc_nick_width(&self.rows, &self.nick_width),
-    };
-    message::render_row(row, &ctx, cx)
-  }
-
-  fn render_thread_row(&mut self, ix: usize, cx: &mut Context<Self>) -> AnyElement {
-    let Some(id) = self.thread.as_ref().and_then(|t| t.rows.get(ix).map(|row| row.msg.id.clone())) else {
-      return div().into_any_element();
-    };
-    let (find, find_hit) = self.find_for(&id);
-    let Some(row) = self.thread.as_ref().and_then(|t| t.rows.get(ix)) else {
-      return div().into_any_element();
-    };
-    let ctx = MsgCtx {
-      images: &self.images,
-      core: &self.core,
-      me_avatar: self.me_avatar.as_deref(),
-      open_thread: None,
-      focus: self.focus.as_deref(),
-      find,
-      find_hit,
-      act: &self.actor,
-      open_person: &self.open_person,
-      threads: false,
-      hovered: self.hovered.as_deref(),
-      on_tools: &self.on_tools,
-      readers: self.thread.as_ref().map_or(&[][..], |thread| thread.readers.of(&id)),
-      nick_width: self
-        .thread
-        .as_ref()
-        .map_or(0., |thread| message::irc_nick_width(&thread.rows, &thread.nick_width)),
-    };
-    message::render_row(row, &ctx, cx)
-  }
-
   /// The thread's header, rows and composer: the side panel and the pop-up show the same ones.
   fn render_thread_panel(&self, cx: &mut Context<Self>) -> Option<Stateful<Div>> {
     let thread = self.thread.as_ref()?;
@@ -1723,13 +1966,7 @@ impl ConversationView {
       .flex_1()
       .min_h_0()
       .w_full()
-      .child(
-        list(
-          thread.list.clone(),
-          cx.processor(|this, ix: usize, _, cx| this.render_thread_row(ix, cx)),
-        )
-        .size_full(),
-      );
+      .child(thread.view.clone().cached(StyleRefinement::default().size_full()));
     let composer = v_flex()
       .w_full()
       .flex_shrink_0()
@@ -1871,7 +2108,7 @@ impl ConversationView {
   /// Creates a Google Meet meeting and posts its link here.
   fn start_meet(&mut self, cx: &mut Context<Self>) {
     self.core.send(Command::StartMeet(self.group.id.clone()));
-    self.list.scroll_to_end();
+    scroll_list(&self.main, None, cx);
     cx.notify();
   }
 
@@ -2034,7 +2271,7 @@ impl Render for ConversationView {
       self.header(cx)
     };
 
-    let body = if self.rows.is_empty() {
+    let body = if self.main.read(cx).rows.is_empty() {
       div()
         .flex_1()
         .flex()
@@ -2054,13 +2291,7 @@ impl Render for ConversationView {
         .flex_1()
         .min_h_0()
         .w_full()
-        .child(
-          list(
-            self.list.clone(),
-            cx.processor(|this, ix: usize, _, cx| this.render_row(ix, cx)),
-          )
-          .size_full(),
-        )
+        .child(self.main.clone().cached(StyleRefinement::default().size_full()))
         .into_any_element()
     };
 
@@ -2178,32 +2409,17 @@ fn save_pasted(picture: &Image) -> Option<PathBuf> {
   Some(path)
 }
 
-/// Replaces `old` with `new`, telling the list only about the changed middle so heights and scroll stay put.
-fn apply_rows(list: &ListState, old: &mut Vec<Row>, new: Vec<Row>, prepended: usize) {
-  let (old_len, new_len) = (old.len(), new.len());
-  let mut prefix = 0;
-  while prefix < old_len.min(new_len) && old[prefix].same(&new[prefix]) {
-    prefix += 1;
-  }
-  let mut suffix = 0;
-  while suffix < old_len - prefix
-    && suffix < new_len - prefix
-    && old[old_len - 1 - suffix].same(&new[new_len - 1 - suffix])
-  {
-    suffix += 1;
-  }
-  let top = list.logical_scroll_top();
-  let anchored = top.item_ix < old_len;
-  if prefix != old_len || prefix != new_len {
-    list.splice(prefix..old_len - suffix, new_len - prefix - suffix);
-  }
-  *old = new;
-  if prepended > 0 && anchored && new_len > old_len {
-    list.scroll_to(ListOffset {
-      item_ix: top.item_ix + (new_len - old_len),
-      offset_in_item: top.offset_in_item,
-    });
-  }
+/// The paths of `files`, whose small pictures leave the windows' sprite atlases (`window` is the one being updated).
+fn release(files: Vec<Attached>, window: &mut Window, cx: &mut App) -> Vec<PathBuf> {
+  files
+    .into_iter()
+    .map(|file| {
+      if let Some(thumb) = file.thumb {
+        cx.drop_image(thumb, Some(&mut *window));
+      }
+      file.path
+    })
+    .collect()
 }
 
 #[cfg(test)]

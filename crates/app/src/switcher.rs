@@ -125,7 +125,7 @@ impl Render for Switcher {
               .text_size(px(14.))
               .text_color(rgb(TEXT))
               .when(conv.g.unread, |d| d.font_weight(FontWeight::SEMIBOLD))
-              .child(conv.g.name.clone()),
+              .child(conv.name.clone()),
           ),
       );
     }

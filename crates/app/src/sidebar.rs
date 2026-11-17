@@ -23,16 +23,26 @@ use crate::ui::{Icon, group_avatar, icon};
 
 const ROW_HEIGHT: f32 = 30.0;
 
+/// The Google Chat layout's column. The window root draws it as a cached view, so it redraws itself whenever what it
+/// draws changes: the store, the settings, or an image arriving.
 pub struct Sidebar {
   store: Entity<Store>,
   scroll: UniformListScrollHandle,
+  _subs: [Subscription; 3],
 }
 
 impl Sidebar {
-  pub fn new(store: Entity<Store>) -> Self {
+  pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
+    let tick = store.read(cx).images.tick().clone();
+    let subs = [
+      cx.observe(&store, |_, _, cx| cx.notify()),
+      cx.observe_global::<Settings>(|_, cx| cx.notify()),
+      cx.observe(&tick, |_, _, cx| cx.notify()),
+    ];
     Self {
       store,
       scroll: UniformListScrollHandle::new(),
+      _subs: subs,
     }
   }
 
@@ -208,7 +218,12 @@ impl Sidebar {
                 })
                 .on_mouse_down(MouseButton::Right, right_click)
                 .child(group_avatar(&store.images, cx, &conv.g, 20.))
-                .child(div().flex_1().min_w_0().child(label(&conv.g.name, conv.g.unread).truncate()))
+                .child(
+                  div()
+                    .flex_1()
+                    .min_w_0()
+                    .child(label(conv.name.clone(), conv.g.unread).truncate()),
+                )
                 .children(key_hint(&Place::Conversation(conv.g.id.clone()), cx))
                 .when(conv.g.pinned, |d| d.child(icon(Icon::Pin, 12., MUTED)))
                 .when(conv.g.unread && !conv.g.pinned, |d| {
@@ -264,12 +279,12 @@ fn item_frame(selected: bool) -> Stateful<Div> {
 
 /// A sidebar name: bright and bold when unread, dimmer otherwise, so unread rows stand out. Selection only
 /// changes the row's background.
-fn label(text: &str, bold: bool) -> Div {
+fn label(text: impl Into<SharedString>, bold: bool) -> Div {
   div()
     .text_size(px(13.))
     .text_color(rgb(if bold { TEXT_STRONG } else { TEXT_DIM }))
     .when(bold, |d| d.font_weight(FontWeight::SEMIBOLD))
-    .child(text.to_string())
+    .child(text.into())
 }
 
 /// The number key that opens a row's place, dim at the row's right edge, while it has one.

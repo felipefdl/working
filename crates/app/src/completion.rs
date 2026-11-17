@@ -86,22 +86,49 @@ pub fn find(text: &str, cursor: usize, tokens: &[InlineTokenSpan]) -> Option<(Tr
     .then_some((Trigger::Mention, at..cursor))
 }
 
+/// A member `@` can offer, with the name and email lowercased once for matching.
+pub struct Member {
+  pub user: User,
+  name: String,
+  email: String,
+}
+
+impl Member {
+  pub fn new(user: User) -> Self {
+    Self {
+      name: user.name.to_lowercase(),
+      email: user.email.to_lowercase(),
+      user,
+    }
+  }
+
+  /// The name, lowercased.
+  pub fn key(&self) -> &str {
+    &self.name
+  }
+}
+
 /// The rows for `query` (the text after the trigger). `all` offers @all, which only spaces have.
-pub fn items(trigger: Trigger, query: &str, members: &[User], all: bool, commands: &[SlashCommand]) -> Vec<Item> {
+pub fn items(trigger: Trigger, query: &str, members: &[Member], all: bool, commands: &[SlashCommand]) -> Vec<Item> {
   let query = query.to_lowercase();
   let mut items: Vec<Item> = match trigger {
     Trigger::Mention => {
-      let matches = |user: &User| {
-        let name = user.name.to_lowercase();
-        name.starts_with(&query)
-          || name.split_whitespace().any(|word| word.starts_with(&query))
-          || user.email.to_lowercase().starts_with(&query)
+      let matches = |member: &Member| {
+        member.name.starts_with(&query)
+          || member.name.split_whitespace().any(|word| word.starts_with(&query))
+          || member.email.starts_with(&query)
       };
       let everyone = all && ["all", "everyone"].iter().any(|word| word.starts_with(&query));
       everyone
         .then_some(Item::All)
         .into_iter()
-        .chain(members.iter().filter(|user| matches(user)).cloned().map(Item::Person))
+        .chain(
+          members
+            .iter()
+            .filter(|member| matches(member))
+            .map(|member| Item::Person(member.user.clone())),
+        )
+        .take(MAX_ITEMS)
         .collect()
     },
     Trigger::Command => commands
@@ -246,7 +273,7 @@ mod tests {
   use gchat_core::{Chip, ChipKind, SlashCommand, User};
   use gpui_kit::component::input::{InlineToken, InputContent};
 
-  use super::{Item, Trigger, find, items, message, reattach};
+  use super::{Item, Member, Trigger, find, items, message, reattach};
 
   fn user(id: &str, name: &str, email: &str) -> User {
     User {
@@ -299,8 +326,8 @@ mod tests {
   #[test]
   fn mention_rows_match_name_words_and_email() {
     let members = [
-      user("1", "Jordan Park", "jpark@example.com"),
-      user("2", "Riley Brooks", "riley@example.com"),
+      Member::new(user("1", "Jordan Park", "jpark@example.com")),
+      Member::new(user("2", "Riley Brooks", "riley@example.com")),
     ];
     let names = |query: &str, all: bool| -> Vec<String> {
       items(Trigger::Mention, query, &members, all, &[])

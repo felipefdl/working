@@ -6,7 +6,7 @@ use std::sync::Arc;
 use gchat_core::fuzzy::Fuzzy;
 use gchat_core::{
   AttachmentKind, Calendar, CalendarEvent, Command, Connection, Core, Event, Group, GroupId, GroupKind, Message,
-  Micros, Notify, Placement, ReadReceipt, SearchHit, Shortcut, SpanKind, User,
+  Micros, Notify, Placement, ReadReceipt, SearchHit, Shortcut, Snippet, SpanKind, User,
 };
 use gpui_kit::*;
 
@@ -83,10 +83,38 @@ impl Section {
   }
 }
 
-/// A group with its lowercase name precomputed for filtering.
+/// A group with what its rows draw worked out once: the lowercase name for filtering, the sidebar section, the name,
+/// and the preview line.
 pub struct Conv {
   pub g: Group,
   pub lower: String,
+  /// Where the sidebar lists it: `Section::of(&g)`.
+  pub section: Section,
+  /// `g.name`, shared by every row that draws it.
+  pub name: SharedString,
+  /// The last message on one line, led by "You" or its sender's name. Empty without one.
+  pub preview: SharedString,
+}
+
+/// The people the user can start a chat with, name order. Each is shared, so lists of them hold references.
+#[derive(Default)]
+pub struct Directory(Vec<Arc<User>>);
+
+impl Directory {
+  /// Every person, in order.
+  pub fn iter(&self) -> impl Iterator<Item = &User> {
+    self.0.iter().map(AsRef::as_ref)
+  }
+
+  /// Every person, in order, as handles a list can keep.
+  pub fn shared(&self) -> impl Iterator<Item = &Arc<User>> {
+    self.0.iter()
+  }
+
+  /// How many people there are.
+  pub const fn count(&self) -> usize {
+    self.0.len()
+  }
 }
 
 #[derive(Clone)]
@@ -402,15 +430,17 @@ pub struct Store {
   /// take.
   pub all: Vec<Arc<Conv>>,
   /// What Home shows: `all` narrowed by the Unread toggle; while there is search text, `every` narrowed by the toggle
-  /// and ranked by the text, best match first.
+  /// and ranked by the text, best match first. Empty in the layouts with a list beside the conversation, where Home
+  /// shows none.
   pub home: Vec<Arc<Conv>>,
   /// What the Messages, Rail, and IRC list shows: `all` narrowed by `pane` and the Unread toggle, pinned first, with
   /// the conversations older than `list_window` behind a row at the end; while there is search text, `every` narrowed
-  /// by those and the text instead, nothing held back.
+  /// by those and the text instead, nothing held back. Empty in the Google Chat layout.
   pub list: Listing,
   pub pane: Pane,
   /// Every Rail entry: All, Mentions, Starred, the user's own sections, each kind the account has, then Meetings.
   pub tabs: Vec<Tab>,
+  /// The Google Chat layout's sidebar. Built only while that layout is on.
   pub sidebar: Vec<SidebarItem>,
   pub view: View,
   /// Views left by navigating, newest last: what Back returns to.
@@ -429,9 +459,9 @@ pub struct Store {
   /// Copies of `Settings::list_sort`, `Settings::section_sort`, and the `show_*` switches of the Mentions, Starred,
   /// Calendar, and Meet buttons, taken by `sync_settings`.
   pub list_sort: Sort,
-  /// The layout is IRC, whose list keeps each kind of conversation together (`Kind::buffer_rank`). Taken by
-  /// `sync_settings` too.
-  by_kind: bool,
+  /// A copy of `Settings::layout`, taken by `sync_settings` too: it says which of `sidebar`, `home`, and `list` are on
+  /// screen, so only those are built, and IRC's list keeps each kind of conversation together (`Kind::buffer_rank`).
+  layout: Layout,
   /// A copy of `Settings::list_window`, taken by `sync_settings`.
   list_window: ListWindow,
   section_sort: std::collections::BTreeMap<String, Sort>,
@@ -449,10 +479,12 @@ pub struct Store {
   pub recent: Vec<GroupId>,
   /// Unread conversations shown on the Dock icon.
   badge: usize,
+  /// `notified` changed since `badge` was counted.
+  badge_dirty: bool,
   /// Notifications still showing, by conversation: taken down when the conversation is read.
   notified: HashMap<GroupId, Vec<String>>,
   /// People the user can start a chat with, name order.
-  pub people: Vec<User>,
+  pub people: Directory,
   pub calendar: CalendarData,
   pub meet: MeetData,
 }
@@ -490,7 +522,7 @@ impl Store {
       shortcut: None,
       unread_only: false,
       list_sort: Sort::default(),
-      by_kind: false,
+      layout: Layout::default(),
       list_window: ListWindow::default(),
       section_sort: std::collections::BTreeMap::new(),
       show_mentions: true,
@@ -504,8 +536,9 @@ impl Store {
       receipts: None,
       recent: Vec::new(),
       badge: 0,
+      badge_dirty: false,
       notified: HashMap::new(),
-      people: Vec::new(),
+      people: Directory::default(),
       calendar: CalendarData::default(),
       meet: MeetData::default(),
     }
@@ -529,16 +562,27 @@ impl Store {
 
   // Events.
 
-  /// Applies a drained batch of core events, then notifies once.
+  /// Applies a drained batch of core events, then notifies once when the batch changed what the store's readers draw.
+  /// Events for the open conversation alone go to its view, which redraws itself.
   pub fn apply(&mut self, events: Vec<Event>, window: &mut Window, cx: &mut Context<Self>) {
     let mut groups_dirty = false;
+    let mut changed = false;
     for event in events {
       match event {
         Event::Me(user) => {
+          // The previews say "You" for the signed-in user's own messages.
+          if self.me.as_ref().is_none_or(|me| me.id != user.id) {
+            let me = user.id.as_str();
+            for held in self.groups.values_mut() {
+              *held = Arc::new(conv(held.g.clone(), me));
+            }
+            groups_dirty = true;
+          }
           self.me = Some(user.clone());
           if let Some(conv) = &self.conv {
             conv.update(cx, |conv, cx| conv.set_me(user, cx));
           }
+          changed = true;
         },
         Event::Connection(connection) => {
           self.signed_out = None;
@@ -547,9 +591,19 @@ impl Store {
             self.core.send(Command::LoadDnd);
           }
           self.connection = connection;
+          changed = true;
         },
         Event::World(list) => {
-          self.groups = list.iter().map(|g| (g.id.clone(), Arc::new(conv(g.clone())))).collect();
+          // A conversation that did not change keeps its `Conv`.
+          let me = self.me.as_ref().map_or("", |u| u.id.as_str());
+          let mut before = std::mem::take(&mut self.groups);
+          self.groups = list
+            .iter()
+            .map(|g| {
+              let same = before.remove(&g.id).filter(|kept| kept.g == *g);
+              (g.id.clone(), same.unwrap_or_else(|| Arc::new(conv(g.clone(), me))))
+            })
+            .collect();
           groups_dirty = true;
         },
         Event::GroupUpsert(group) => {
@@ -565,7 +619,9 @@ impl Store {
           if was_unread && !group.unread {
             self.clear_notifications(&group.id);
           }
-          self.groups.insert(group.id.clone(), Arc::new(conv(group)));
+          let id = group.id.clone();
+          let upserted = Arc::new(conv(group, self.me.as_ref().map_or("", |u| u.id.as_str())));
+          self.groups.insert(id, upserted);
           groups_dirty = true;
         },
         Event::History {
@@ -613,6 +669,7 @@ impl Store {
             && search.query == query
           {
             search.hits = Some(hits);
+            changed = true;
           }
         },
         Event::Shortcut { shortcut, hits, appended, cursor } => {
@@ -625,10 +682,11 @@ impl Store {
             }
             list.cursor = cursor;
             list.loading_more = false;
+            changed = true;
           }
         },
         Event::MessageUpsert { message, replaces, incoming } => {
-          self.call_posted(&message);
+          changed |= self.call_posted(&message);
           if incoming {
             self.notify_incoming(&message, window, cx);
           }
@@ -636,12 +694,15 @@ impl Store {
         },
         Event::MessageDeleted { group, id } => {
           if let Some(history) = self.histories.get_mut(&group) {
-            let list = Arc::make_mut(&mut history.messages);
-            list.retain(|m| m.id != id);
+            // As in `upsert_message`: the open view hands its list back so the removal does not copy it.
+            let open = matches!(&self.view, View::Conversation(open) if *open == group);
+            let view = self.conv.as_ref().filter(|_| open);
+            if let Some(view) = view {
+              drop(view.update(cx, |view, _| view.take_messages()));
+            }
+            Arc::make_mut(&mut history.messages).retain(|m| m.id != id);
             let snapshot = history.clone();
-            if self.is_open(&group)
-              && let Some(view) = &self.conv
-            {
+            if let Some(view) = view {
               view.update(cx, |view, cx| {
                 view.set_history(
                   snapshot.messages,
@@ -669,6 +730,7 @@ impl Store {
           // What was asked for before is not answered now.
           self.meet.creating = None;
           self.meet.calling = None;
+          changed = true;
         },
         // The call button posts the link. Auto-open then joins it (built-in window or browser).
         Event::MeetStarted(url) => {
@@ -676,12 +738,14 @@ impl Store {
           if cx.global::<crate::settings::Settings>().meet_auto_open {
             crate::call::open(&url, cx);
           }
+          changed = true;
         },
+        // Their readers observe these globals.
         Event::Mcp(status) => cx.set_global(crate::settings::McpState(status)),
         Event::Dnd(schedules) => cx.set_global(crate::status::DndState(Some(schedules))),
         Event::Mine(status) => {
           cx.set_global(crate::status::Mine(status));
-          cx.notify();
+          changed = true;
         },
         Event::Statuses(statuses) => {
           let statuses = crate::ui::People(statuses.into_iter().collect());
@@ -690,7 +754,10 @@ impl Store {
             cx.refresh_windows();
           }
         },
-        Event::People(people) => self.people = people,
+        Event::People(people) => {
+          self.people = Directory(people.into_iter().map(Arc::new).collect());
+          changed = true;
+        },
         Event::Members { group, users } => {
           if self.is_open(&group)
             && let Some(view) = &self.conv
@@ -711,8 +778,12 @@ impl Store {
           } else {
             self.open(id, window, cx);
           }
+          changed = true;
         },
-        Event::Calendars(calendars) => self.calendar.calendars = calendars,
+        Event::Calendars(calendars) => {
+          self.calendar.calendars = calendars;
+          changed = true;
+        },
         Event::CalendarEvents { start, end, events } => {
           // Each view keeps the range it asked for last. An answer for a range neither is on any more is dropped.
           let range = Some((start, end));
@@ -720,33 +791,41 @@ impl Store {
             self.meet.events = events.clone();
             self.meet.loaded = true;
             self.calendar.error = None;
+            changed = true;
           }
           if self.calendar.range == range {
             self.calendar.events = events;
             self.calendar.loaded = true;
             self.calendar.error = None;
+            changed = true;
           }
         },
         Event::CalendarWritten(result) => {
           self.calendar.writing = false;
           self.calendar.written = Some(result);
+          changed = true;
         },
         Event::CalendarFailed(message) => {
           tracing::warn!("calendar: {message}");
           self.calendar.error = Some(message);
+          changed = true;
         },
-        Event::MeetingCreated(result) => match (result, self.meet.creating.take()) {
-          (Ok(url), Some(Creating::Instant)) => crate::call::open(&url, cx),
-          (Ok(url), Some(Creating::ForLater)) => self.meet.made = Some(url),
-          (Err(message), _) => self.meet.error = Some(message),
-          // An answer nobody asked for.
-          (Ok(_), None) => {},
+        Event::MeetingCreated(result) => {
+          match (result, self.meet.creating.take()) {
+            (Ok(url), Some(Creating::Instant)) => crate::call::open(&url, cx),
+            (Ok(url), Some(Creating::ForLater)) => self.meet.made = Some(url),
+            (Err(message), _) => self.meet.error = Some(message),
+            // An answer nobody asked for.
+            (Ok(_), None) => {},
+          }
+          changed = true;
         },
         Event::Error(message) => {
           tracing::warn!("core error: {message}");
           // The call that was being started failed: the Meet view says why.
           if self.meet.calling.take().is_some() {
             self.meet.error = Some(message);
+            changed = true;
           }
         },
       }
@@ -754,9 +833,19 @@ impl Store {
     if groups_dirty {
       self.rebuild();
     }
-    // The Dock number counts what asked for attention: unread conversations set to notify for everything,
-    // and the others only while a notification Working posted for them (a mention) is still unread. Hidden and
-    // blocked conversations are out of the lists, so they are out of it too.
+    if groups_dirty || self.badge_dirty {
+      self.count_badge();
+    }
+    if changed || groups_dirty {
+      cx.notify();
+    }
+  }
+
+  /// Counts the Dock number again: unread conversations set to notify for everything, and the others only while a
+  /// notification Working posted for them (a mention) is still unread. Hidden and blocked conversations are out of
+  /// the lists, so they are out of it too.
+  fn count_badge(&mut self) {
+    self.badge_dirty = false;
     let badge = self
       .all
       .iter()
@@ -771,7 +860,6 @@ impl Store {
       self.badge = badge;
       crate::notify::set_badge(badge);
     }
-    cx.notify();
   }
 
   fn is_open(&self, group: &GroupId) -> bool {
@@ -789,6 +877,7 @@ impl Store {
   fn clear_notifications(&mut self, group: &GroupId) {
     if let Some(ids) = self.notified.remove(group) {
       crate::notify::clear(&ids);
+      self.badge_dirty = true;
     }
   }
 
@@ -827,6 +916,7 @@ impl Store {
     let space = (!direct).then_some(conv.g.name.as_str());
     crate::notify::post(&message.id, &message.group.key(), &message.sender_name, space, &body, sound);
     self.notified.entry(message.group.clone()).or_default().push(message.id.clone());
+    self.badge_dirty = true;
   }
 
   fn upsert_message(
@@ -840,6 +930,13 @@ impl Store {
     let Some(history) = self.histories.get_mut(&group) else {
       return;
     };
+    // The open view hands its list back first, so `make_mut` changes the history's list in place instead of copying
+    // it. `set_history` below always gives the view a list again.
+    let open = matches!(&self.view, View::Conversation(open) if *open == group);
+    let view = self.conv.as_ref().filter(|_| open);
+    if let Some(view) = view {
+      drop(view.update(cx, |view, _| view.take_messages()));
+    }
     let list = Arc::make_mut(&mut history.messages);
     let existing = replaces
       .as_ref()
@@ -860,9 +957,7 @@ impl Store {
       list.insert(at, message.clone());
     }
     let snapshot = history.clone();
-    if self.is_open(&group)
-      && let Some(view) = &self.conv
-    {
+    if let Some(view) = view {
       view.update(cx, |view, cx| {
         view.set_history(
           snapshot.messages,
@@ -892,7 +987,7 @@ impl Store {
     self.rebuild_lists();
   }
 
-  /// Home, the Messages and Rail list, and the Rail tabs.
+  /// Home or the Messages, Rail, and IRC list, whichever the layout shows, and the Rail tabs.
   fn rebuild_lists(&mut self) {
     let query = self.query.trim();
     // Searching finds hidden and blocked conversations too, so they can be opened, unhidden, or unblocked again.
@@ -901,30 +996,13 @@ impl Store {
     } else {
       &self.every
     };
-    let rank = |shown: Vec<Arc<Conv>>| -> Vec<Arc<Conv>> {
-      if query.is_empty() {
-        shown
-      } else {
-        Fuzzy::new(query)
-          .rank(shown, |conv| conv.g.name.as_str())
-          .into_iter()
-          .map(|(_, conv)| conv)
-          .collect()
-      }
-    };
     let unread_only = self.unread_only;
-    let alphabetical = query.is_empty() && self.list_sort == Sort::Alphabetical;
-    let by_name = |list: &mut Vec<Arc<Conv>>| {
-      if alphabetical {
-        list.sort_by(|a, b| name_key(a).cmp(name_key(b)));
-      }
-    };
     let pane = &self.pane;
     let in_pane = |conv: &Arc<Conv>| match pane {
       Pane::All => true,
       Pane::Unread => conv.g.unread,
       Pane::Kind(kind) => Kind::of(conv.g.kind) == *kind,
-      Pane::Section(section) => Section::of(&conv.g) == *section,
+      Pane::Section(section) => conv.section == *section,
       Pane::Shortcut(_) => false,
     };
     // Home takes the Unread and kind filters; sections and shortcuts belong to the Rail.
@@ -932,43 +1010,51 @@ impl Store {
       Pane::Unread | Pane::Kind(_) => in_pane(conv),
       Pane::All | Pane::Section(_) | Pane::Shortcut(_) => true,
     };
-    self.home = rank(
-      source
-        .iter()
-        .filter(|conv| (!unread_only || conv.g.unread) && in_home(conv))
-        .cloned()
-        .collect(),
-    );
-    by_name(&mut self.home);
-
-    let mut list = rank(
-      source
-        .iter()
-        .filter(|conv| (!unread_only || conv.g.unread) && in_pane(conv))
-        .cloned()
-        .collect(),
-    );
-    by_name(&mut list);
-    // Stable: pinned first, then in IRC one kind after another, in the chosen order within each. Search results keep
-    // best match first.
+    // Home lists conversations only where no list sits beside it, and the list only there.
+    let beside = self.layout.keeps_list();
+    let mut shown: Vec<Arc<Conv>> = source
+      .iter()
+      .filter(|conv| (!unread_only || conv.g.unread) && if beside { in_pane(conv) } else { in_home(conv) })
+      .cloned()
+      .collect();
     if query.is_empty() {
-      let by_kind = self.by_kind;
-      list.sort_by_key(|conv| {
-        let rank = if by_kind {
-          Kind::of(conv.g.kind).buffer_rank()
-        } else {
-          0
-        };
-        (!conv.g.pinned, rank)
-      });
+      if self.list_sort == Sort::Alphabetical {
+        shown.sort_by(|a, b| name_key(a).cmp(name_key(b)));
+      }
+    } else {
+      shown = Fuzzy::new(query)
+        .rank(shown, |conv| conv.g.name.as_str())
+        .into_iter()
+        .map(|(_, conv)| conv)
+        .collect();
     }
-    self.set_list(list, !query.is_empty());
+    let searching = !query.is_empty();
+    if beside {
+      // Stable: pinned first, then in IRC one kind after another, in the chosen order within each. Search results
+      // keep best match first.
+      if !searching {
+        let by_kind = self.layout == Layout::Irc;
+        shown.sort_by_key(|conv| {
+          let rank = if by_kind {
+            Kind::of(conv.g.kind).buffer_rank()
+          } else {
+            0
+          };
+          (!conv.g.pinned, rank)
+        });
+      }
+      self.home = Vec::new();
+      self.set_list(shown, searching);
+    } else {
+      self.home = shown;
+      self.set_list(Vec::new(), searching);
+    }
 
-    let mut by_section: HashMap<Section, usize> = HashMap::new();
+    let mut by_section: HashMap<&Section, usize> = HashMap::new();
     let mut by_kind: HashMap<Kind, usize> = HashMap::new();
     for conv in &self.all {
       let unread = usize::from(conv.g.unread);
-      *by_section.entry(Section::of(&conv.g)).or_default() += unread;
+      *by_section.entry(&conv.section).or_default() += unread;
       *by_kind.entry(Kind::of(conv.g.kind)).or_default() += unread;
     }
     let mut tabs = vec![Tab {
@@ -984,7 +1070,7 @@ impl Store {
       }
     }
     // The user's own sections, then the kinds the account has, then Meetings.
-    let sections = ordered(by_section.keys());
+    let sections = ordered(by_section.keys().copied());
     let section_tab = |section: &Section| Tab {
       unread: by_section[section],
       pane: Pane::Section(section.clone()),
@@ -1025,7 +1111,12 @@ impl Store {
     cx.notify();
   }
 
+  /// The Google Chat layout's sidebar; the other layouts have none.
   pub fn rebuild_sidebar(&mut self) {
+    if self.layout != Layout::GoogleChat {
+      self.sidebar = Vec::new();
+      return;
+    }
     let mut items = vec![SidebarItem::Header(Section::Shortcuts)];
     if !self.collapsed.contains(&Section::Shortcuts) {
       items.push(SidebarItem::Home);
@@ -1042,11 +1133,11 @@ impl Store {
         items.push(SidebarItem::Meet);
       }
     }
-    let mut by_section: HashMap<Section, Vec<&Arc<Conv>>> = HashMap::new();
+    let mut by_section: HashMap<&Section, Vec<&Arc<Conv>>> = HashMap::new();
     for conv in &self.all {
-      by_section.entry(Section::of(&conv.g)).or_default().push(conv);
+      by_section.entry(&conv.section).or_default().push(conv);
     }
-    let order = ordered(by_section.keys());
+    let order = ordered(by_section.keys().copied());
     for section in order {
       // `all` is newest first, so each section starts in that order.
       let Some(members) = by_section.remove(&section) else {
@@ -1168,13 +1259,13 @@ impl Store {
 
   /// The sections the user made in Google Chat, A to Z: those its conversations are placed in.
   pub fn custom_sections(&self) -> Vec<Section> {
-    let present: HashSet<Section> = self
+    let present: HashSet<&Section> = self
       .every
       .iter()
-      .map(|conv| Section::of(&conv.g))
+      .map(|conv| &conv.section)
       .filter(|section| matches!(section, Section::Custom { .. }))
       .collect();
-    ordered(present.iter())
+    ordered(present.into_iter())
   }
 
   /// The order of a Google Chat sidebar section: the user's pick, or the section's default.
@@ -1186,13 +1277,12 @@ impl Store {
       .unwrap_or_else(|| section.default_sort())
   }
 
-  /// Takes the sort orders, the list's window, and the Mentions, Starred, Calendar, and Meet buttons from the
-  /// settings, rebuilding the lists when they changed. Call at start and whenever the settings change.
+  /// Takes the layout, the sort orders, the list's window, and the Mentions, Starred, Calendar, and Meet buttons from
+  /// the settings, rebuilding the lists when they changed. Call at start and whenever the settings change.
   pub fn sync_settings(&mut self, cx: &mut Context<Self>) {
     let settings = cx.global::<Settings>();
-    let by_kind = settings.layout == Layout::Irc;
     if settings.list_sort == self.list_sort
-      && by_kind == self.by_kind
+      && settings.layout == self.layout
       && settings.list_window == self.list_window
       && settings.section_sort == self.section_sort
       && settings.show_mentions == self.show_mentions
@@ -1203,7 +1293,7 @@ impl Store {
       return;
     }
     self.list_sort = settings.list_sort;
-    self.by_kind = by_kind;
+    self.layout = settings.layout;
     self.list_window = settings.list_window;
     self.section_sort = settings.section_sort.clone();
     self.show_mentions = settings.show_mentions;
@@ -1513,20 +1603,22 @@ impl Store {
   }
 
   /// A meeting card in the chat of the call being started says the meeting is posted: nothing is waited for. The core
-  /// answers `MeetStarted` after it, but an answer that never comes must not leave the call waiting.
-  fn call_posted(&mut self, message: &Message) {
+  /// answers `MeetStarted` after it, but an answer that never comes must not leave the call waiting. Answers whether
+  /// it was that card.
+  fn call_posted(&mut self, message: &Message) -> bool {
     let card = message
       .attachments
       .iter()
       .any(|attachment| attachment.kind == AttachmentKind::Meet);
-    if self
+    let posted = self
       .meet
       .calling
       .as_ref()
-      .is_some_and(|call| call.is_posted(&message.group, card))
-    {
+      .is_some_and(|call| call.is_posted(&message.group, card));
+    if posted {
       self.meet.calling = None;
     }
+    posted
   }
 
   /// Asks for the newest messages of a shortcut, replacing the ones held.
@@ -1598,9 +1690,37 @@ fn name_key(conv: &Conv) -> &str {
   conv.lower.trim_start_matches("group: ")
 }
 
-fn conv(group: Group) -> Conv {
+/// The `Conv` of a group. `me` is the signed-in user's id, empty until the core says it: their own last message is
+/// led by "You".
+fn conv(group: Group, me: &str) -> Conv {
   let lower = group.name.to_lowercase();
-  Conv { g: group, lower }
+  let section = Section::of(&group);
+  let name = SharedString::from(group.name.clone());
+  let preview = group
+    .snippet
+    .as_ref()
+    .map_or_else(SharedString::default, |snippet| preview_line(snippet, me));
+  Conv { g: group, lower, section, name, preview }
+}
+
+/// A last message on one line, at most 240 characters of it, led by "You" or its sender's name.
+fn preview_line(snippet: &Snippet, me: &str) -> SharedString {
+  let sender = if !me.is_empty() && snippet.sender_id == me {
+    "You"
+  } else {
+    snippet.sender_name.as_str()
+  };
+  let text: String = snippet
+    .text
+    .chars()
+    .take(240)
+    .map(|c| if c == '\n' { ' ' } else { c })
+    .collect();
+  if sender.is_empty() {
+    text.into()
+  } else {
+    format!("{sender}: {text}").into()
+  }
 }
 
 /// Whether a conversation belongs in the browsing lists: neither hidden nor blocked. Searches find it either way.
@@ -1763,7 +1883,7 @@ mod tests {
       chat("archive", GroupKind::Space, 90),
     ]
     .into_iter()
-    .map(|g| Arc::new(conv(g)))
+    .map(|g| Arc::new(conv(g, "")))
     .collect()
   }
 

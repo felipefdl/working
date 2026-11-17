@@ -76,6 +76,8 @@ pub struct CalendarView {
   failure: Option<String>,
   /// The calendar is the view on screen.
   active: bool,
+  /// A read of the events came due while the window was hidden: it happens once the window shows.
+  stale: bool,
   _subs: Vec<Subscription>,
   _tick: Task<()>,
 }
@@ -88,20 +90,28 @@ impl CalendarView {
         this.refresh_events(cx);
         cx.notify();
       }),
+      // A hidden window shows nothing: what came due while it was hidden happens when it shows again.
+      cx.observe_window_visibility(window, |this, visibility, _, cx| {
+        if visibility.is_visible() && this.active {
+          this.catch_up(cx);
+        }
+      }),
     ];
-    let tick = cx.spawn(async move |this, cx| {
+    let tick = cx.spawn_in(window, async move |this, cx| {
       let mut ticks = 0_u32;
       loop {
         cx.background_executor().timer(TICK).await;
         ticks = ticks.wrapping_add(1);
-        let alive = this.update(cx, |this, cx| {
+        let alive = this.update_in(cx, |this, window, cx| {
           if !this.active {
             return;
           }
-          if ticks.is_multiple_of(TICKS_PER_READ) && this.editor.is_none() {
-            this.load(cx);
+          if ticks.is_multiple_of(TICKS_PER_READ) {
+            this.stale = true;
           }
-          cx.notify();
+          if window.is_visible() {
+            this.catch_up(cx);
+          }
         });
         if alive.is_err() {
           break;
@@ -123,6 +133,7 @@ impl CalendarView {
       editor: None,
       failure: None,
       active: false,
+      stale: false,
       _subs: subs,
       _tick: tick,
     }
@@ -133,6 +144,7 @@ impl CalendarView {
     let shown = self.store.read(cx).view == View::Calendar;
     if shown && !self.active {
       self.active = true;
+      self.stale = false;
       self.scroll_to_now = true;
       self.load(cx);
     } else if !shown && self.active {
@@ -181,6 +193,15 @@ impl CalendarView {
   fn load(&self, cx: &mut Context<Self>) {
     let (start, end) = range(self.mode, self.anchor);
     self.store.update(cx, |store, cx| store.load_calendar(start, end, cx));
+  }
+
+  /// The minute tick's work, once the window shows: reads the events again when a read came due and no editor is
+  /// open, and redraws for the line that marks now.
+  fn catch_up(&mut self, cx: &mut Context<Self>) {
+    if std::mem::take(&mut self.stale) && self.editor.is_none() {
+      self.load(cx);
+    }
+    cx.notify();
   }
 
   /// What takes the keyboard for the calendar's one-letter keys.

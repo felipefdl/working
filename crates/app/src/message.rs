@@ -1,13 +1,13 @@
 //! Rendering of one conversation row: header, bubbles with formatted text, attachments, cards, reactions.
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
 
 use gchat_core::{
-  Attachment, AttachmentKind, Card, Command, Core, GroupId, Message, Micros, Reaction, ReadReceipt, Span, SpanKind,
+  Attachment, AttachmentKind, Card, Command, Core, GroupId, Message, Micros, ReadReceipt, Span, SpanKind,
 };
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
@@ -22,14 +22,33 @@ use crate::receipt_logic;
 use crate::settings::{MessageStyle, Settings};
 use crate::text_panel;
 use crate::theme::{
-  ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, BUBBLE_OWN, CODE_BG, FIELD, MARK, MUTED, PANEL, PLACEHOLDER, POPOVER, RED,
-  ROW_HOVER, TEXT, Tone, WHITE, rgb,
+  self, ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, BUBBLE_OWN, CODE_BG, FIELD, MARK, MUTED, PANEL, PLACEHOLDER, POPOVER,
+  RED, ROW_HOVER, TEXT, Theme, Tone, WHITE, rgb,
 };
 use crate::ui::{Icon, avatar, icon};
 use crate::util;
 use crate::viewer;
 
 const FIVE_MINUTES: i64 = 5 * 60 * 1_000_000;
+const ONE_HOUR: i64 = 60 * 60 * 1_000_000;
+
+/// The parts of a row with an element id: each is `(row.id, PART_*)`, plus the index of the item for the ranges.
+const PART_AVATAR: usize = 0;
+const PART_NAME: usize = 1;
+const PART_BUBBLE: usize = 2;
+const PART_ROW: usize = 3;
+const PART_TOOLS: usize = 4;
+const PART_READERS: usize = 5;
+const PART_THREAD: usize = 6;
+const PART_REACT: usize = 7;
+const PART_EDIT: usize = 8;
+const PART_THREAD_TOOL: usize = 9;
+const PART_QUOTE: usize = 10;
+const PART_MORE: usize = 11;
+const PART_QUICK: usize = 16;
+const PART_ATTACHMENT: usize = 1 << 10;
+const PART_REACTION: usize = 2 << 10;
+const PART_TEXT: usize = 3 << 10;
 
 /// One avatar of whoever has read up to a message: the picture, and the ring in the page's color around it that keeps
 /// it apart from its neighbors and from the part of the message it sits on.
@@ -59,6 +78,8 @@ pub type Opener = Rc<dyn Fn(&str, &mut Window, &mut App)>;
 #[derive(Clone)]
 pub struct Row {
   pub msg: Arc<Message>,
+  /// The message's id, the start of the element ids of its parts.
+  pub id: SharedString,
   /// Date separator shown above this message (first message of a day).
   pub date: Option<SharedString>,
   /// Starts a run: shows avatar, name and time.
@@ -66,15 +87,65 @@ pub struct Row {
   pub own: bool,
   /// Set on a message that started a thread with replies.
   pub thread: Option<ThreadInfo>,
+  /// The text as it is drawn: made on the first draw, kept while the theme and the fonts stay.
+  prepared: RefCell<Option<Rc<Prepared>>>,
+  /// The header's time once it is a clock time, which no longer changes.
+  clock: OnceCell<SharedString>,
 }
 
 impl Row {
+  fn new(msg: &Arc<Message>, date: Option<SharedString>, head: bool, own: bool, thread: Option<ThreadInfo>) -> Self {
+    Self {
+      msg: msg.clone(),
+      id: SharedString::from(msg.id.as_str()),
+      date,
+      head,
+      own,
+      thread,
+      prepared: RefCell::default(),
+      clock: OnceCell::new(),
+    }
+  }
+
   pub fn same(&self, other: &Self) -> bool {
     self.head == other.head
       && self.own == other.own
       && self.thread == other.thread
       && self.date == other.date
       && (Arc::ptr_eq(&self.msg, &other.msg) || *self.msg == *other.msg)
+  }
+
+  /// Takes over what `old`, a row `same` as this one, already worked out, so it is not worked out again.
+  pub fn adopt(&mut self, old: &mut Self) {
+    *self.prepared.get_mut() = old.prepared.get_mut().take();
+    if let Some(clock) = old.clock.take() {
+      let _ = self.clock.set(clock);
+    }
+  }
+
+  /// The text as it is drawn, worked out on the first call and again after the theme or the fonts change.
+  fn prepared(&self) -> Rc<Prepared> {
+    let mut slot = self.prepared.borrow_mut();
+    if let Some(prepared) = slot.as_ref().filter(|prepared| prepared.fresh()) {
+      return prepared.clone();
+    }
+    let prepared = Rc::new(Prepared::new(&self.msg));
+    *slot = Some(prepared.clone());
+    prepared
+  }
+
+  /// The time in the header (`util::message_time`), kept once it is a clock time.
+  fn time(&self) -> SharedString {
+    if let Some(clock) = self.clock.get() {
+      return clock.clone();
+    }
+    // Asked before the text is made, so a time that reads as minutes is never kept.
+    let old = chrono::Local::now().timestamp_micros() - self.msg.time >= ONE_HOUR;
+    let time = SharedString::from(util::message_time(self.msg.time));
+    if old {
+      let _ = self.clock.set(time.clone());
+    }
+    time
   }
 }
 
@@ -107,19 +178,23 @@ pub fn build_rows(messages: &[Arc<Message>], me_id: &str) -> Vec<Row> {
   let infos = thread_infos(messages);
   let mut rows: Vec<Row> = Vec::with_capacity(messages.len());
   let mut prev_day = i32::MIN;
+  // The local day of the last message looked at and its span: the messages of one day take no time-zone conversion.
+  let mut day: Option<(i32, Range<Micros>)> = None;
   for msg in messages.iter().filter(|m| !m.is_thread_reply()) {
-    let day = util::day_key(msg.time);
-    let date = (day != prev_day).then(|| SharedString::from(util::date_label(msg.time)));
+    let key = match &day {
+      Some((key, span)) if span.contains(&msg.time) => *key,
+      _ => {
+        let (key, span) = util::day_span(msg.time);
+        day = Some((key, span));
+        key
+      },
+    };
+    let date = (key != prev_day).then(|| SharedString::from(util::date_label(msg.time)));
     let head = starts_run(rows.last(), msg, date.is_some());
-    prev_day = day;
+    prev_day = key;
     let thread = infos.get(msg.id.as_str()).copied();
-    rows.push(Row {
-      msg: msg.clone(),
-      date,
-      head,
-      own: !me_id.is_empty() && msg.sender_id == me_id,
-      thread,
-    });
+    let own = !me_id.is_empty() && msg.sender_id == me_id;
+    rows.push(Row::new(msg, date, head, own, thread));
   }
   rows
 }
@@ -129,29 +204,17 @@ pub fn build_thread_rows(messages: &[Arc<Message>], topic: &str, me_id: &str) ->
   let start = messages.iter().find(|m| m.id == topic)?;
   let infos = thread_infos(messages);
   let own = |msg: &Message| !me_id.is_empty() && msg.sender_id == me_id;
-  let mut rows = vec![Row {
-    msg: start.clone(),
-    date: None,
-    head: true,
-    own: own(start),
-    thread: infos.get(topic).copied(),
-  }];
+  let mut rows = vec![Row::new(start, None, true, own(start), infos.get(topic).copied())];
   for msg in messages.iter().filter(|m| m.is_thread_reply() && m.topic_id == topic) {
     let head = starts_run(rows.last(), msg, false);
-    rows.push(Row {
-      msg: msg.clone(),
-      date: None,
-      head,
-      own: own(msg),
-      thread: None,
-    });
+    rows.push(Row::new(msg, None, head, own(msg), None));
   }
   Some(rows)
 }
 
 /// Who has read up to each message of a list of rows, by message id: their avatars sit on its corner.
 #[derive(Default)]
-pub struct Readers(HashMap<String, Vec<ReadReceipt>>);
+pub struct Readers(HashMap<SharedString, Rc<[ReadReceipt]>>);
 
 impl Readers {
   /// Puts each of `receipts` on the newest message of `rows` sent at or before their read time. A line of the
@@ -169,19 +232,18 @@ impl Readers {
     let by_message = receipt_logic::place(&times, &read_times)
       .into_iter()
       .filter_map(|(at, readers)| {
-        let id = candidates.get(at)?.msg.id.clone();
-        Some((
-          id,
-          readers.into_iter().filter_map(|reader| receipts.get(reader).cloned()).collect(),
-        ))
+        let id = candidates.get(at)?.id.clone();
+        let readers: Rc<[ReadReceipt]> =
+          readers.into_iter().filter_map(|reader| receipts.get(reader).cloned()).collect();
+        Some((id, readers))
       })
       .collect();
     Self(by_message)
   }
 
-  /// Who has read up to the message `id`, earliest reader first.
-  pub fn of(&self, id: &str) -> &[ReadReceipt] {
-    self.0.get(id).map_or(&[][..], Vec::as_slice)
+  /// Who has read up to the message `id`, earliest reader first; `None` when nobody has.
+  pub fn of(&self, id: &str) -> Option<&Rc<[ReadReceipt]>> {
+    self.0.get(id)
   }
 }
 
@@ -194,8 +256,8 @@ pub struct MsgCtx<'a> {
   pub open_thread: Option<&'a Opener>,
   /// The message a search hit jumped to: its row gets a tint.
   pub focus: Option<&'a str>,
-  /// In-conversation find query, when the find bar is open.
-  pub find: Option<&'a str>,
+  /// Where the find bar's query is in this message's text: empty while the find bar is closed or finds nothing here.
+  pub find: &'a [Range<usize>],
   /// The current find hit in this message, if any.
   pub find_hit: Option<Range<usize>>,
   /// Runs what a message's toolbar asks for.
@@ -208,11 +270,13 @@ pub struct MsgCtx<'a> {
   pub hovered: Option<&'a str>,
   /// Set while the pointer is on a toolbar, which can reach over the row above its message.
   pub on_tools: &'a Rc<Cell<bool>>,
-  /// Who has read up to this message: their avatars sit on its bottom corner, out of the row's layout. Empty in a
+  /// Who has read up to this message: their avatars sit on its bottom corner, out of the row's layout. `None` in a
   /// conversation with read receipts off.
-  pub readers: &'a [ReadReceipt],
+  pub readers: Option<&'a Rc<[ReadReceipt]>>,
   /// IRC style: the width of the sender column, as wide as the longest name among the rows (`irc_nick_width`).
   pub nick_width: f32,
+  /// The window's pixels per point: thumbnails are decoded for the size they are drawn at.
+  pub scale: f32,
 }
 
 /// What a message's toolbar asks the conversation to do.
@@ -253,6 +317,7 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
       ),
     );
   }
+  let prepared = row.prepared();
   if msg.system {
     return out
       .child(
@@ -263,7 +328,7 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
           .text_size(px(12.))
           .text_color(rgb(MUTED))
           .text_center()
-          .child(marked_plain(&msg.text, ctx.find, ctx.find_hit.as_ref())),
+          .child(plain_text(row, &prepared, ctx)),
       )
       .into_any_element();
   }
@@ -281,21 +346,17 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
     msg.sender_avatar.as_deref()
   };
   // Someone else's avatar and name open the chat with them.
-  let person = (!row.own).then(|| (msg.sender_id.clone(), ctx.open_person.clone()));
+  let person = (!row.own).then(|| (msg.clone(), ctx.open_person.clone()));
   let avatar_col = (!aside).then(|| {
     div().w(px(36.)).flex_shrink_0().when(row.head, |d| {
-      let picture = div().id(SharedString::from(format!("{}-avatar", msg.id))).child(avatar(
-        ctx.images,
-        cx,
-        avatar_url,
-        None,
-        &msg.sender_name,
-        32.,
-      ));
+      let picture =
+        div()
+          .id((row.id.clone(), PART_AVATAR))
+          .child(avatar(ctx.images, cx, avatar_url, None, &msg.sender_name, 32.));
       d.child(match person.clone() {
-        Some((user_id, open)) => picture
+        Some((sender, open)) => picture
           .cursor_pointer()
-          .on_click(move |_, window, cx| open(&user_id, window, cx)),
+          .on_click(move |_, window, cx| open(&sender.sender_id, window, cx)),
         None => picture,
       })
     })
@@ -315,10 +376,7 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
   let mut body: Vec<AnyElement> = Vec::new();
   let mut bubble_at = None;
   if row.head {
-    let time = div()
-      .text_size(px(11.))
-      .text_color(rgb(MUTED))
-      .child(util::message_time(msg.time));
+    let time = div().text_size(px(11.)).text_color(rgb(MUTED)).child(row.time());
     let header = if aside {
       time
     } else {
@@ -327,16 +385,16 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
         .items_baseline()
         .child({
           let label = div()
-            .id(SharedString::from(format!("{}-name", msg.id)))
+            .id((row.id.clone(), PART_NAME))
             .text_size(px(13.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(rgb(TEXT))
             .child(name);
           match person {
-            Some((user_id, open)) => label
+            Some((sender, open)) => label
               .cursor_pointer()
               .hover(gpui_kit::Styled::underline)
-              .on_click(move |_, window, cx| open(&user_id, window, cx)),
+              .on_click(move |_, window, cx| open(&sender.sender_id, window, cx)),
             None => label,
           }
         })
@@ -350,9 +408,9 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
   let has_bubble = has_text || msg.quote.is_some();
   if has_bubble {
     // A click on the bubble, the quote in it included, opens its text in the panel where it can be selected. A link or
-    // a mention in the text stops the click (`rich_text`), as does the readers' overlay on its corner.
+    // a mention in the text stops the click (`Segment::draw`), as does the readers' overlay on its corner.
     let mut bubble = v_flex()
-      .id(SharedString::from(format!("{}-bubble", msg.id)))
+      .id((row.id.clone(), PART_BUBBLE))
       .max_w(px(600.))
       .gap_1()
       .px_3p5()
@@ -365,7 +423,7 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
         let msg = msg.clone();
         bubble.on_click(move |event, window, cx| text_panel::show(event.position(), &msg.text, window, cx))
       });
-    if let Some(quote) = &msg.quote {
+    if let (Some(quote), Some(clipped)) = (&msg.quote, &prepared.quote) {
       bubble = bubble.child(
         v_flex()
           .gap_0p5()
@@ -375,18 +433,11 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
           .text_size(px(12.5))
           .text_color(rgb(MUTED))
           .child(div().font_weight(FontWeight::SEMIBOLD).child(quote.sender_name.clone()))
-          .child(div().child(clip(&quote.text, 240))),
+          .child(div().child(clipped.clone())),
       );
     }
     if has_text {
-      bubble = bubble.child(rich_text(
-        &msg.id,
-        &msg.text,
-        &msg.spans,
-        ctx.find,
-        ctx.find_hit.as_ref(),
-        ctx.open_person,
-      ));
+      bubble = bubble.child(rich_text(row, &prepared, ctx));
       if msg.edited {
         bubble = bubble.child(div().text_size(px(11.)).text_color(rgb(MUTED)).child("(edited)"));
       }
@@ -396,7 +447,7 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
   }
 
   let (attachment_at, card_at) = push_extras(&mut body, row, bubble_bg, ctx, cx);
-  content = place_readers(content, body, [bubble_at, attachment_at, card_at], aside, &msg.id, ctx, cx);
+  content = place_readers(content, body, [bubble_at, attachment_at, card_at], aside, row, ctx, cx);
 
   // Floats over the top edge of the first bubble, as in Google Chat, so it can reach over the row above.
   // Only the message under the pointer has one, and it swallows the pointer: the row beneath it does not
@@ -419,7 +470,7 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
   let (act, entered) = (ctx.act.clone(), msg.clone());
   let out = out.child(
     h_flex()
-      .id(SharedString::from(format!("{}-row", msg.id)))
+      .id((row.id.clone(), PART_ROW))
       .w_full()
       .max_w(px(780.))
       .px(px(ROW_PAD))
@@ -451,10 +502,16 @@ fn push_extras(
 ) -> (Option<usize>, Option<usize>) {
   let msg = &row.msg;
   let (mut attachment_at, mut card_at) = (None, None);
-  for (i, attachment) in msg.attachments.iter().enumerate() {
-    let id = SharedString::from(format!("{}-a{i}", msg.id));
+  for i in 0..msg.attachments.len() {
     attachment_at = Some(body.len());
-    body.push(attachment_view(attachment, id, bubble_bg, ctx, cx));
+    body.push(attachment_view(
+      msg,
+      i,
+      (row.id.clone(), PART_ATTACHMENT + i).into(),
+      bubble_bg,
+      ctx,
+      cx,
+    ));
   }
   if msg.starred {
     body.push(
@@ -473,7 +530,7 @@ fn push_extras(
     body.push(card_view(card, msg, ctx, cx, i));
   }
   if !msg.reactions.is_empty() {
-    body.push(reactions_view(&msg.reactions, msg, ctx.core));
+    body.push(reactions_view(msg, &row.id, ctx.core));
   }
   if msg.failed {
     body.push(
@@ -485,7 +542,7 @@ fn push_extras(
     );
   }
   if let (Some(info), Some(open)) = (row.thread, ctx.open_thread) {
-    body.push(thread_footer(&msg.id, info, open.clone()));
+    body.push(thread_footer(row, info, open.clone()));
   }
   (attachment_at, card_at)
 }
@@ -498,12 +555,12 @@ fn place_readers(
   body: Vec<AnyElement>,
   marks: [Option<usize>; 3],
   aside: bool,
-  msg_id: &str,
+  row: &Row,
   ctx: &MsgCtx,
   cx: &App,
 ) -> Div {
   let mark = marks.into_iter().flatten().next().or_else(|| body.len().checked_sub(1));
-  let mut readers = readers_group(aside, msg_id, ctx, cx);
+  let mut readers = readers_group(aside, row, ctx, cx);
   for (ix, part) in body.into_iter().enumerate() {
     content = content.child(if mark == Some(ix) {
       read_mark(part, readers.take(), aside).into_any_element()
@@ -525,7 +582,7 @@ fn floating_tools(row: &Row, ctx: &MsgCtx) -> Option<Stateful<Div>> {
   let (on_tools, act, left) = (ctx.on_tools.clone(), ctx.act.clone(), msg.clone());
   Some(
     h_flex()
-      .id(SharedString::from(format!("{}-tools", msg.id)))
+      .id((row.id.clone(), PART_TOOLS))
       .absolute()
       .gap_1()
       .occlude()
@@ -535,7 +592,7 @@ fn floating_tools(row: &Row, ctx: &MsgCtx) -> Option<Stateful<Div>> {
           act(Act::Leave, &left, window, cx);
         }
       })
-      .child(quick_reactions(msg, ctx.core))
+      .child(quick_reactions(msg, &row.id, ctx.core))
       .child(toolbar(row, ctx)),
   )
 }
@@ -605,7 +662,7 @@ fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
     .whitespace_nowrap()
     .when(blocks, gpui_kit::Styled::pt_1p5)
     .text_color(rgb(MUTED))
-    .child(util::message_time(msg.time));
+    .child(row.time());
   let nick = div()
     .w(px(ctx.nick_width))
     .ml_1()
@@ -615,6 +672,7 @@ fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
     .truncate();
   // The rule between the senders and the text, as tall as the row, so it runs on from one row to the next.
   let rule = div().w(px(1.)).flex_shrink_0().self_stretch().mx_2().bg(rgb(BORDER));
+  let prepared = row.prepared();
   if msg.system {
     return out
       .child(
@@ -625,11 +683,13 @@ fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
           .child(time)
           .child(nick.text_color(rgb(MUTED)).child("*"))
           .child(rule)
-          .child(div().flex_1().min_w_0().text_color(rgb(MUTED)).child(marked_plain(
-            &msg.text,
-            ctx.find,
-            ctx.find_hit.as_ref(),
-          ))),
+          .child(
+            div()
+              .flex_1()
+              .min_w_0()
+              .text_color(rgb(MUTED))
+              .child(plain_text(row, &prepared, ctx)),
+          ),
       )
       .into_any_element();
   }
@@ -645,18 +705,15 @@ fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
   } else {
     nick_color(&msg.sender_id)
   };
-  let nick = nick
-    .id(SharedString::from(format!("{}-name", msg.id)))
-    .text_color(color)
-    .child(name);
+  let nick = nick.id((row.id.clone(), PART_NAME)).text_color(color).child(name);
   let nick = if row.own {
     nick
   } else {
-    let (user_id, open) = (msg.sender_id.clone(), ctx.open_person.clone());
+    let (sender, open) = (msg.clone(), ctx.open_person.clone());
     nick
       .cursor_pointer()
       .hover(gpui_kit::Styled::underline)
-      .on_click(move |_, window, cx| open(&user_id, window, cx))
+      .on_click(move |_, window, cx| open(&sender.sender_id, window, cx))
   };
 
   let mut column = v_flex()
@@ -673,7 +730,7 @@ fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
   if has_text || msg.quote.is_some() {
     // A click on the text, its quote included, opens it in the panel where it can be selected, as on a bubble.
     let mut text = v_flex()
-      .id(SharedString::from(format!("{}-bubble", msg.id)))
+      .id((row.id.clone(), PART_BUBBLE))
       .min_w_0()
       // No bubble for the readers' avatars to tuck into: the text keeps them a gap away (`read_mark`).
       .pr(px(READER_TUCK + 6.))
@@ -682,16 +739,11 @@ fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
         let msg = msg.clone();
         text.on_click(move |event, window, cx| text_panel::show(event.position(), &msg.text, window, cx))
       });
-    if let Some(quote) = &msg.quote {
-      let quoted = quote.text.split_whitespace().collect::<Vec<_>>().join(" ");
-      text = text.child(div().max_w_full().truncate().text_color(rgb(MUTED)).child(format!(
-        "> {}: {}",
-        quote.sender_name,
-        clip(&quoted, 240)
-      )));
+    if let Some(quote) = &prepared.irc_quote {
+      text = text.child(div().max_w_full().truncate().text_color(rgb(MUTED)).child(quote.clone()));
     }
     if has_text {
-      let rich = rich_text(&msg.id, &msg.text, &msg.spans, ctx.find, ctx.find_hit.as_ref(), ctx.open_person);
+      let rich = rich_text(row, &prepared, ctx);
       // The mark has a line of its own under the text, which keeps the text free to wrap at the column's edge.
       text = text.child(rich);
       if msg.edited {
@@ -702,7 +754,7 @@ fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
     body.push(text.into_any_element());
   }
   let (attachment_at, card_at) = push_extras(&mut body, row, BUBBLE, ctx, cx);
-  column = place_readers(column, body, [text_at, attachment_at, card_at], false, &msg.id, ctx, cx);
+  column = place_readers(column, body, [text_at, attachment_at, card_at], false, row, ctx, cx);
   // Over the right end of the row above, clear of the sender and the start of the text.
   if let Some(tools) = floating_tools(row, ctx) {
     column = column.child(tools.top(px(-26.)).right(px(12.)));
@@ -711,7 +763,7 @@ fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
   let (act, entered) = (ctx.act.clone(), msg.clone());
   let out = out.child(
     h_flex()
-      .id(SharedString::from(format!("{}-row", msg.id)))
+      .id((row.id.clone(), PART_ROW))
       .w_full()
       .px(px(ROW_PAD))
       .items_start()
@@ -752,7 +804,7 @@ fn nick_color(id: &str) -> Hsla {
 /// The emoji offered by a message's "Add reaction" button.
 const QUICK_EMOJI: [&str; 10] = ["👍", "❤️", "😂", "😮", "😢", "🙏", "🎉", "✅", "👀", "🚀"];
 
-fn tool(id: SharedString, name: Icon) -> Stateful<Div> {
+fn tool(id: ElementId, name: Icon) -> Stateful<Div> {
   div()
     .id(id)
     .size(px(26.))
@@ -816,11 +868,9 @@ fn read_mark(part: impl IntoElement, readers: Option<Stateful<Div>>, aside: bool
 /// The avatars of whoever has read up to a message, `None` when nobody has: at most `MAX_SHOWN`, overlapping, then `+N`
 /// in muted text, with a tooltip that names them all. Laid out from the part's corner outward (`read_mark` places
 /// them): left to right, or right to left beside a bubble on the right, with the count outermost.
-fn readers_group(aside: bool, msg_id: &str, ctx: &MsgCtx, cx: &App) -> Option<Stateful<Div>> {
-  if ctx.readers.is_empty() {
-    return None;
-  }
-  let (faces, folded) = receipt_logic::shown(ctx.readers);
+fn readers_group(aside: bool, row: &Row, ctx: &MsgCtx, cx: &App) -> Option<Stateful<Div>> {
+  let readers = ctx.readers.filter(|readers| !readers.is_empty())?;
+  let (faces, folded) = receipt_logic::shown(&readers[..]);
   let pictures = faces.iter().enumerate().map(|(ix, reader)| {
     let ring = div()
       .size(px(READER_RING))
@@ -853,13 +903,16 @@ fn readers_group(aside: bool, msg_id: &str, ctx: &MsgCtx, cx: &App) -> Option<St
       .child(format!("+{folded}"))
   });
   let outward = |row: Div| if aside { row.flex_row_reverse() } else { row };
-  let names: Vec<&str> = ctx.readers.iter().map(|reader| reader.name.as_str()).collect();
+  let named = readers.clone();
   Some(
     outward(h_flex())
-      .id(SharedString::from(format!("{msg_id}-readers")))
+      .id((row.id.clone(), PART_READERS))
       .flex_shrink_0()
       .gap(px(3.))
-      .tooltip(hint(receipt_logic::read_by(&names)))
+      .tooltip(move |window, cx| {
+        let names: Vec<&str> = named.iter().map(|reader| reader.name.as_str()).collect();
+        Tooltip::new(receipt_logic::read_by(&names)).build(window, cx)
+      })
       // Over the bubble, a click on it is not a click on the bubble.
       .on_click(|_, _, cx| cx.stop_propagation())
       .child(outward(h_flex()).children(pictures))
@@ -868,7 +921,7 @@ fn readers_group(aside: bool, msg_id: &str, ctx: &MsgCtx, cx: &App) -> Option<St
 }
 
 /// The reactions one click away, left of the toolbar.
-fn quick_reactions(msg: &Arc<Message>, core: &Core) -> Div {
+fn quick_reactions(msg: &Arc<Message>, id: &SharedString, core: &Core) -> Div {
   let mut pill = h_flex()
     .flex_shrink_0()
     .p(px(2.))
@@ -880,7 +933,7 @@ fn quick_reactions(msg: &Arc<Message>, core: &Core) -> Div {
     let (core, msg) = (core.clone(), msg.clone());
     pill = pill.child(
       div()
-        .id(SharedString::from(format!("{}-q{ix}", msg.id)))
+        .id((id.clone(), PART_QUICK + ix))
         .size(px(26.))
         .flex()
         .items_center()
@@ -902,7 +955,7 @@ fn quick_reactions(msg: &Arc<Message>, core: &Core) -> Div {
 /// The buttons that float over a message under the pointer: react, edit, reply in thread, quote, more.
 fn toolbar(row: &Row, ctx: &MsgCtx) -> Div {
   let msg = &row.msg;
-  let id = |part: &str| SharedString::from(format!("{}-{part}", msg.id));
+  let id = |part: usize| ElementId::from((row.id.clone(), part));
   let act = |what: Act| {
     let (act, msg) = (ctx.act.clone(), msg.clone());
     move |_: &ClickEvent, window: &mut Window, cx: &mut App| act(what, &msg, window, cx)
@@ -916,8 +969,9 @@ fn toolbar(row: &Row, ctx: &MsgCtx) -> Div {
     .border_color(rgb(BORDER));
 
   let (core, reacting) = (ctx.core.clone(), msg.clone());
-  tools = tools.child(
-    tool(id("react"), Icon::SmilePlus).on_mouse_down(MouseButton::Left, move |event, window, cx| {
+  tools = tools.child(tool(id(PART_REACT), Icon::SmilePlus).on_mouse_down(
+    MouseButton::Left,
+    move |event, window, cx| {
       // Picking one the user already gave takes it back, as clicking its chip does.
       let toggle = {
         let (core, msg) = (core.clone(), reacting.clone());
@@ -940,21 +994,21 @@ fn toolbar(row: &Row, ctx: &MsgCtx) -> Div {
         emoji_picker::show(at, Rc::new(move |emoji, _, _| toggle(emoji)), window, cx);
       }));
       menu::show_strip(event.position, choices, window, cx);
-    }),
-  );
+    },
+  ));
   if row.own && !msg.text.trim().is_empty() {
-    tools = tools.child(tool(id("edit"), Icon::Pencil).tooltip(hint("Edit")).on_click(act(Act::Edit)));
+    tools = tools.child(tool(id(PART_EDIT), Icon::Pencil).tooltip(hint("Edit")).on_click(act(Act::Edit)));
   }
   if ctx.open_thread.is_some() {
     if ctx.threads {
       tools = tools.child(
-        tool(id("thread"), Icon::Thread)
+        tool(id(PART_THREAD_TOOL), Icon::Thread)
           .tooltip(hint("Reply in thread"))
           .on_click(act(Act::Thread)),
       );
     }
     tools = tools.child(
-      tool(id("quote"), Icon::Reply)
+      tool(id(PART_QUOTE), Icon::Reply)
         .tooltip(hint("Quote in reply"))
         .on_click(act(Act::Quote)),
     );
@@ -962,7 +1016,7 @@ fn toolbar(row: &Row, ctx: &MsgCtx) -> Div {
 
   let (core, own, target) = (ctx.core.clone(), row.own, msg.clone());
   tools.child(
-    tool(id("more"), Icon::More).on_mouse_down(MouseButton::Left, move |event, window, cx| {
+    tool(id(PART_MORE), Icon::More).on_mouse_down(MouseButton::Left, move |event, window, cx| {
       let mut items = Vec::new();
       if !target.text.trim().is_empty() {
         let msg = target.clone();
@@ -1012,10 +1066,10 @@ fn reply_label(count: usize) -> String {
 }
 
 /// `N replies · time` under a thread starter, with the small corner connector; opens the thread panel.
-fn thread_footer(msg_id: &str, info: ThreadInfo, open: Opener) -> AnyElement {
-  let topic = msg_id.to_string();
+fn thread_footer(row: &Row, info: ThreadInfo, open: Opener) -> AnyElement {
+  let topic = row.id.clone();
   h_flex()
-    .id(SharedString::from(format!("{msg_id}-thread")))
+    .id((row.id.clone(), PART_THREAD))
     .mt_1()
     .gap_2()
     .items_end()
@@ -1104,17 +1158,15 @@ fn find_style(now: bool) -> HighlightStyle {
   }
 }
 
+/// The find bar's hits of a message (`hits`, offsets into its text) inside its segment `seg`, in the segment's own
+/// offsets. `current` is the hit the find bar is on.
 fn find_highlights(
-  text: &str,
-  seg: Range<usize>,
-  find: Option<&str>,
+  seg: &Range<usize>,
+  hits: &[Range<usize>],
   current: Option<&Range<usize>>,
 ) -> Vec<(Range<usize>, HighlightStyle)> {
-  let Some(query) = find else {
-    return Vec::new();
-  };
-  find_ranges(text, query)
-    .into_iter()
+  hits
+    .iter()
     .filter_map(|range| {
       let a = range.start.max(seg.start);
       let b = range.end.min(seg.end);
@@ -1142,93 +1194,98 @@ fn compact_highlights(
   highlights
 }
 
-fn marked_plain(text: &str, find: Option<&str>, current: Option<&Range<usize>>) -> AnyElement {
-  let highlights = compact_highlights(text, find_highlights(text, 0..text.len(), find, current));
-  let (highlights, fonts) = emoji_font::runs(text, highlights, Vec::new());
-  StyledText::new(text.to_string())
-    .with_highlights(highlights)
-    .with_font_family_overrides(fonts)
-    .into_any_element()
+/// A message's text as it is drawn, worked out once (`Row::prepared`): how it breaks into blocks, and each text
+/// block's padded text, styles, fonts and links. The theme's colors and the monospace family are in it, so it is made
+/// again when they change. The find bar's hits go on at draw time (`Segment::draw`).
+struct Prepared {
+  theme: &'static Theme,
+  mono: SharedString,
+  blocks: Vec<Block>,
+  /// The quoted message's text, clipped, as a bubble shows it.
+  quote: Option<SharedString>,
+  /// The quote as the IRC style's one line: `> name: text` with its whitespace folded.
+  irc_quote: Option<SharedString>,
 }
 
-fn rich_text(
-  id: &str,
-  text: &str,
-  spans: &[Span],
-  find: Option<&str>,
-  current: Option<&Range<usize>>,
-  open_person: &Opener,
-) -> AnyElement {
-  // Code blocks and list items each take their own row; the text between them flows as plain segments.
-  let mut blocks: Vec<(Range<usize>, bool)> = spans
+impl Prepared {
+  fn new(msg: &Message) -> Self {
+    let text = msg.text.as_str();
+    let blocks = if msg.system {
+      // A line of the conversation itself: its whole text, unformatted.
+      vec![Block::Text(Segment::new(text, 0..text.len(), &[], 0))]
+    } else {
+      blocks(text, &msg.spans)
+    };
+    let quote = msg.quote.as_ref().map(|quote| SharedString::from(clip(&quote.text, 240)));
+    let irc_quote = msg.quote.as_ref().map(|quote| {
+      let quoted = quote.text.split_whitespace().collect::<Vec<_>>().join(" ");
+      SharedString::from(format!("> {}: {}", quote.sender_name, clip(&quoted, 240)))
+    });
+    Self {
+      theme: theme::current(),
+      mono: theme::mono(),
+      blocks,
+      quote,
+      irc_quote,
+    }
+  }
+
+  /// Made with the theme and the monospace family in use.
+  fn fresh(&self) -> bool {
+    std::ptr::eq(self.theme, theme::current()) && self.mono == theme::mono()
+  }
+}
+
+/// One row of a message's text.
+enum Block {
+  /// Text that flows.
+  Text(Segment),
+  /// A list item, after its bullet.
+  Item(Segment),
+  /// A code block.
+  Code(SharedString),
+}
+
+/// A message's text split into blocks: code blocks and list items each take their own row, and the text between them
+/// flows as plain segments.
+fn blocks(text: &str, spans: &[Span]) -> Vec<Block> {
+  let mut marked: Vec<(Range<usize>, bool)> = spans
     .iter()
     .filter(|s| matches!(s.kind, SpanKind::CodeBlock | SpanKind::ListItem) && valid(text, &s.range))
     .map(|s| (s.range.clone(), s.kind == SpanKind::ListItem))
     .collect();
-  blocks.sort_by_key(|(range, _)| range.start);
+  marked.sort_by_key(|(range, _)| range.start);
 
-  let mut column = v_flex().gap_1().items_start().min_w_0();
+  let mut out = Vec::new();
   let mut pos = 0;
   let mut n = 0;
-  let push_text = |column: Div, range: Range<usize>, n: &mut usize| -> Div {
-    let slice = &text[range.clone()];
-    let trimmed = slice.trim_end_matches(['\n', ' ']);
+  let push_text = |out: &mut Vec<Block>, range: Range<usize>, n: &mut usize| {
+    let trimmed = text[range.clone()].trim_end_matches(['\n', ' ']);
     if trimmed.is_empty() {
-      return column;
+      return;
     }
-    let range = range.start..range.start + trimmed.len();
     *n += 1;
-    column.child(text_segment(
-      SharedString::from(format!("{id}-t{n}")),
+    out.push(Block::Text(Segment::new(
       text,
-      range,
+      range.start..range.start + trimmed.len(),
       spans,
-      find,
-      current,
-      open_person,
-    ))
+      *n,
+    )));
   };
-  for (block, item) in blocks {
+  for (block, item) in marked {
     if block.start < pos {
       continue;
     }
     if block.start > pos {
-      column = push_text(column, pos..block.start, &mut n);
+      push_text(&mut out, pos..block.start, &mut n);
     }
-    column = if item {
+    if item {
       let line = text[block.clone()].trim_end_matches(['\n', ' ']);
       n += 1;
-      column.child(
-        h_flex()
-          .w_full()
-          .min_w_0()
-          .pl_2()
-          .gap_2()
-          .items_start()
-          .child(div().flex_shrink_0().child("•"))
-          .child(div().flex_1().min_w_0().child(text_segment(
-            SharedString::from(format!("{id}-t{n}")),
-            text,
-            block.start..block.start + line.len(),
-            spans,
-            find,
-            current,
-            open_person,
-          ))),
-      )
+      out.push(Block::Item(Segment::new(text, block.start..block.start + line.len(), spans, n)));
     } else {
-      let code = text[block.clone()].trim_matches('\n').to_string();
-      column.child(
-        div()
-          .px_3()
-          .py_2()
-          .rounded(px(8.))
-          .bg(rgb(CODE_BG))
-          .font_family(crate::theme::mono())
-          .text_size(px(12.5))
-          .child(code),
-      )
-    };
+      out.push(Block::Code(text[block.clone()].trim_matches('\n').to_string().into()));
+    }
     pos = block.end;
     // The line break that ends a block is the row itself, not a blank line before the next text.
     if text[pos..].starts_with('\n') {
@@ -1236,130 +1293,199 @@ fn rich_text(
     }
   }
   if pos < text.len() {
-    column = push_text(column, pos..text.len(), &mut n);
+    push_text(&mut out, pos..text.len(), &mut n);
+  }
+  out
+}
+
+/// The message's text, block under block.
+fn rich_text(row: &Row, prepared: &Prepared, ctx: &MsgCtx) -> AnyElement {
+  let mut column = v_flex().gap_1().items_start().min_w_0();
+  for block in &prepared.blocks {
+    column = match block {
+      Block::Text(segment) => column.child(segment.draw(row, ctx)),
+      Block::Item(segment) => column.child(
+        h_flex()
+          .w_full()
+          .min_w_0()
+          .pl_2()
+          .gap_2()
+          .items_start()
+          .child(div().flex_shrink_0().child("•"))
+          .child(div().flex_1().min_w_0().child(segment.draw(row, ctx))),
+      ),
+      Block::Code(code) => column.child(
+        div()
+          .px_3()
+          .py_2()
+          .rounded(px(8.))
+          .bg(rgb(CODE_BG))
+          .font_family(prepared.mono.clone())
+          .text_size(px(12.5))
+          .child(code.clone()),
+      ),
+    };
   }
   column.into_any_element()
 }
 
-fn text_segment(
-  id: SharedString,
-  text: &str,
-  seg: Range<usize>,
-  spans: &[Span],
-  find: Option<&str>,
-  current: Option<&Range<usize>>,
-  open_person: &Opener,
-) -> AnyElement {
-  let slice = &text[seg.clone()];
-  let clipped: Vec<(Range<usize>, &SpanKind)> = spans
-    .iter()
-    .filter(|s| !matches!(s.kind, SpanKind::CodeBlock) && valid(text, &s.range))
-    .filter_map(|s| {
-      let a = s.range.start.max(seg.start);
-      let b = s.range.end.min(seg.end);
-      (a < b).then(|| ((a - seg.start)..(b - seg.start), &s.kind))
-    })
-    .collect();
-
-  let mut cuts = vec![0, slice.len()];
-  for (range, _) in &clipped {
-    cuts.push(range.start);
-    cuts.push(range.end);
+/// A line of the conversation itself: its text, with nothing but the find bar's hits on it.
+fn plain_text(row: &Row, prepared: &Prepared, ctx: &MsgCtx) -> AnyElement {
+  match prepared.blocks.first() {
+    Some(Block::Text(segment)) => segment.draw(row, ctx),
+    _ => StyledText::new(SharedString::default()).into_any_element(),
   }
-  cuts.sort_unstable();
-  cuts.dedup();
+}
 
-  let mut highlights: Vec<(Range<usize>, HighlightStyle)> = find_highlights(text, seg.clone(), find, current);
-  let mut fonts: Vec<(Range<usize>, SharedString)> = Vec::new();
-  for pair in cuts.windows(2) {
-    let (a, b) = (pair[0], pair[1]);
-    let mut style = HighlightStyle::default();
-    let mut touched = false;
-    let mut code = false;
+/// One stretch of a message's text drawn as one text element, worked out once.
+struct Segment {
+  /// Its number among the message's text elements, for its element id.
+  n: usize,
+  /// Where it is in the message's text.
+  range: Range<usize>,
+  /// Its text with the pads around mentions (`pad_at`).
+  shown: SharedString,
+  /// The styles of its spans and the monospace runs of its code, on its own text before the pads, for laying the find
+  /// bar's hits in with them.
+  styles: Vec<(Range<usize>, HighlightStyle)>,
+  code: Vec<(Range<usize>, SharedString)>,
+  marks: Vec<Mark>,
+  /// The highlights and fonts of `shown` with no find hits on it.
+  highlights: Vec<(Range<usize>, HighlightStyle)>,
+  fonts: Vec<(Range<usize>, SharedString)>,
+  /// Where in `shown` the links and mentions are, and what a click on each opens.
+  links: Vec<Range<usize>>,
+  targets: Rc<[Target]>,
+}
+
+impl Segment {
+  fn new(text: &str, seg: Range<usize>, spans: &[Span], n: usize) -> Self {
+    let slice = &text[seg.clone()];
+    let clipped: Vec<(Range<usize>, &SpanKind)> = spans
+      .iter()
+      .filter(|s| !matches!(s.kind, SpanKind::CodeBlock) && valid(text, &s.range))
+      .filter_map(|s| {
+        let a = s.range.start.max(seg.start);
+        let b = s.range.end.min(seg.end);
+        (a < b).then(|| ((a - seg.start)..(b - seg.start), &s.kind))
+      })
+      .collect();
+
+    let mut cuts = vec![0, slice.len()];
+    for (range, _) in &clipped {
+      cuts.push(range.start);
+      cuts.push(range.end);
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let mono = theme::mono();
+    let mut styles: Vec<(Range<usize>, HighlightStyle)> = Vec::new();
+    let mut code: Vec<(Range<usize>, SharedString)> = Vec::new();
+    for pair in cuts.windows(2) {
+      let (a, b) = (pair[0], pair[1]);
+      let mut style = HighlightStyle::default();
+      let mut touched = false;
+      let mut monospace = false;
+      for (range, kind) in &clipped {
+        if range.start > a || range.end < b {
+          continue;
+        }
+        touched = true;
+        match kind {
+          SpanKind::Bold => style.font_weight = Some(FontWeight::BOLD),
+          SpanKind::Italic => style.font_style = Some(FontStyle::Italic),
+          SpanKind::Strike => {
+            style.strikethrough = Some(StrikethroughStyle { thickness: px(1.), color: None });
+          },
+          SpanKind::Underline => {
+            style.underline = Some(UnderlineStyle {
+              thickness: px(1.),
+              color: None,
+              wavy: false,
+            });
+          },
+          SpanKind::Code => {
+            style.background_color = Some(rgb(CODE_BG).into());
+            monospace = true;
+          },
+          SpanKind::Link(_) => {
+            style.color = Some(rgb(ACCENT).into());
+            style.underline = Some(UnderlineStyle {
+              thickness: px(1.),
+              color: None,
+              wavy: false,
+            });
+          },
+          SpanKind::Mention(_) | SpanKind::MentionAll => {
+            style.color = Some(rgb(ACCENT).into());
+            style.background_color = Some(rgb(ACCENT_BG).into());
+          },
+          SpanKind::CodeBlock | SpanKind::ListItem => {},
+        }
+      }
+      if touched {
+        styles.push((a..b, style));
+      }
+      if monospace {
+        code.push((a..b, mono.clone()));
+      }
+    }
+
+    // What a click opens: a link's address, or the chat with the person a mention names.
+    let mut links = Vec::new();
+    let mut targets = Vec::new();
     for (range, kind) in &clipped {
-      if range.start > a || range.end < b {
-        continue;
-      }
-      touched = true;
-      match kind {
-        SpanKind::Bold => style.font_weight = Some(FontWeight::BOLD),
-        SpanKind::Italic => style.font_style = Some(FontStyle::Italic),
-        SpanKind::Strike => {
-          style.strikethrough = Some(StrikethroughStyle { thickness: px(1.), color: None });
-        },
-        SpanKind::Underline => {
-          style.underline = Some(UnderlineStyle {
-            thickness: px(1.),
-            color: None,
-            wavy: false,
-          });
-        },
-        SpanKind::Code => {
-          style.background_color = Some(rgb(CODE_BG).into());
-          code = true;
-        },
-        SpanKind::Link(_) => {
-          style.color = Some(rgb(ACCENT).into());
-          style.underline = Some(UnderlineStyle {
-            thickness: px(1.),
-            color: None,
-            wavy: false,
-          });
-        },
-        SpanKind::Mention(_) | SpanKind::MentionAll => {
-          style.color = Some(rgb(ACCENT).into());
-          style.background_color = Some(rgb(ACCENT_BG).into());
-        },
-        SpanKind::CodeBlock | SpanKind::ListItem => {},
-      }
+      let target = match kind {
+        SpanKind::Link(url) => Target::Url(url.clone()),
+        SpanKind::Mention(user_id) => Target::Person(user_id.clone()),
+        _ => continue,
+      };
+      links.push(range.clone());
+      targets.push(target);
     }
-    if touched {
-      highlights.push((a..b, style));
-    }
-    if code {
-      fonts.push((a..b, crate::theme::mono()));
+
+    let marks = mention_marks(slice, &clipped);
+    let shown = pad_at(slice, &marks);
+    let (highlights, fonts) = laid_out(&shown, &marks, compact_highlights(slice, styles.clone()), &code);
+    let links = links.iter().map(|range| remap(range, &marks)).collect();
+    Self {
+      n,
+      range: seg,
+      shown: shown.into(),
+      styles,
+      code,
+      marks,
+      highlights,
+      fonts,
+      links,
+      targets: targets.into(),
     }
   }
-  let highlights = compact_highlights(slice, highlights);
 
-  // What a click opens: a link's address, or the chat with the person a mention names.
-  let mut link_ranges = Vec::new();
-  let mut targets = Vec::new();
-  for (range, kind) in &clipped {
-    let target = match kind {
-      SpanKind::Link(url) => Target::Url(url.clone()),
-      SpanKind::Mention(user_id) => Target::Person(user_id.clone()),
-      _ => continue,
+  /// The segment as an element, with the find bar's hits in the message (`ctx.find`) laid over its styles.
+  fn draw(&self, row: &Row, ctx: &MsgCtx) -> AnyElement {
+    let found = find_highlights(&self.range, ctx.find, ctx.find_hit.as_ref());
+    let styled = StyledText::new(self.shown.clone());
+    let styled = if found.is_empty() {
+      styled
+        .with_highlights(self.highlights.iter().cloned())
+        .with_font_family_overrides(self.fonts.iter().cloned())
+    } else {
+      let slice = row.msg.text.get(self.range.clone()).unwrap_or_default();
+      let mut highlights = found;
+      highlights.extend(self.styles.iter().cloned());
+      let (highlights, fonts) = laid_out(&self.shown, &self.marks, compact_highlights(slice, highlights), &self.code);
+      styled.with_highlights(highlights).with_font_family_overrides(fonts)
     };
-    link_ranges.push(range.clone());
-    targets.push(target);
-  }
-
-  let marks = mention_marks(slice, &clipped);
-  let shown = pad_at(slice, &marks);
-  let remap = |range: &Range<usize>| shift_start(range.start, &marks)..shift_end(range.end, &marks);
-  let highlights = highlights
-    .iter()
-    .map(|(range, style)| (remap(range), *style))
-    .collect::<Vec<_>>();
-  let fonts = fonts
-    .iter()
-    .map(|(range, font)| (remap(range), font.clone()))
-    .collect::<Vec<_>>();
-  let link_ranges = link_ranges.iter().map(remap).collect::<Vec<_>>();
-  let (highlights, fonts) = emoji_font::runs(&shown, highlights, fonts);
-
-  let styled = StyledText::new(shown)
-    .with_highlights(highlights)
-    .with_font_family_overrides(fonts);
-  if link_ranges.is_empty() {
-    styled.into_any_element()
-  } else {
-    let open_person = open_person.clone();
-    InteractiveText::new(id, styled)
+    if self.links.is_empty() {
+      return styled.into_any_element();
+    }
+    let (open_person, targets) = (ctx.open_person.clone(), self.targets.clone());
+    InteractiveText::new((row.id.clone(), PART_TEXT + self.n), styled)
       // Runs before the bubble's click, its listener being added after the bubble's: stopping here keeps a click on a
       // link or a mention from also opening the text panel.
-      .on_click(link_ranges, move |ix, window, cx| {
+      .on_click(self.links.clone(), move |ix, window, cx| {
         cx.stop_propagation();
         match targets.get(ix) {
           Some(Target::Url(url)) => cx.open_url(url),
@@ -1369,6 +1495,27 @@ fn text_segment(
       })
       .into_any_element()
   }
+}
+
+/// A range of a segment's own text in its padded text (`pad_at`).
+fn remap(range: &Range<usize>, marks: &[Mark]) -> Range<usize> {
+  shift_start(range.start, marks)..shift_end(range.end, marks)
+}
+
+/// The highlights (compacted) and code fonts of a segment's own text, moved onto its padded text `shown` and split for
+/// the emoji font (`emoji_font::runs`).
+fn laid_out(
+  shown: &str,
+  marks: &[Mark],
+  highlights: Vec<(Range<usize>, HighlightStyle)>,
+  code: &[(Range<usize>, SharedString)],
+) -> (Vec<(Range<usize>, HighlightStyle)>, Vec<(Range<usize>, SharedString)>) {
+  let highlights = highlights
+    .into_iter()
+    .map(|(range, style)| (remap(&range, marks), style))
+    .collect();
+  let fonts = code.iter().map(|(range, font)| (remap(range, marks), font.clone())).collect();
+  emoji_font::runs(shown, highlights, fonts)
 }
 
 /// What clicking a span of message text opens.
@@ -1495,13 +1642,27 @@ fn fit(width: Option<u32>, height: Option<u32>, max_w: f32, max_h: f32) -> (f32,
   }
 }
 
-fn attachment_view(att: &Attachment, id: SharedString, bubble: Tone, ctx: &MsgCtx, cx: &App) -> AnyElement {
+/// The widest an image attachment is drawn, in points: the viewer's stand-in while the original loads is decoded for
+/// it too, so the two share one decoded thumbnail.
+pub const THUMB_MAX: f32 = 420.;
+
+/// Opens the message's attachment `i`, as a click on it does.
+fn open_attachment(msg: &Message, i: usize, window: &mut Window, cx: &mut App) {
+  if let Some(att) = msg.attachments.get(i) {
+    viewer::open_attachment(att, window, cx);
+  }
+}
+
+fn attachment_view(msg: &Arc<Message>, i: usize, id: ElementId, bubble: Tone, ctx: &MsgCtx, cx: &App) -> AnyElement {
+  let Some(att) = msg.attachments.get(i) else {
+    return div().into_any_element();
+  };
   if att.kind == AttachmentKind::LinkPreview {
-    return link_card(att, id, bubble, ctx, cx);
+    return link_card(msg, i, att, id, bubble, ctx, cx);
   }
   if let (AttachmentKind::Image, Some(thumb)) = (att.kind, att.thumb_url.as_deref()) {
-    let (w, h) = fit(att.width, att.height, 420., 320.);
-    let (open, menu_att, menu_core) = (att.clone(), att.clone(), ctx.core.clone());
+    let (w, h) = fit(att.width, att.height, THUMB_MAX, 320.);
+    let (open, menu_msg, menu_core) = (msg.clone(), msg.clone(), ctx.core.clone());
     let mut frame = div()
       .id(id)
       .w(px(w))
@@ -1510,38 +1671,49 @@ fn attachment_view(att: &Attachment, id: SharedString, bubble: Tone, ctx: &MsgCt
       .rounded(px(14.))
       .bg(rgb(PLACEHOLDER))
       .cursor_pointer()
-      .on_click(move |_, window, cx| viewer::open_attachment(&open, window, cx))
+      .on_click(move |_, window, cx| open_attachment(&open, i, window, cx))
       .on_mouse_down(MouseButton::Right, move |event, window, cx| {
-        viewer::image_menu(&menu_core, &menu_att, event.position, window, cx);
+        if let Some(att) = menu_msg.attachments.get(i) {
+          viewer::image_menu(&menu_core, att, event.position, window, cx);
+        }
       });
-    if let Some(image) = ctx.images.get(thumb, 1600, cx) {
+    if let Some(image) = ctx.images.thumb(thumb, w.max(h), ctx.scale, cx) {
       frame = frame.child(img(image).size_full().rounded(px(14.)).object_fit(ObjectFit::Cover));
     }
     return frame.into_any_element();
   }
   // A file on its way up, or one that failed to go: it opens from the disk.
   if att.url.starts_with("file://") {
-    return chip(att, id, false);
+    return chip(msg, i, id, false);
   }
   if att.kind == AttachmentKind::Meet {
     return meet_card(att, id);
   }
   if viewer::is_video(att) {
-    return video_tile(att, id, ctx, cx);
+    return video_tile(msg, i, att, id, ctx, cx);
   }
-  chip(att, id, true)
+  chip(msg, i, id, true)
 }
 
 /// A link's preview, drawn as a second bubble of its message so it reads as part of it: the page's image at its
 /// own proportions, then its title and domain. The whole card opens the link; hovering shows the full address.
-fn link_card(att: &Attachment, id: SharedString, bubble: Tone, ctx: &MsgCtx, cx: &App) -> AnyElement {
+fn link_card(
+  msg: &Arc<Message>,
+  i: usize,
+  att: &Attachment,
+  id: ElementId,
+  bubble: Tone,
+  ctx: &MsgCtx,
+  cx: &App,
+) -> AnyElement {
   const RADIUS: f32 = 16.;
   const GROUP: &str = "link-card";
   // The image keeps its proportions, as image attachments do; the card is never narrower than its text needs.
   let (image_w, image_h) = fit(att.width, att.height, 400., 300.);
   let card_w = image_w.max(280.);
-  let (open, address, menu_att, menu_core) = (att.url.clone(), att.url.clone(), att.clone(), ctx.core.clone());
+  let (open, address) = (msg.clone(), msg.clone());
   let image = att.thumb_url.as_deref().map(|thumb| {
+    let (menu_msg, menu_core) = (msg.clone(), ctx.core.clone());
     let mut frame = h_flex()
       .w_full()
       .h(px(image_h))
@@ -1549,9 +1721,11 @@ fn link_card(att: &Attachment, id: SharedString, bubble: Tone, ctx: &MsgCtx, cx:
       .rounded_t(px(RADIUS))
       .bg(rgb(PLACEHOLDER))
       .on_mouse_down(MouseButton::Right, move |event, window, cx| {
-        viewer::image_menu(&menu_core, &menu_att, event.position, window, cx);
+        if let Some(att) = menu_msg.attachments.get(i) {
+          viewer::image_menu(&menu_core, att, event.position, window, cx);
+        }
       });
-    if let Some(image) = ctx.images.get(thumb, 1600, cx) {
+    if let Some(image) = ctx.images.thumb(thumb, image_w.max(image_h), ctx.scale, cx) {
       // An explicit size: with `size_full` the image's own aspect ratio sets its height.
       frame = frame.child(
         img(image)
@@ -1573,8 +1747,15 @@ fn link_card(att: &Attachment, id: SharedString, bubble: Tone, ctx: &MsgCtx, cx:
     .rounded(px(RADIUS))
     .bg(rgb(bubble))
     .cursor_pointer()
-    .tooltip(move |window, cx| Tooltip::new(address.clone()).build(window, cx))
-    .on_click(move |_, _, cx| cx.open_url(&open))
+    .tooltip(move |window, cx| {
+      let url = address.attachments.get(i).map_or_default(|att| att.url.clone());
+      Tooltip::new(url).build(window, cx)
+    })
+    .on_click(move |_, _, cx| {
+      if let Some(att) = open.attachments.get(i) {
+        cx.open_url(&att.url);
+      }
+    })
     .children(image)
     .child(
       v_flex()
@@ -1616,9 +1797,9 @@ fn link_domain(url: &str) -> String {
 }
 
 /// A video: poster frame (when the server has one) under a play button, like the web app. Opens the viewer.
-fn video_tile(att: &Attachment, id: SharedString, ctx: &MsgCtx, cx: &App) -> AnyElement {
-  let (w, h) = fit(att.width, att.height, 420., 320.);
-  let open = att.clone();
+fn video_tile(msg: &Arc<Message>, i: usize, att: &Attachment, id: ElementId, ctx: &MsgCtx, cx: &App) -> AnyElement {
+  let (w, h) = fit(att.width, att.height, THUMB_MAX, 320.);
+  let open = msg.clone();
   let mut tile = div()
     .id(id)
     .relative()
@@ -1629,8 +1810,8 @@ fn video_tile(att: &Attachment, id: SharedString, ctx: &MsgCtx, cx: &App) -> Any
     .rounded(px(14.))
     .bg(gpui_kit::rgb(0x000000))
     .cursor_pointer()
-    .on_click(move |_, window, cx| viewer::open_attachment(&open, window, cx));
-  if let Some(image) = viewer::poster_url(att).and_then(|url| ctx.images.get(&url, 1600, cx)) {
+    .on_click(move |_, window, cx| open_attachment(&open, i, window, cx));
+  if let Some(image) = viewer::poster_url(att).and_then(|url| ctx.images.thumb(&url, w.max(h), ctx.scale, cx)) {
     tile = tile.child(img(image).size_full().object_fit(ObjectFit::Cover));
   }
   tile
@@ -1673,7 +1854,7 @@ fn video_tile(att: &Attachment, id: SharedString, ctx: &MsgCtx, cx: &App) -> Any
 }
 
 /// A Google Meet invitation: what it is, the meeting code, and a Join button. Opens the meeting.
-fn meet_card(att: &Attachment, id: SharedString) -> AnyElement {
+fn meet_card(att: &Attachment, id: ElementId) -> AnyElement {
   let url = att.url.clone();
   let code = att
     .url
@@ -1737,13 +1918,16 @@ fn meet_card(att: &Attachment, id: SharedString) -> AnyElement {
 }
 
 /// A file row: icon and name. Opens the viewer (or the browser for Drive files, Meet links and link previews).
-fn chip(att: &Attachment, id: SharedString, viewer_first: bool) -> AnyElement {
-  let att = att.clone();
+fn chip(msg: &Arc<Message>, i: usize, id: ElementId, viewer_first: bool) -> AnyElement {
+  let Some(att) = msg.attachments.get(i) else {
+    return div().into_any_element();
+  };
   let label = if att.name.is_empty() {
     att.url.clone()
   } else {
     att.name.clone()
   };
+  let msg = msg.clone();
   h_flex()
     .id(id)
     .max_w(px(420.))
@@ -1756,8 +1940,11 @@ fn chip(att: &Attachment, id: SharedString, viewer_first: bool) -> AnyElement {
     .cursor_pointer()
     .hover(|s| s.bg(rgb(ROW_HOVER)))
     .on_click(move |_, window, cx| {
+      let Some(att) = msg.attachments.get(i) else {
+        return;
+      };
       if viewer_first {
-        viewer::open_attachment(&att, window, cx);
+        viewer::open_attachment(att, window, cx);
       } else {
         cx.open_url(&att.url);
       }
@@ -1768,7 +1955,7 @@ fn chip(att: &Attachment, id: SharedString, viewer_first: bool) -> AnyElement {
 }
 
 /// An app card as Google Chat draws it: a bordered box, the header first, then each section with a divider above it.
-fn card_view(card: &Card, msg: &Message, ctx: &MsgCtx, cx: &App, ix: usize) -> AnyElement {
+fn card_view(card: &Card, msg: &Arc<Message>, ctx: &MsgCtx, cx: &App, ix: usize) -> AnyElement {
   let core = ctx.core;
   let msg_id = msg.id.as_str();
   let block = |first: bool| {
@@ -1863,16 +2050,27 @@ fn card_view(card: &Card, msg: &Message, ctx: &MsgCtx, cx: &App, ix: usize) -> A
             pressable(pill).on_click(move |_, _, cx| cx.open_url(&url))
           },
           // The app answers through Google Chat, by updating this message or posting a new one.
-          (None, Some(action)) => {
-            let command = Command::ClickCard {
-              group: msg.group.clone(),
-              topic_id: msg.topic_id.clone(),
-              message_id: msg.id.clone(),
-              card_id: card.id.clone(),
-              action: action.clone(),
-            };
-            let core = core.clone();
-            pressable(pill).on_click(move |_, _, _| core.send(command.clone()))
+          (None, Some(_)) => {
+            let (core, msg) = (core.clone(), msg.clone());
+            pressable(pill).on_click(move |_, _, _| {
+              let Some(card) = msg.cards.get(ix) else {
+                return;
+              };
+              let action = card
+                .sections
+                .get(s)
+                .and_then(|section| section.buttons.get(b))
+                .and_then(|button| button.action.clone());
+              if let Some(action) = action {
+                core.send(Command::ClickCard {
+                  group: msg.group.clone(),
+                  topic_id: msg.topic_id.clone(),
+                  message_id: msg.id.clone(),
+                  card_id: card.id.clone(),
+                  action,
+                });
+              }
+            })
           },
           (None, None) => pill.text_color(rgb(MUTED)),
         });
@@ -1884,20 +2082,13 @@ fn card_view(card: &Card, msg: &Message, ctx: &MsgCtx, cx: &App, ix: usize) -> A
   body.into_any_element()
 }
 
-fn reactions_view(reactions: &[Reaction], msg: &Message, core: &Core) -> AnyElement {
+fn reactions_view(msg: &Arc<Message>, id: &SharedString, core: &Core) -> AnyElement {
   let mut row = h_flex().flex_wrap().gap_1();
-  for (i, reaction) in reactions.iter().enumerate() {
-    let (core, group, topic, id, emoji) = (
-      core.clone(),
-      msg.group.clone(),
-      msg.topic_id.clone(),
-      msg.id.clone(),
-      reaction.emoji.clone(),
-    );
-    let add = !reaction.mine;
+  for (i, reaction) in msg.reactions.iter().enumerate() {
+    let (core, target) = (core.clone(), msg.clone());
     row = row.child(
       h_flex()
-        .id(SharedString::from(format!("{}-r{i}", msg.id)))
+        .id((id.clone(), PART_REACTION + i))
         .gap_1()
         .px_2()
         .h(px(24.))
@@ -1908,7 +2099,18 @@ fn reactions_view(reactions: &[Reaction], msg: &Message, core: &Core) -> AnyElem
         .cursor_pointer()
         .when(reaction.mine, |d| d.bg(rgb(ACCENT_BG)).border_color(rgb(ACCENT)))
         .when(!reaction.mine, |d| d.border_color(rgb(BORDER)).hover(|s| s.bg(rgb(ROW_HOVER))))
-        .on_click(move |_, _, _| react(&core, &group, &topic, &id, &emoji, add))
+        .on_click(move |_, _, _| {
+          if let Some(reaction) = target.reactions.get(i) {
+            react(
+              &core,
+              &target.group,
+              &target.topic_id,
+              &target.id,
+              &reaction.emoji,
+              !reaction.mine,
+            );
+          }
+        })
         .child(emoji_font::text(reaction.emoji.clone()))
         .child(reaction.count.to_string()),
     );
@@ -1987,6 +2189,23 @@ mod tests {
     assert_eq!(find_ranges("abc abc", "bc"), vec![1..3, 5..7]);
     assert_eq!(find_ranges("hello", ""), [] as [std::ops::Range<usize>; 0]);
     assert_eq!(find_ranges("café", "é"), vec![3..5]);
+  }
+
+  #[test]
+  fn find_hits_are_clipped_to_each_segment() {
+    // "one two three": a hit over "e two t" crosses the segments 0..4 and 4..13.
+    use std::ops::Range;
+    let hit = Range { start: 2, end: 9 };
+    let hits = std::slice::from_ref(&hit);
+    let ranges = |seg: Range<usize>, current: Option<&Range<usize>>| -> Vec<Range<usize>> {
+      super::find_highlights(&seg, hits, current)
+        .into_iter()
+        .map(|(range, _)| range)
+        .collect()
+    };
+    assert_eq!(ranges(0..4, None), [Range { start: 2, end: 4 }]);
+    assert_eq!(ranges(4..13, Some(&hit)), [Range { start: 0, end: 5 }]);
+    assert_eq!(ranges(9..13, None), Vec::<Range<usize>>::new());
   }
 
   #[test]
@@ -2108,11 +2327,18 @@ mod tests {
     // Jordan stopped after `a`; Riley read past everything, so she is on `b` and not on the system line or the message
     // still going out; Sam read none of it.
     let placed = Readers::place(&rows, &[reader("jordan", 15), reader("riley", 60), reader("sam", 5)]);
-    let at = |id: &str| placed.of(id).iter().map(|reader| reader.user_id.as_str()).collect::<Vec<_>>();
+    let at = |id: &str| {
+      placed
+        .of(id)
+        .into_iter()
+        .flat_map(|readers| readers.iter())
+        .map(|reader| reader.user_id.as_str())
+        .collect::<Vec<_>>()
+    };
     assert_eq!(at("a"), ["jordan"]);
     assert_eq!(at("b"), ["riley"]);
     assert_eq!(at("joined"), Vec::<&str>::new());
     assert_eq!(at("sending"), Vec::<&str>::new());
-    assert_eq!(Readers::place(&rows, &[]).of("a"), []);
+    assert!(Readers::place(&rows, &[]).of("a").is_none());
   }
 }

@@ -40,7 +40,7 @@ impl EventEmitter<NewChatEvent> for NewChat {}
 /// The people to offer for `query`, best match first, without those `skip` leaves out. With no query, the people the
 /// user has a one-to-one chat with come first, then the rest by name.
 pub fn match_people(store: &Store, query: &str, skip: impl Fn(&User) -> bool) -> Vec<Arc<User>> {
-  let mut people: Vec<Arc<User>> = store.people.iter().filter(|user| !skip(user)).cloned().map(Arc::new).collect();
+  let offered = store.people.shared().filter(|user| !skip(user));
   if query.is_empty() {
     let dms: HashSet<&str> = store
       .all
@@ -48,15 +48,15 @@ pub fn match_people(store: &Store, query: &str, skip: impl Fn(&User) -> bool) ->
       .filter(|conv| conv.g.kind == GroupKind::Dm)
       .flat_map(|conv| conv.g.member_ids.iter().map(String::as_str))
       .collect();
-    people.sort_by_key(|user| (!dms.contains(user.id.as_str()), user.name.to_lowercase()));
+    let mut people: Vec<Arc<User>> = offered.cloned().collect();
+    people.sort_by_cached_key(|user| (!dms.contains(user.id.as_str()), user.name.to_lowercase()));
     return people;
   }
   let mut fuzzy = Fuzzy::new(query);
-  let mut hits: Vec<(u32, Arc<User>)> = people
-    .into_iter()
+  let mut hits: Vec<(u32, Arc<User>)> = offered
     .filter_map(|user| {
       let score = fuzzy.score(&user.name).into_iter().chain(fuzzy.score(&user.email)).max();
-      score.map(|score| (score, user))
+      score.map(|score| (score, user.clone()))
     })
     .collect();
   hits.sort_by(|a, b| b.0.cmp(&a.0));

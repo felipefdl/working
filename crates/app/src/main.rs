@@ -184,6 +184,16 @@ fn main() {
     cx.set_global(status::DndState::default());
     status::keep_presence(core.clone(), cx);
     cx.set_global(status::Mine::default());
+    // Quitting stops the core, which writes the history changes it still holds back to the disk cache. The wait sits
+    // before GPUI's own short wait on quit handlers, and is bounded so a stuck disk never holds the quit up.
+    cx.on_app_quit({
+      let core = core.clone();
+      move |_| {
+        core.shutdown(std::time::Duration::from_millis(1500));
+        async {}
+      }
+    })
+    .detach();
 
     keys::bind(cx);
     cx.on_action(|_: &Quit, cx| cx.quit());

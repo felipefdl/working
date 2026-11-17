@@ -86,6 +86,8 @@ pub struct MeetView {
   pub(crate) copied: bool,
   /// Meet is the view on screen.
   active: bool,
+  /// A read of the day's events came due while the window was hidden: it happens once the window shows.
+  stale: bool,
   _copied_reset: Option<Task<()>>,
   _subs: Vec<Subscription>,
   _tick: Task<()>,
@@ -125,20 +127,28 @@ impl MeetView {
         window.focus(&this.focus, cx);
         this.go_to(picked.date(), window, cx);
       }),
+      // A hidden window shows nothing: what came due while it was hidden happens when it shows again.
+      cx.observe_window_visibility(window, |this, visibility, _, cx| {
+        if visibility.is_visible() && this.active {
+          this.catch_up(cx);
+        }
+      }),
     ];
-    let tick = cx.spawn(async move |this, cx| {
+    let tick = cx.spawn_in(window, async move |this, cx| {
       let mut ticks = 0_u32;
       loop {
         cx.background_executor().timer(TICK).await;
         ticks = ticks.wrapping_add(1);
-        let alive = this.update(cx, |this, cx| {
+        let alive = this.update_in(cx, |this, window, cx| {
           if !this.active {
             return;
           }
           if ticks.is_multiple_of(TICKS_PER_READ) {
-            this.load(cx);
+            this.stale = true;
           }
-          cx.notify();
+          if window.is_visible() {
+            this.catch_up(cx);
+          }
         });
         if alive.is_err() {
           break;
@@ -162,6 +172,7 @@ impl MeetView {
       card: None,
       copied: false,
       active: false,
+      stale: false,
       _copied_reset: None,
       _subs: subs,
       _tick: tick,
@@ -174,6 +185,7 @@ impl MeetView {
     let shown = self.store.read(cx).view == View::Meet;
     if shown && !self.active {
       self.active = true;
+      self.stale = false;
       self.failure = None;
       self.go_to(today(), window, cx);
     } else if !shown && self.active {
@@ -184,7 +196,7 @@ impl MeetView {
       return;
     }
     self.refresh_meetings(cx);
-    if self.tab == Tab::Calls && self.people_total != self.store.read(cx).people.len() {
+    if self.tab == Tab::Calls && self.people_total != self.store.read(cx).people.count() {
       self.refresh_people(cx);
     }
     if let Some(url) = self.store.update(cx, |store, _| store.take_meeting()) {
@@ -206,7 +218,7 @@ impl MeetView {
   fn refresh_people(&mut self, cx: &mut Context<Self>) {
     let query = self.search.read(cx).value().trim().to_string();
     let store = self.store.read(cx);
-    self.people_total = store.people.len();
+    self.people_total = store.people.count();
     self.people = match_people(store, &query, |_| false);
     self.picked = if query.is_empty() {
       self.picked.take().filter(|id| self.people.iter().any(|user| user.id == *id))
@@ -257,6 +269,15 @@ impl MeetView {
   fn load(&self, cx: &mut Context<Self>) {
     let (start, end) = day_range(self.day);
     self.store.update(cx, |store, cx| store.load_meet(start, end, cx));
+  }
+
+  /// The minute tick's work, once the window shows: reads the events again when a read came due, and redraws for the
+  /// time.
+  fn catch_up(&mut self, cx: &mut Context<Self>) {
+    if std::mem::take(&mut self.stale) {
+      self.load(cx);
+    }
+    cx.notify();
   }
 
   fn set_tab(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {

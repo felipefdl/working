@@ -49,8 +49,22 @@ pub fn message_time(t: Micros) -> String {
   }
 }
 
-pub fn day_key(t: Micros) -> i32 {
-  local(t).date_naive().num_days_from_ce()
+/// The local day of `t` as a number (`num_days_from_ce`), and the span of microseconds of that day, so the times after
+/// it on the same day need no time-zone conversion. A day whose midnight cannot be found (a time-zone change at
+/// midnight) spans `t` alone.
+pub fn day_span(t: Micros) -> (i32, std::ops::Range<Micros>) {
+  let date = local(t).date_naive();
+  let midnight = |date: chrono::NaiveDate| {
+    date
+      .and_hms_opt(0, 0, 0)
+      .and_then(|time| Local.from_local_datetime(&time).earliest())
+      .map(|time| time.timestamp_micros())
+  };
+  let span = match (midnight(date), date.succ_opt().and_then(midnight)) {
+    (Some(start), Some(end)) if start <= t && t < end => start..end,
+    _ => t..t.saturating_add(1),
+  };
+  (date.num_days_from_ce(), span)
 }
 
 pub fn date_label(t: Micros) -> String {
@@ -152,5 +166,22 @@ mod tests {
   fn rel_time_hides_missing_times() {
     assert_eq!(rel_time(0), "");
     assert_eq!(rel_time(-1), "");
+  }
+}
+
+#[cfg(test)]
+mod day_tests {
+  use super::day_span;
+
+  #[test]
+  fn day_span_holds_its_time_and_the_rest_of_its_day() {
+    let t = 1_700_000_000_000_000;
+    let (key, span) = day_span(t);
+    assert!(span.contains(&t));
+    assert_eq!(day_span(span.start).0, key);
+    assert_eq!(day_span(span.end - 1).0, key);
+    if span.end - span.start > 1 {
+      assert_eq!(day_span(span.end).0, key + 1);
+    }
   }
 }

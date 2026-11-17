@@ -28,13 +28,19 @@ const TAB_HEIGHT: f32 = 56.0;
 /// padding. Below that the list of panes scrolls instead.
 const TAB_MIN_HEIGHT: f32 = 44.0;
 
+/// The window root draws it as a cached view, so it redraws itself whenever the store or the settings change.
 pub struct Rail {
   store: Entity<Store>,
+  _subs: [Subscription; 2],
 }
 
 impl Rail {
-  pub const fn new(store: Entity<Store>) -> Self {
-    Self { store }
+  pub fn new(store: Entity<Store>, cx: &mut Context<Self>) -> Self {
+    let subs = [
+      cx.observe(&store, |_, _, cx| cx.notify()),
+      cx.observe_global::<Settings>(|_, cx| cx.notify()),
+    ];
+    Self { store, _subs: subs }
   }
 }
 
