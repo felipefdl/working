@@ -1030,8 +1030,8 @@ impl Store {
     }
     let searching = !query.is_empty();
     if beside {
-      // Stable: pinned first, then in IRC one kind after another, in the chosen order within each. Search results
-      // keep best match first.
+      // Stable, in the chosen order within each: pinned first; in IRC one kind after another, each with its pinned
+      // first. Search results keep best match first.
       if !searching {
         let by_kind = self.layout == Layout::Irc;
         shown.sort_by_key(|conv| {
@@ -1040,7 +1040,7 @@ impl Store {
           } else {
             0
           };
-          (!conv.g.pinned, rank)
+          (rank, !conv.g.pinned)
         });
       }
       self.home = Vec::new();

@@ -223,8 +223,8 @@ impl ConvList {
     }
   }
 
-  /// IRC: a conversation as one line of its buffer name, bright and bold with the unread dot while unread. A click
-  /// opens it and a right-click shows its menu, as on the Messages row.
+  /// IRC: a conversation as one line of its buffer name, after `@` while pinned, bold in the accent color with the
+  /// unread dot while unread. A click opens it and a right-click shows its menu, as on the Messages row.
   fn buffer_row(&self, ix: usize, conv: &Conv, selected: bool) -> Stateful<Div> {
     let g = &conv.g;
     let opened = g.id.clone();
@@ -252,9 +252,19 @@ impl ConvList {
           .flex_1()
           .min_w_0()
           .truncate()
-          .text_color(rgb(if g.unread || selected { TEXT } else { MUTED }))
+          .text_color(rgb(if g.unread {
+            ACCENT
+          } else if selected {
+            TEXT
+          } else {
+            MUTED
+          }))
           .when(g.unread, |d| d.font_weight(FontWeight::BOLD))
-          .child(emoji_font::text(buffer_name(g))),
+          .child(emoji_font::text(if g.pinned {
+            format!("@{}", buffer_name(g))
+          } else {
+            buffer_name(g)
+          })),
       )
       .when(g.unread, |row| {
         row.child(div().size(px(6.)).flex_shrink_0().rounded_full().bg(rgb(ACCENT)))
@@ -464,11 +474,14 @@ pub fn pane_title(pane: &Pane) -> &str {
   }
 }
 
-/// A conversation's name as IRC writes it: a space as `#name`, a DM or group DM as its plain name.
+/// A conversation's name as IRC writes it: a space as `#name`, a group DM as `&name`, an app as `+name`, a DM as its
+/// plain name.
 pub fn buffer_name(g: &Group) -> String {
   match g.kind {
     GroupKind::Space => format!("#{}", g.name),
-    GroupKind::Dm | GroupKind::App | GroupKind::GroupDm => g.name.clone(),
+    GroupKind::GroupDm => format!("&{}", g.name),
+    GroupKind::App => format!("+{}", g.name),
+    GroupKind::Dm => g.name.clone(),
   }
 }
 
