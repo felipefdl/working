@@ -8,7 +8,7 @@ pub fn local(t: Micros) -> DateTime<Local> {
   Local.timestamp_micros(t).single().unwrap_or_else(Local::now)
 }
 
-/// `now`, `4 min`, `11:22 AM`, `Yesterday`, `Nov 3`.
+/// `now`, `4 min`, `11:22 AM` (`11:22` on a 24-hour clock), `Yesterday`, `Nov 3`.
 pub fn rel_time(t: Micros) -> String {
   if t <= 0 {
     return String::new();
@@ -23,7 +23,7 @@ pub fn rel_time(t: Micros) -> String {
     return format!("{} min", secs / 60);
   }
   if then.date_naive() == now.date_naive() {
-    return then.format("%-I:%M %p").to_string();
+    return clock_text(then, crate::clock::is_24_hour());
   }
   if then.date_naive() == (now - Duration::days(1)).date_naive() {
     return "Yesterday".into();
@@ -45,7 +45,16 @@ pub fn message_time(t: Micros) -> String {
   } else if secs < 3600 {
     format!("{} min", secs / 60)
   } else {
-    then.format("%-I:%M %p").to_string()
+    clock_text(then, crate::clock::is_24_hour())
+  }
+}
+
+/// `1:50 PM`, or `13:50` when `h24`: a clock time as message headers and lists write it.
+pub fn clock_text(at: DateTime<Local>, h24: bool) -> String {
+  if h24 {
+    at.format("%-H:%M").to_string()
+  } else {
+    at.format("%-I:%M %p").to_string()
   }
 }
 

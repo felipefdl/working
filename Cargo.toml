@@ -37,7 +37,7 @@ nucleo-matcher = "0.3"
 objc2 = "0.6"
 objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMSampleBuffer", "CMTime", "objc2-core-video"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVBase", "CVBuffer", "CVImageBuffer", "CVPixelBuffer", "CVReturn"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSHTTPCookie", "NSDictionary", "NSString", "NSArray", "NSEnumerator", "NSError", "NSValue"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSHTTPCookie", "NSDictionary", "NSString", "NSArray", "NSEnumerator", "NSError", "NSValue", "NSDateFormatter", "NSFormatter", "NSLocale"] }
 objc2-screen-capture-kit = { version = "0.3", default-features = false, features = ["std", "SCContentSharingPicker", "SCShareableContent", "SCStream", "bitflags", "block2", "dispatch2", "objc2-core-foundation", "objc2-core-media"] }
 objc2-user-notifications = "0.3"
 prost = "0.14"
@@ -58,7 +58,7 @@ urlencoding = "2"
 webkit2gtk = { version = "2.0.1", features = ["v2_38"] }
 webview2-com = "0.38"
 windows = { version = "0.61", features = ["Data_Xml_Dom", "UI_Notifications", "Win32_System_WinRT"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Globalization", "Win32_System_Console", "Win32_System_SystemInformation", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_Shell"] }
 winresource = { version = "0.1.34", default-features = false }
 wry = { version = "0.53.3", package = "lb-wry" }
 x11rb = { version = "0.14", features = ["screensaver"] }

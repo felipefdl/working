@@ -465,10 +465,17 @@ pub fn agenda(events: &[CalendarEvent], days: &[NaiveDate]) -> Vec<(NaiveDate, V
     .collect()
 }
 
-/// `7am`, `11:30am`, `12pm`: a clock time as Google Calendar writes it.
+/// `7am`, `11:30am`, `12pm` (`7:00`, `11:30`, `12:00` on a 24-hour clock): a clock time as Google Calendar writes it.
 pub fn clock(time: Micros) -> String {
+  clock_with(time, crate::clock::is_24_hour())
+}
+
+/// `clock`, on a 24-hour clock when `h24`.
+fn clock_with(time: Micros, h24: bool) -> String {
   let at = local(time);
-  if at.minute() == 0 {
+  if h24 {
+    at.format("%-H:%M").to_string()
+  } else if at.minute() == 0 {
     at.format("%-I%P").to_string()
   } else {
     at.format("%-I:%M%P").to_string()
@@ -476,21 +483,33 @@ pub fn clock(time: Micros) -> String {
 }
 
 /// `7 – 7:30am`, `11:30am – 12:30pm`: a start and an end on one day, naming the half of the day once when they share
-/// it.
+/// it. On a 24-hour clock, `7:00 – 7:30`.
 pub fn clock_range(start: Micros, end: Micros) -> String {
-  let (from, to) = (local(start), local(end));
-  let same_half = (from.hour() < 12) == (to.hour() < 12);
-  let first = clock(start);
-  let first = if same_half {
+  clock_range_with(start, end, crate::clock::is_24_hour())
+}
+
+/// `clock_range`, on a 24-hour clock when `h24`.
+fn clock_range_with(start: Micros, end: Micros, h24: bool) -> String {
+  let first = clock_with(start, h24);
+  let same_half = (local(start).hour() < 12) == (local(end).hour() < 12);
+  let first = if !h24 && same_half {
     first.trim_end_matches("am").trim_end_matches("pm").to_string()
   } else {
     first
   };
-  format!("{first} – {}", clock(end))
+  format!("{first} – {}", clock_with(end, h24))
 }
 
-/// `12 AM`, `1 PM`: the label of an hour line.
+/// `12 AM`, `1 PM` (`0:00`, `13:00` on a 24-hour clock): the label of an hour line.
 pub fn hour_label(hour: u8) -> String {
+  hour_label_with(hour, crate::clock::is_24_hour())
+}
+
+/// `hour_label`, on a 24-hour clock when `h24`.
+fn hour_label_with(hour: u8, h24: bool) -> String {
+  if h24 {
+    return format!("{hour}:00");
+  }
   let (shown, half) = match hour {
     0 => (12, "AM"),
     1..=11 => (hour, "AM"),
@@ -503,6 +522,11 @@ pub fn hour_label(hour: u8) -> String {
 /// When an event is, in words: `Friday, November 13 ⋅ 11:30am – 12:30pm`, `Thursday, November 26`,
 /// `Nov 30 – Dec 2, 2026`.
 pub fn when_line(event: &CalendarEvent) -> String {
+  when_line_with(event, crate::clock::is_24_hour())
+}
+
+/// `when_line`, on a 24-hour clock when `h24`.
+fn when_line_with(event: &CalendarEvent, h24: bool) -> String {
   let (first, last) = event_days(event);
   if event.all_day {
     if first == last {
@@ -514,14 +538,18 @@ pub fn when_line(event: &CalendarEvent) -> String {
     return format!("{} – {}", first.format("%b %-d"), last.format("%b %-d, %Y"));
   }
   if first == last {
-    return format!("{} ⋅ {}", first.format("%A, %B %-d"), clock_range(event.start, event.end));
+    return format!(
+      "{} ⋅ {}",
+      first.format("%A, %B %-d"),
+      clock_range_with(event.start, event.end, h24)
+    );
   }
   format!(
     "{}, {} – {}, {}",
     first.format("%b %-d"),
-    clock(event.start),
+    clock_with(event.start, h24),
     last.format("%b %-d"),
-    clock(event.end)
+    clock_with(event.end, h24)
   )
 }
 
@@ -707,16 +735,38 @@ mod tests {
   fn times_read_as_google_calendar_writes_them() {
     let day = date(2026, 11, 13);
     let morning = timed(day, (7, 0), (7, 30));
-    assert_eq!(clock(morning.start), "7am");
-    assert_eq!(clock_range(morning.start, morning.end), "7 – 7:30am");
+    assert_eq!(clock_with(morning.start, false), "7am");
+    assert_eq!(clock_range_with(morning.start, morning.end, false), "7 – 7:30am");
     let noon = timed(day, (11, 30), (12, 30));
-    assert_eq!(clock_range(noon.start, noon.end), "11:30am – 12:30pm");
-    assert_eq!(when_line(&noon), "Friday, November 13 ⋅ 11:30am – 12:30pm");
-    assert_eq!(when_line(&whole(date(2026, 11, 30), date(2026, 12, 2))), "Nov 30 – Dec 2, 2026");
-    assert_eq!(when_line(&whole(day, day)), "Friday, November 13");
+    assert_eq!(clock_range_with(noon.start, noon.end, false), "11:30am – 12:30pm");
+    assert_eq!(when_line_with(&noon, false), "Friday, November 13 ⋅ 11:30am – 12:30pm");
     assert_eq!(
-      (hour_label(0), hour_label(12), hour_label(13)),
+      when_line_with(&whole(date(2026, 11, 30), date(2026, 12, 2)), false),
+      "Nov 30 – Dec 2, 2026"
+    );
+    assert_eq!(when_line_with(&whole(day, day), false), "Friday, November 13");
+    assert_eq!(
+      (
+        hour_label_with(0, false),
+        hour_label_with(12, false),
+        hour_label_with(13, false)
+      ),
       ("12 AM".into(), "12 PM".into(), "1 PM".into())
+    );
+  }
+
+  #[test]
+  fn times_read_on_a_24_hour_clock() {
+    let day = date(2026, 11, 13);
+    let morning = timed(day, (7, 0), (7, 30));
+    assert_eq!(clock_with(morning.start, true), "7:00");
+    assert_eq!(clock_range_with(morning.start, morning.end, true), "7:00 – 7:30");
+    let noon = timed(day, (11, 30), (12, 30));
+    assert_eq!(clock_range_with(noon.start, noon.end, true), "11:30 – 12:30");
+    assert_eq!(when_line_with(&noon, true), "Friday, November 13 ⋅ 11:30 – 12:30");
+    assert_eq!(
+      (hour_label_with(0, true), hour_label_with(12, true), hour_label_with(13, true)),
+      ("0:00".into(), "12:00".into(), "13:00".into())
     );
   }
 }

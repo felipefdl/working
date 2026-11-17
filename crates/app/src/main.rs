@@ -51,6 +51,7 @@ mod call {
   }
 }
 mod chrome;
+mod clock;
 mod completion;
 #[cfg(target_os = "windows")]
 mod console;
@@ -163,6 +164,7 @@ fn main() {
     .with_writer(std::io::stderr)
     .try_init();
   let _ = std::fs::remove_dir_all(conversation::pasted_dir());
+  clock::warm();
   let core = Core::start();
   // The webviews (sign-in and Meet) are WebKitGTK, which runs on X11 only: a Wayland session runs the app through
   // XWayland.

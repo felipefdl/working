@@ -91,6 +91,9 @@ pub struct Row {
   prepared: RefCell<Option<Rc<Prepared>>>,
   /// The header's time once it is a clock time, which no longer changes.
   clock: OnceCell<SharedString>,
+  /// The IRC style's time (`irc_clock`), which is always a clock time and so never changes. Apart from `clock` because
+  /// the two are written differently on a 24-hour clock (`09:05` here, `9:05` there).
+  irc_clock: OnceCell<SharedString>,
 }
 
 impl Row {
@@ -104,6 +107,7 @@ impl Row {
       thread,
       prepared: RefCell::default(),
       clock: OnceCell::new(),
+      irc_clock: OnceCell::new(),
     }
   }
 
@@ -121,6 +125,9 @@ impl Row {
     if let Some(clock) = old.clock.take() {
       let _ = self.clock.set(clock);
     }
+    if let Some(clock) = old.irc_clock.take() {
+      let _ = self.irc_clock.set(clock);
+    }
   }
 
   /// The text as it is drawn, worked out on the first call and again after the theme or the fonts change.
@@ -134,7 +141,8 @@ impl Row {
     prepared
   }
 
-  /// The time in the header (`util::message_time`), kept once it is a clock time.
+  /// The time in the header (`util::message_time`): `now` and minutes while recent, kept once it is a clock time. The
+  /// IRC style shows `irc_time` instead.
   fn time(&self) -> SharedString {
     if let Some(clock) = self.clock.get() {
       return clock.clone();
@@ -146,6 +154,14 @@ impl Row {
       let _ = self.clock.set(time.clone());
     }
     time
+  }
+
+  /// The IRC style's time column: always the clock time (`irc_clock`), never `now` or minutes.
+  fn irc_time(&self) -> SharedString {
+    self
+      .irc_clock
+      .get_or_init(|| irc_clock(self.msg.time, crate::clock::is_24_hour()).into())
+      .clone()
   }
 }
 
@@ -597,12 +613,28 @@ fn floating_tools(row: &Row, ctx: &MsgCtx) -> Option<Stateful<Div>> {
   )
 }
 
-/// Width of the IRC style's time column: `12:59 PM` in the monospaced font, which never wraps.
-const IRC_TIME: f32 = 68.;
 /// The fewest and the most characters the IRC style's sender column makes room for: a longer name ends in an ellipsis.
 const IRC_NICK_CHARS: (usize, usize) = (3, 14);
 /// How wide one character of the monospaced font is at the IRC style's text size, a little over most fonts' 0.6 em.
 const IRC_CHAR: f32 = 8.;
+
+/// The IRC style's time, as WeeChat writes it: the clock time, never `now` or minutes, with the hour zero-padded so
+/// every time has the same length. `01:50 PM`, or `13:50` on a 24-hour clock when `h24`.
+fn irc_clock(time: Micros, h24: bool) -> String {
+  let at = util::local(time);
+  if h24 {
+    at.format("%H:%M").to_string()
+  } else {
+    at.format("%I:%M %p").to_string()
+  }
+}
+
+/// Width of the IRC style's time column: the length of every time `irc_clock` writes (`12:59 PM`, or `23:59` when
+/// `h24`) in the monospaced font.
+fn irc_time_width(h24: bool) -> f32 {
+  let chars: u8 = if h24 { 5 } else { 8 };
+  f32::from(chars) * IRC_CHAR
+}
 
 /// The width of the IRC style's sender column for `rows`: room for the longest sender's name, so short names do not
 /// leave a gap after the time. `cache` keeps the answer while the count of rows stays the same.
@@ -626,9 +658,10 @@ pub fn irc_nick_width(rows: &[Row], cache: &std::cell::Cell<(usize, f32)>) -> f3
 }
 
 /// A row in the IRC style, as WeeChat draws a buffer: each message on its own lines of time, sender and text in the
-/// monospaced font, the senders right-aligned against a rule that runs down the list, and wrapped text hanging under
-/// the text column. No avatars, no bubbles, no runs: every row names its sender and time. What the message shows
-/// after its text (attachments, cards, reactions, the thread footer) stacks under the text in the same column.
+/// monospaced font, the clock time right-aligned in a column as wide as the longest time (`irc_time_width`), the
+/// senders right-aligned against a rule that runs down the list, and wrapped text hanging under the text column. No
+/// avatars, no bubbles, no runs: every row names its sender and time. What the message shows after its text
+/// (attachments, cards, reactions, the thread footer) stacks under the text in the same column.
 fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
   let msg = &row.msg;
   let focused = ctx.focus == Some(msg.id.as_str());
@@ -657,12 +690,13 @@ fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
   // it. The space is inside its columns, so the rule between them still runs on unbroken.
   let blocks = !msg.attachments.is_empty() || !msg.cards.is_empty() || !msg.reactions.is_empty();
   let time = div()
-    .w(px(IRC_TIME))
+    .w(px(irc_time_width(crate::clock::is_24_hour())))
     .flex_shrink_0()
     .whitespace_nowrap()
+    .text_right()
     .when(blocks, gpui_kit::Styled::pt_1p5)
     .text_color(rgb(MUTED))
-    .child(row.time());
+    .child(row.irc_time());
   let nick = div()
     .w(px(ctx.nick_width))
     .ml_1()
@@ -2130,8 +2164,24 @@ fn react(core: &Core, group: &GroupId, topic: &str, id: &str, emoji: &str, add: 
 
 #[cfg(test)]
 mod tests {
-  use super::{MENTION_PAD, find_ranges, link_domain, mention_marks, pad_at, shift_end, shift_start};
+  use super::{MENTION_PAD, find_ranges, irc_clock, link_domain, mention_marks, pad_at, shift_end, shift_start};
+  use chrono::{Local, TimeZone};
   use gchat_core::SpanKind;
+
+  #[test]
+  fn irc_times_fill_their_column() {
+    let at = |hour, minute| {
+      Local
+        .with_ymd_and_hms(2026, 11, 13, hour, minute, 0)
+        .single()
+        .map(|at| at.timestamp_micros())
+    };
+    let (morning, afternoon) = (at(9, 5), at(13, 50));
+    assert_eq!(morning.map(|time| irc_clock(time, false)).as_deref(), Some("09:05 AM"));
+    assert_eq!(afternoon.map(|time| irc_clock(time, false)).as_deref(), Some("01:50 PM"));
+    assert_eq!(morning.map(|time| irc_clock(time, true)).as_deref(), Some("09:05"));
+    assert_eq!(afternoon.map(|time| irc_clock(time, true)).as_deref(), Some("13:50"));
+  }
 
   #[test]
   fn link_domain_is_the_host_without_www() {

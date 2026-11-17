@@ -225,9 +225,14 @@ impl EventEditor {
         state
       })
     };
+    let cycle = if crate::clock::is_24_hour() {
+      HourCycle::H23
+    } else {
+      HourCycle::H12
+    };
     let time = |time: NaiveTime, window: &mut Window, cx: &mut Context<Self>| {
       cx.new(|cx| {
-        let mut state = TimeFieldState::new(window, cx).hour_cycle(HourCycle::H12);
+        let mut state = TimeFieldState::new(window, cx).hour_cycle(cycle);
         state.set_time(time, window, cx);
         state
       })

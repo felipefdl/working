@@ -172,9 +172,17 @@ pub fn muted_now(schedules: &DndSchedules) -> bool {
   })
 }
 
-/// A minute of the day as a clock shows it: "7:00 PM".
+/// A minute of the day as a clock shows it: "7:00 PM", or "19:00" on a 24-hour clock.
 pub fn clock(minute: u16) -> String {
+  clock_with(minute, crate::clock::is_24_hour())
+}
+
+/// `clock`, on a 24-hour clock when `h24`.
+fn clock_with(minute: u16, h24: bool) -> String {
   let (hour, minute) = (minute / 60 % 24, minute % 60);
+  if h24 {
+    return format!("{hour}:{minute:02}");
+  }
   let half = if hour < 12 { "AM" } else { "PM" };
   format!("{}:{minute:02} {half}", if hour % 12 == 0 { 12 } else { hour % 12 })
 }
@@ -202,7 +210,7 @@ pub const WEEK: [(u8, &str); 7] = [
 
 #[cfg(test)]
 mod tests {
-  use super::{clock, days_text, presence, within};
+  use super::{clock_with, days_text, presence, within};
   use crate::settings::{ActivityStatus, Settings};
   use gchat_core::Presence;
 
@@ -217,9 +225,16 @@ mod tests {
 
   #[test]
   fn clock_is_12_hour() {
-    assert_eq!(clock(0), "12:00 AM");
-    assert_eq!(clock(12 * 60 + 5), "12:05 PM");
-    assert_eq!(clock(19 * 60), "7:00 PM");
+    assert_eq!(clock_with(0, false), "12:00 AM");
+    assert_eq!(clock_with(12 * 60 + 5, false), "12:05 PM");
+    assert_eq!(clock_with(19 * 60, false), "7:00 PM");
+  }
+
+  #[test]
+  fn clock_is_24_hour() {
+    assert_eq!(clock_with(0, true), "0:00");
+    assert_eq!(clock_with(12 * 60 + 5, true), "12:05");
+    assert_eq!(clock_with(19 * 60, true), "19:00");
   }
 
   #[test]

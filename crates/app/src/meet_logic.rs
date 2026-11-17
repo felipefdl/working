@@ -73,22 +73,22 @@ pub fn meeting_link(text: &str) -> Option<String> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Meeting {
   pub title: String,
-  /// `1:45 PM – 2:45 PM`, or `All day`.
+  /// `1:45 PM – 2:45 PM` (`13:45 – 14:45` on a 24-hour clock), or `All day`.
   pub when: String,
   /// The Google Meet link it opens.
   pub url: String,
 }
 
-/// `1:45 PM`: a clock time as Meet writes it.
-fn clock(time: Micros) -> String {
-  local(time).format("%-I:%M %p").to_string()
+/// `1:45 PM`, or `13:45` when `h24`: a clock time as Meet writes it.
+fn clock(time: Micros, h24: bool) -> String {
+  crate::util::clock_text(local(time), h24)
 }
 
-fn time_text(event: &CalendarEvent) -> String {
+fn time_text(event: &CalendarEvent, h24: bool) -> String {
   if event.all_day {
     "All day".into()
   } else {
-    format!("{} – {}", clock(event.start), clock(event.end))
+    format!("{} – {}", clock(event.start, h24), clock(event.end, h24))
   }
 }
 
@@ -101,8 +101,9 @@ fn is_listed(event: &CalendarEvent, day: NaiveDate, hidden: &[String]) -> bool {
 }
 
 /// The meetings of `day` among `events`: those with a Meet link, except the ones the user declined and the ones of a
-/// calendar in `hidden`. All-day meetings come first, then the others by start.
-pub fn meetings_on(events: &[CalendarEvent], day: NaiveDate, hidden: &[String]) -> Vec<Meeting> {
+/// calendar in `hidden`. All-day meetings come first, then the others by start. Times are on a 24-hour clock when
+/// `h24`.
+pub fn meetings_on(events: &[CalendarEvent], day: NaiveDate, hidden: &[String], h24: bool) -> Vec<Meeting> {
   let mut listed: Vec<(&CalendarEvent, &str)> = events
     .iter()
     .filter(|event| is_listed(event, day, hidden))
@@ -116,7 +117,7 @@ pub fn meetings_on(events: &[CalendarEvent], day: NaiveDate, hidden: &[String]) 
     .into_iter()
     .map(|(event, url)| Meeting {
       title: event.title.clone(),
-      when: time_text(event),
+      when: time_text(event, h24),
       url: url.to_string(),
     })
     .collect()
@@ -288,7 +289,7 @@ mod tests {
       blank,
       meeting(add_days(day, 1), (9, 0), (10, 0), "tomorrow"),
     ];
-    let listed = meetings_on(&events, day, &[]);
+    let listed = meetings_on(&events, day, &[], false);
     assert_eq!(titles(&listed), ["morning", "afternoon"]);
   }
 
@@ -299,7 +300,7 @@ mod tests {
     whole.all_day = true;
     whole.end = day_start(add_days(day, 1));
     let events = [meeting(day, (13, 45), (14, 45), "sync"), whole];
-    let listed = meetings_on(&events, day, &[]);
+    let listed = meetings_on(&events, day, &[], false);
     assert_eq!(titles(&listed), ["offsite", "sync"]);
     assert_eq!(listed.first().map(|row| row.when.as_str()), Some("All day"));
     assert_eq!(listed.get(1).map(|row| row.when.as_str()), Some("1:45 PM – 2:45 PM"));
@@ -311,7 +312,7 @@ mod tests {
     let day = date(2026, 11, 13);
     // From eleven at night to one in the morning.
     let overnight = meeting(day, (23, 0), (25, 0), "overnight");
-    let listed_on = |on_day: NaiveDate| meetings_on(std::slice::from_ref(&overnight), on_day, &[]);
+    let listed_on = |on_day: NaiveDate| meetings_on(std::slice::from_ref(&overnight), on_day, &[], false);
     assert_eq!(titles(&listed_on(day)), ["overnight"]);
     assert_eq!(titles(&listed_on(add_days(day, 1))), ["overnight"]);
     assert_eq!(titles(&listed_on(add_days(day, 2))), [] as [&str; 0]);
@@ -320,7 +321,7 @@ mod tests {
     earlier.all_day = true;
     earlier.start = day_start(sub_days(day, 1));
     earlier.end = day_start(day);
-    assert_eq!(titles(&meetings_on(&[earlier], day, &[])), [] as [&str; 0]);
+    assert_eq!(titles(&meetings_on(&[earlier], day, &[], false)), [] as [&str; 0]);
   }
 
   #[test]
@@ -333,7 +334,7 @@ mod tests {
     let mut elsewhere = meeting(day, (11, 0), (12, 0), "elsewhere");
     elsewhere.calendar_id = "hidden".into();
     let events = [declined, maybe, elsewhere];
-    let listed = meetings_on(&events, day, &["hidden".to_string()]);
+    let listed = meetings_on(&events, day, &["hidden".to_string()], false);
     assert_eq!(titles(&listed), ["maybe"]);
   }
 

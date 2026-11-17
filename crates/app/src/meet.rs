@@ -210,7 +210,8 @@ impl MeetView {
   /// The day's meetings from the store's events, without the calendars hidden in the Calendar view.
   fn refresh_meetings(&mut self, cx: &App) {
     let events = self.store.read(cx).meet.events.clone();
-    self.meetings = meetings_on(&events, self.day, &cx.global::<Settings>().calendar_hidden);
+    let hidden = &cx.global::<Settings>().calendar_hidden;
+    self.meetings = meetings_on(&events, self.day, hidden, crate::clock::is_24_hour());
   }
 
   /// Matches the people against the search text, as New chat does. With text, the best match is the one picked, so
