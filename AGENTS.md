@@ -43,6 +43,12 @@ Native Google Chat client for macOS, Linux, and Windows. The GPUI app is `crates
 - Secrets: `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, `APPLE_SIGNING_IDENTITY`, `APPLE_API_KEY`, `APPLE_API_ISSUER`, `APPLE_API_KEY_CONTENT`, `PACKAGER_SIGN_PRIVATE_KEY`, `PACKAGER_SIGN_PRIVATE_KEY_PASSWORD`, `HOMEBREW_TAP_DEPLOY_KEY`.
 - Self-update lives in `crates/app/src/updater/` (the shared loop and card in `mod.rs`, one file per OS): no setting, only builds with `WORKING_UPDATES=1` check. macOS replaces the bundle; Linux writes the new AppImage over `$APPIMAGE` (only an AppImage updates itself, and only when its folder is writable: otherwise it downloads nothing and logs why once per run) and relaunches it with no inherited descriptors, so the old image's mount goes away; Windows runs the downloaded installer (`/P /R /NS`, so a deleted Desktop shortcut stays deleted) at Restart from `%LOCALAPPDATA%\dev.felipefdl.working\updates`, which the next launch empties ([docs/workarounds.md](docs/workarounds.md)). The updater downloads the raw `.AppImage` and `-setup.exe`, never an archive. The minisign public key there must match `PACKAGER_SIGN_PRIVATE_KEY`. Settings shows the running version at the bottom of its sidebar.
 
+## Automatic to-dos
+
+Work that waits on a trigger. When a change you are making meets an item's trigger, do the item in that change without being asked, then delete the item. An item is a trigger and what to do.
+
+- **Trigger: a `gpui-kit` upgrade whose calendar and date types are `jiff`** ([longbridge/gpui-kit#4015](https://github.com/longbridge/gpui-kit/pull/4015), merged after 0.10.0). Migrate `gchat-core` and `working` from `chrono` to `jiff`, drop `chrono` from `[workspace.dependencies]`, and delete the `RUSTSEC-2026-0543` entry from `deny.toml`. Until then `chrono` stays, so the app and gpui-kit share one time library.
+
 ## Commands
 
 ```bash
