@@ -938,8 +938,12 @@ pub fn open(url: &str, cx: &mut App) {
   }
   let url = url.to_string();
   let fallback = url.clone();
+  // The call opens on the screen the active window is on. Bounds are relative to their display, so both name it.
+  let display_id = cx.active_display().map(|display| display.id());
+  let bounds = Bounds::centered(display_id, size(px(1100.), px(720.)), cx);
   let mut options = WindowOptions {
-    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1100.), px(720.)), cx))),
+    window_bounds: Some(WindowBounds::Windowed(bounds)),
+    display_id,
     window_min_size: Some(size(px(640.), px(420.))),
     ..Default::default()
   };
