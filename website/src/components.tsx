@@ -58,8 +58,10 @@ export function Shortcuts(): VNode {
     <section>
       <h2>Keyboard shortcuts</h2>
       <p>
-        Ctrl takes the place of Cmd: <kbd>Ctrl+K</kbd> jumps to any conversation, <kbd>Ctrl+2</kbd>{" "}
-        opens Google Calendar, and <kbd>Ctrl+3</kbd> opens Google Meet. These differ from the Mac:
+        Ctrl takes the place of Cmd: <kbd>Ctrl+K</kbd> jumps to any conversation, and{" "}
+        <kbd>Ctrl+1</kbd> to <kbd>Ctrl+4</kbd> open Home, Calendar, Meet, and Mail. In Mail,{" "}
+        <kbd>Ctrl+L</kbd> opens the labels and <kbd>Ctrl+Enter</kbd> sends an email or a reply.
+        These differ from the Mac:
       </p>
       <table>
         <thead>

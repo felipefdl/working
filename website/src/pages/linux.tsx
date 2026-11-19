@@ -8,13 +8,13 @@ function Linux(): VNode {
   return (
     <Article
       crumb="Linux"
-      title="Google Chat for Linux"
-      lede="Working is a native Google Chat client for Linux, shipped as one AppImage for x86_64 and one for aarch64. No browser tab, no Electron: a Rust app that opens from a local cache."
+      title="Google Chat and Gmail for Linux"
+      lede="Working is a native app for Google Chat, Gmail, and Google Calendar on Linux, shipped as one AppImage for x86_64 and one for aarch64. It is a Rust app, not a browser tab or Electron, and it opens from a local cache."
     >
       <Download>Download the AppImage</Download>
       <Screenshot
         shot={shots.linux}
-        alt="Working, a native Google Chat client, on Linux with its own window buttons, in the Messages layout: the chat list beside the Coffee chat space, where a photo of coffee beans gets a reply"
+        alt="Working, a native Google Chat and Gmail app, on Linux with its own window buttons, in the Messages layout: the chat list beside the Coffee chat space, where a photo of coffee beans gets a reply"
         sizes="(min-width: 48rem) 46rem, 100vw"
         eager
       />
@@ -46,6 +46,25 @@ function Linux(): VNode {
           </li>
           <li>An X11 session, or XWayland under Wayland.</li>
           <li>A glibc at least as new as the one in Ubuntu 24.04, where the release is built.</li>
+        </ul>
+      </section>
+
+      <section>
+        <h2>What Linux has</h2>
+        <ul>
+          <li>
+            Google Chat, Mail, and Calendar, as on macOS and Windows. Each email renders in
+            WebKitGTK.
+          </li>
+          <li>
+            Notifications for new messages, new mail, and event reminders through your desktop's
+            notification server. They are not grouped by conversation.
+          </li>
+          <li>
+            The unread count on Working's launcher in KDE Plasma, Ubuntu Dock, Dash to Dock, and
+            Plank, once Working is in your apps menu. Other desktops show no count.
+          </li>
+          <li>No call window: Meet opens in your browser.</li>
         </ul>
       </section>
 
@@ -98,8 +117,8 @@ function Linux(): VNode {
 export const linux: Page = {
   path: "/linux/",
   crumb: "Linux",
-  title: "Google Chat for Linux: native AppImage client | Working",
+  title: "Google Chat and Gmail for Linux: native AppImage | Working",
   description:
-    "Working is a native Google Chat client for Linux, shipped as an AppImage for x86_64 and aarch64. Requirements, apps menu setup, Meet, and known limits.",
+    "Working is a native Google Chat, Gmail, and Calendar app for Linux, shipped as an AppImage for x86_64 and aarch64. Requirements, apps menu, Meet, and limits.",
   body: Linux,
 };

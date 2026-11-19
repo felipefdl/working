@@ -26,8 +26,10 @@ export const shots = {
   rail: await shot("rail.png", "google-chat-desktop-app-rail-layout"),
   calendar: await shot("calendar.png", "google-calendar-desktop-app-week-view"),
   meet: await shot("meet.png", "google-meet-desktop-app-meetings"),
-  filters: await shot("filters.png", "google-chat-desktop-app-filters"),
+  mail: await shot("mail.png", "gmail-desktop-app-reading-pane"),
+  mailLabels: await shot("mail-labels.png", "gmail-desktop-app-labels"),
   themes: await shot("themes.png", "google-chat-desktop-app-themes"),
+  settings: await shot("settings.png", "google-chat-desktop-app-settings"),
   windows: await shot("windows.png", "google-chat-windows-app"),
   linux: await shot("linux.png", "google-chat-linux-app"),
 };

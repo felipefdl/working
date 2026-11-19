@@ -4,7 +4,7 @@ What differs on each system: requirements, known limits, where files live, and w
 
 ## macOS
 
-Working runs on macOS 13 or newer, on Apple silicon and Intel. Notifications and the Dock badge need `Working.app`, not a bare binary.
+Working runs on macOS 13 or newer, on Apple silicon and Intel. Notifications and the Dock badge need `Working.app`, not a bare binary. The Dock number counts unread chats and, while Mail is on in Settings, Features, unread inbox threads.
 
 ## Linux
 
@@ -30,6 +30,10 @@ Working neither asks nor writes under the AppImage opt-outs (a running `appimage
 
 Meet opens in your default browser: joining from a meeting card, the Meet view, a conversation's call button, or a `https://meet.google.com/...` link given to `working` on the command line all hand the link to the browser. WebKitGTK as Fedora builds it has no WebRTC (`RTCPeerConnection` is missing even with WebRTC turned on), and the webview refuses camera and microphone requests, so a call cannot run inside the app. The call button still posts the meeting in the chat.
 
+### Notifications
+
+Notifications for messages, new mail, and event reminders go to the desktop's notification server over D-Bus. The freedesktop specification groups nothing, so they are not grouped by conversation. The unread count goes out as the launcher entry signal on `working.desktop`, which KDE Plasma's task manager, Ubuntu Dock, Dash to Dock, and Plank show on Working's launcher; it needs the apps menu entry above, and other desktops show no count.
+
 ### Emoji
 
 Working draws emoji with its own copy of Google's Noto Color Emoji on every distribution. GPUI's Linux text stack cannot draw the COLRv1 color emoji font some distributions install (Fedora's `Noto-COLRv1.ttf`), so emoji would otherwise be blank there ([zed#42255](https://github.com/zed-industries/zed/issues/42255), [swash#21](https://github.com/dfrg/swash/issues/21)). The system emoji font is not used and does not need replacing.
@@ -48,7 +52,17 @@ The installer sets Working up for your user only, with no administrator rights, 
 
 Notifications show only for the installed app, whose Start Menu shortcut carries the app's identity.
 
+There is no unread count: Windows has none on a taskbar icon.
+
 Updates keep your shortcuts as they are: the Start Menu shortcut is renewed, and a Desktop shortcut you deleted does not come back.
+
+### Known limits
+
+- In Mail, an email scrolled partly out of the reading pane keeps drawing past the pane, over the Mail toolbar and the thread list. gpui-webview cannot clip a webview to a scrolling pane on Windows, where it has no window composition surface.
+
+## Mail
+
+Each email's HTML renders in the system web view: WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. The page runs none of the email's scripts, frames, or forms, and its links open in the default browser. Notifications for new mail and the unread count follow each system's notes above, and on Windows an email can draw past the reading pane (see Windows, Known limits).
 
 ## Shortcuts
 

@@ -27,7 +27,7 @@ export function llms(pages: Page[]): string {
   return [
     `# ${site.name}`,
     "",
-    `> ${site.tagline}. A free, open-source native Google Chat client for macOS, Linux, and Windows, written in Rust. Not affiliated with or endorsed by Google.`,
+    `> ${site.tagline}. Free, open source, and native on macOS, Linux, and Windows, written in Rust. It uses the Google account you sign in with. Not affiliated with or endorsed by Google.`,
     "",
     "## Pages",
     "",

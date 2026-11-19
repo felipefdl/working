@@ -3,52 +3,167 @@ import { Code } from "../components";
 import { Article, type Page } from "../layout";
 import { href } from "../site";
 
-const tools = [
-  ["inbox", "The unread conversations, newest first, each with its unread messages."],
-  ["recent_activity", "Every conversation waiting on a reply from you in the last 24 hours."],
-  [
-    "find_conversations",
-    "A direct message, group chat, space, or app by name, part of a name, or email.",
-  ],
-  [
-    "read_conversation",
-    "The messages of one conversation, oldest first, with thread replies under the message they answer.",
-  ],
-  ["search_messages", "The text of messages in every conversation, however old."],
-  [
-    "send_message",
-    "Text, files, or both to one conversation the agent has read. Listed only when sending is on.",
-  ],
-] as const;
+type Server = {
+  id: string;
+  title: string;
+  lede: string;
+  tools: (readonly [string, string])[];
+};
+
+const servers: Server[] = [
+  {
+    id: "chat",
+    title: "Chat",
+    lede: "Google Chat. A conversation can be named the way a person would: a name, part of one, or an id. Reading changes nothing: messages stay unread.",
+    tools: [
+      ["inbox", "The unread conversations, newest first, each with its unread messages."],
+      ["recent_activity", "Every conversation waiting on a reply from you in the last 24 hours."],
+      [
+        "find_conversations",
+        "A direct message, group chat, space, or app by name, part of a name, or email.",
+      ],
+      [
+        "read_conversation",
+        "The messages of one conversation, oldest first, with thread replies under the message they answer.",
+      ],
+      ["search_messages", "The text of messages in every conversation, however old."],
+      [
+        "send_message",
+        "Text, files, or both to one conversation the agent has read. Listed only with Let agents send messages.",
+      ],
+    ],
+  },
+  {
+    id: "mail",
+    title: "Mail",
+    lede: "Gmail. Reading leaves threads unread. The four tools that send and change mail are listed only with Let agents send and change mail; without it they answer that writing mail is turned off.",
+    tools: [
+      [
+        "mail_inbox",
+        "The newest threads of the Inbox, Starred, Sent, All mail, or one of your labels.",
+      ],
+      ["mail_search", "The threads that match Gmail's own search words, as in its search box."],
+      [
+        "mail_read_thread",
+        "The emails of one thread, oldest first, as plain text: each email's id, who wrote it, to and copied whom, when, the names of its files, and its body.",
+      ],
+      ["mail_labels", "Your own labels, nested ones as Parent/Child, with their unread counts."],
+      [
+        "mail_send",
+        "Sends a new email from your address to the people in to and cc, with a subject and text. Your Gmail signature is added unless the agent asks not to.",
+      ],
+      [
+        "mail_reply",
+        "Answers in a thread, quoting the email as Gmail does: the newest one from someone else, or the one message names. reply_all answers everyone. The recipients are the ones Gmail's Reply and Reply all pick; the agent does not choose them.",
+      ],
+      ["mail_archive", "Moves a thread out of the inbox, or back into it."],
+      ["mail_mark", "Marks a thread read or unread."],
+    ],
+  },
+  {
+    id: "calendar",
+    title: "Calendar",
+    lede: "Google Calendar. The four tools that change events are listed only with Let agents change events. Guests are emailed only when the agent asks for it.",
+    tools: [
+      ["calendar_list", "Your calendars and what you may do in each."],
+      ["calendar_events", "Your events in a date range: today and the next 7 days unless asked."],
+      [
+        "calendar_get_event",
+        "One event in full, with its description, organizer, and whether it repeats.",
+      ],
+      ["calendar_create_event", "A new event in your calendar."],
+      ["calendar_update_event", "Changes to an event: only what the agent passes."],
+      ["calendar_delete_event", "Deletes an event."],
+      ["calendar_respond", "Answers an invitation: accept, decline, or maybe."],
+    ],
+  },
+  {
+    id: "meet",
+    title: "Meet",
+    lede: "Google Meet.",
+    tools: [
+      [
+        "meet_create_meeting",
+        "A new meeting's link, to share with whoever should join. It is in no chat and on no calendar.",
+      ],
+      [
+        "meet_upcoming",
+        "Your calendar events in the next 7 days that have a Meet link, soonest first.",
+      ],
+    ],
+  },
+];
+
+const claude =
+  'claude mcp add --scope user --transport http working-mail http://127.0.0.1:3021/mcp/mail --header "Authorization: Bearer <contents of mcp-token>"';
 
 const client = `{
   "mcpServers": {
-    "working": {
+    "working-chat": {
       "type": "http",
-      "url": "http://127.0.0.1:3021/mcp",
+      "url": "http://127.0.0.1:3021/mcp/chat",
+      "headers": { "Authorization": "Bearer <contents of mcp-token>" }
+    },
+    "working-mail": {
+      "type": "http",
+      "url": "http://127.0.0.1:3021/mcp/mail",
       "headers": { "Authorization": "Bearer <contents of mcp-token>" }
     }
   }
 }`;
 
+function Tools({ server }: { server: Server }): VNode {
+  return (
+    <section>
+      <h3 id={server.id}>
+        {server.title}: <code>/mcp/{server.id}</code>
+      </h3>
+      <p>{server.lede}</p>
+      <table>
+        <thead>
+          <tr>
+            <th scope="col">Tool</th>
+            <th scope="col">What it returns or does</th>
+          </tr>
+        </thead>
+        <tbody>
+          {server.tools.map(([name, text]) => (
+            <tr>
+              <td>
+                <code>{name}</code>
+              </td>
+              <td>{text}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </section>
+  );
+}
+
 function Mcp(): VNode {
   return (
     <Article
-      crumb="MCP server"
-      title="Google Chat MCP server"
-      lede="Working includes an optional MCP server, so AI agents on your computer can catch up on your Google Chat, find a conversation, and search every message. Sending is a separate switch that starts off."
+      crumb="MCP servers"
+      title="MCP servers for Google Chat, Gmail, Calendar, and Meet"
+      lede="Working serves one MCP server per product, so AI agents on your computer can catch up on your Google Chat, read and answer your Gmail, check your calendar, and make Meet links. Each server has its own switch and is off until you turn it on."
     >
       <section>
-        <h2>Turn it on</h2>
+        <h2>Turn one on</h2>
         <ol>
           <li>
             Install Working for <a href={href("/mac/")}>Mac</a>, <a href={href("/linux/")}>Linux</a>
             , or <a href={href("/windows/")}>Windows</a>, and sign in.
           </li>
-          <li>Open Settings and turn on the MCP server.</li>
           <li>
-            Point your agent at <code>http://127.0.0.1:3021/mcp</code> with the token from the{" "}
-            <code>mcp-token</code> file beside the settings.
+            Open Settings, then Agents, and turn on the servers you want. Sending chat messages,
+            sending and changing mail, and changing events each have a second switch under their
+            server. The Calendar, Meet, and Mail servers also need their feature on in Settings,
+            Features.
+          </li>
+          <li>
+            Copy a server's Claude Code command or its link from the same place, and give it to your
+            agent.
           </li>
         </ol>
       </section>
@@ -56,52 +171,59 @@ function Mcp(): VNode {
       <section>
         <h2>Connect an agent</h2>
         <p>
-          The server speaks MCP over HTTP and expects the token as a bearer header. Many clients
-          take a block like this one:
+          The servers share one address on your computer, <code>http://127.0.0.1:3021</code>, each
+          under its own path, and one token. Set <code>mcp_port</code> in the settings file for
+          another port. They speak MCP over HTTP. With Claude Code:
         </p>
+        <Code>{claude}</Code>
+        <p>Many other clients take a block like this one, with one entry for each server:</p>
         <Code>{client}</Code>
         <p>
-          The token is in <code>~/.config/working/mcp-token</code> on macOS and Linux, and in{" "}
+          The token can also be the last part of the path, as in{" "}
+          <code>http://127.0.0.1:3021/mcp/chat/&lt;token&gt;</code>, for an agent that only takes a
+          URL. It is in <code>~/.config/working/mcp-token</code> on macOS and Linux, and in{" "}
           <code>%APPDATA%\working\mcp-token</code> on Windows. It is a secret: anyone who has it can
-          read your chats through the server.
+          use every server you turned on. Settings replaces it with a new one.
         </p>
       </section>
 
       <section>
         <h2>What an agent can do</h2>
-        <table>
-          <thead>
-            <tr>
-              <th scope="col">Tool</th>
-              <th scope="col">What it returns or does</th>
-            </tr>
-          </thead>
-          <tbody>
-            {tools.map(([name, text]) => (
-              <tr>
-                <td>
-                  <code>{name}</code>
-                </td>
-                <td>{text}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
         <p>
-          A conversation can be named the way a person would: a name, part of one, or an id. Reading
-          changes nothing: messages stay unread.
+          Each server tells the agent its own name (<code>working-chat</code>,{" "}
+          <code>working-mail</code>, <code>working-calendar</code>, or <code>working-meet</code>)
+          and lists only its own tools.
         </p>
+        {servers.map((server) => (
+          <Tools server={server} />
+        ))}
       </section>
 
       <section>
         <h2>What keeps it safe</h2>
         <ul>
-          <li>The server is off until you turn it on.</li>
-          <li>It listens on your computer only, never on the network.</li>
-          <li>Every request needs the token.</li>
           <li>
-            Sending has its own switch, and a message goes only to a conversation the agent has just
-            read.
+            Every server is off until you turn it on, and one that is off answers 404. Turning
+            Calendar, Meet, or Mail off in Settings, Features turns its server off too, whatever its
+            own switch says.
+          </li>
+          <li>They listen on your computer only, never on the network.</li>
+          <li>
+            Every request needs the token, and a request from a web page on another address is
+            refused.
+          </li>
+          <li>
+            Sending a chat message has its own switch, and a message goes only to a conversation the
+            agent has read since its last send.
+          </li>
+          <li>
+            Sending and changing mail has its own switch. An email an agent sends is real: it
+            reaches its recipients at once, from your address.
+          </li>
+          <li>Changing events has its own switch.</li>
+          <li>
+            Run with <code>WORKING_READONLY=1</code> and every tool that sends or changes something
+            refuses, whatever the switches say.
           </li>
         </ul>
       </section>
@@ -111,9 +233,9 @@ function Mcp(): VNode {
 
 export const mcp: Page = {
   path: "/mcp/",
-  crumb: "MCP server",
-  title: "Google Chat MCP server for AI agents | Working",
+  crumb: "MCP servers",
+  title: "Google Chat, Gmail, and Calendar MCP servers | Working",
   description:
-    "Working includes a local MCP server so AI agents on your computer can read and search your Google Chat, and send messages only when you allow it.",
+    "Working serves local MCP servers for Google Chat, Gmail, Google Calendar, and Meet. Each has its own switch, and sending and changing things are separate.",
   body: Mcp,
 };

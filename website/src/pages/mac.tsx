@@ -8,8 +8,8 @@ function Mac(): VNode {
   return (
     <Article
       crumb="Mac"
-      title="Google Chat for Mac"
-      lede="Working is a native Google Chat app for macOS: a Dock badge for unread messages, system notifications, the menu bar and shortcuts of a Mac app, and Meet calls in their own window."
+      title="Google Chat and Gmail for Mac"
+      lede="Working is a native macOS app for Google Chat, Gmail, Google Calendar, and Meet in one window: a Dock badge for unread chats and mail, system notifications, the menu bar and shortcuts of a Mac app, and Meet calls in their own window."
     >
       <Download>Download for macOS</Download>
       <Screenshot
@@ -40,11 +40,23 @@ function Mac(): VNode {
       <section>
         <h2>What the Mac app does</h2>
         <ul>
-          <li>Shows unread messages on the Dock icon and through system notifications.</li>
-          <li>Jumps to any conversation with ⌘K, and previews themes with ⌘⇧T.</li>
-          <li>Opens Google Calendar with ⌘2 and Google Meet with ⌘3, in the same window.</li>
-          <li>Runs calls in their own window, with camera, microphone, and screen sharing.</li>
-          <li>Follows the system between a light theme and a dark one.</li>
+          <li>
+            Opens Home, Calendar, Meet, and Mail with ⌘1 to ⌘4, and jumps to any conversation with
+            ⌘K.
+          </li>
+          <li>
+            Reads and writes Gmail in the same window: the Inbox, Starred, Sent, All mail, your
+            labels, and Gmail search, with new emails, replies, archive, and mark as unread.
+          </li>
+          <li>Counts unread chats and unread inbox threads on the Dock icon.</li>
+          <li>Posts to Notification Center for new messages, new mail, and event reminders.</li>
+          <li>
+            Runs calls in their own window, with camera, microphone, the call's chat, and screen
+            sharing through the macOS picker.
+          </li>
+          <li>
+            Follows the system between a light theme and a dark one, and previews themes with ⌘⇧T.
+          </li>
           <li>Updates itself.</li>
         </ul>
       </section>
@@ -57,8 +69,8 @@ function Mac(): VNode {
 export const mac: Page = {
   path: "/mac/",
   crumb: "Mac",
-  title: "Google Chat for Mac: a native macOS app | Working",
+  title: "Google Chat and Gmail for Mac: a native macOS app | Working",
   description:
-    "Install Working, a native Google Chat app for macOS 13 or newer on Apple silicon and Intel. Homebrew or dmg, with a Dock badge, notifications, and Meet calls.",
+    "Working is a native Mac app for Google Chat, Gmail, Calendar, and Meet on macOS 13 or newer. Homebrew or dmg, with a Dock badge, notifications, and Meet calls.",
   body: Mac,
 };

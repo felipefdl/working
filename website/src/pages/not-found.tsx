@@ -19,6 +19,6 @@ export const notFound: Page = {
   hidden: true,
   title: "Page not found | Working",
   description:
-    "This page does not exist. The home page of Working, the native Google Chat desktop app, has the downloads and the guides for each system.",
+    "This page does not exist. The home page of Working, the desktop app for Google Chat, Gmail, Calendar, and Meet, has the downloads and each system's guide.",
   body: NotFound,
 };

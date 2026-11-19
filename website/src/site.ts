@@ -7,7 +7,7 @@ const base = origin.pathname.replace(/\/$/, "");
 
 export const site = {
   name: "Working",
-  tagline: "Google Chat as a real desktop app",
+  tagline: "Google Chat, Gmail, Calendar, and Meet in one desktop app",
   version: cargo.workspace.package.version as string,
   repo: "https://github.com/felipefdl/working",
   releases: "https://github.com/felipefdl/working/releases/latest",

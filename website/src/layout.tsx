@@ -24,7 +24,7 @@ const nav = [
   { path: "/mac/", label: "Mac" },
   { path: "/linux/", label: "Linux" },
   { path: "/windows/", label: "Windows" },
-  { path: "/mcp/", label: "MCP server" },
+  { path: "/mcp/", label: "MCP servers" },
 ];
 
 const app = {
@@ -32,7 +32,7 @@ const app = {
   "@id": absolute("/#app"),
   name: site.name,
   description:
-    "A native Google Chat client for macOS, Linux, and Windows, written in Rust. Free and open source.",
+    "A native desktop app for Google Chat, Gmail, Google Calendar, and Google Meet on macOS, Linux, and Windows, written in Rust. Free and open source.",
   url: absolute("/"),
   applicationCategory: "CommunicationApplication",
   operatingSystem: "macOS 13 or newer, Linux, Windows",
@@ -96,7 +96,7 @@ function Head({ page }: { page: Page }): VNode {
       <meta property="og:image:height" content="630" />
       <meta
         property="og:image:alt"
-        content="Working: Google Chat as a real desktop app, beside the app's window with the Google Chat sidebar and a space showing a link preview"
+        content={`Working: ${site.tagline}, beside the app's window with the Google Chat sidebar and a space showing a link preview`}
       />
       <meta name="twitter:card" content="summary_large_image" />
       <meta name="twitter:title" content={page.title} />
@@ -135,16 +135,16 @@ function Footer(): VNode {
     <footer class="bottom">
       <nav aria-label="Footer">
         <a href={href("/")}>Working</a>
-        <a href={href("/mac/")}>Google Chat for Mac</a>
-        <a href={href("/linux/")}>Google Chat for Linux</a>
-        <a href={href("/windows/")}>Google Chat for Windows</a>
-        <a href={href("/mcp/")}>Google Chat MCP server</a>
+        <a href={href("/mac/")}>Google Chat and Gmail for Mac</a>
+        <a href={href("/linux/")}>Google Chat and Gmail for Linux</a>
+        <a href={href("/windows/")}>Google Chat and Gmail for Windows</a>
+        <a href={href("/mcp/")}>MCP servers for AI agents</a>
         <a href={site.repo}>Source on GitHub</a>
         <a href={`${site.repo}/issues`}>Report a problem</a>
       </nav>
       <p>
         Working is an independent project. It is not affiliated with or endorsed by Google. Google
-        Chat, Google Meet, and Google Calendar are trademarks of Google LLC.
+        Chat, Gmail, Google Calendar, and Google Meet are trademarks of Google LLC.
       </p>
       <p>
         Free and open source under the <a href={site.license}>MIT license</a>.

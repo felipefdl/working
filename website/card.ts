@@ -38,9 +38,9 @@ const html = `<!doctype html>
   h1 {
     position: absolute;
     left: 72px;
-    top: 196px;
-    width: 500px;
-    font-size: 86px;
+    top: 200px;
+    width: 510px;
+    font-size: 60px;
     font-weight: 700;
     letter-spacing: -0.04em;
     line-height: 0.98;
@@ -63,7 +63,7 @@ const html = `<!doctype html>
   }
 </style>
 <div class="brand">${logo}${site.name}</div>
-<h1>Google Chat as a real desktop app</h1>
+<h1>${site.tagline}</h1>
 <p>Native on macOS, Linux, and Windows. Free and open source.</p>
 <img src="/shot.png" alt="">`;
 
