@@ -111,7 +111,8 @@ pub(crate) fn same_cookie(a: &SessionCookie, b: &SessionCookie) -> bool {
 
 /// Reads a `Set-Cookie` header from `url` as a cookie of the session file: one for `chat.google.com` alone or
 /// for every `google.com` host, written as the file writes them. A header that takes a cookie away, or sets one
-/// for any other host, reads as none.
+/// for any other host, reads as none, and so does one for `google.com` that a host outside it sent: the file
+/// keeps what this reads, whatever the requests' own jar refuses.
 fn set_cookie(header: &str, url: &reqwest::Url) -> Option<SessionCookie> {
   let mut parts = header.split(';').map(str::trim);
   let (name, value) = parts.next()?.split_once('=')?;
@@ -132,7 +133,7 @@ fn set_cookie(header: &str, url: &reqwest::Url) -> Option<SessionCookie> {
     return None;
   }
   let domain = match domain.as_deref() {
-    Some("google.com") => ".google.com",
+    Some("google.com") if is_google(url) => ".google.com",
     None if url.host_str() == Some("chat.google.com") => "chat.google.com",
     _ => return None,
   };
@@ -142,6 +143,15 @@ fn set_cookie(header: &str, url: &reqwest::Url) -> Option<SessionCookie> {
     domain: domain.into(),
     path: path.filter(|path| !path.is_empty()).unwrap_or("/").into(),
   })
+}
+
+/// Whether `url` is an HTTPS address of `google.com` or a host under it: the only ones that set a cookie for
+/// every `google.com` host.
+fn is_google(url: &reqwest::Url) -> bool {
+  url.scheme() == "https"
+    && url
+      .host_str()
+      .is_some_and(|host| host == "google.com" || host.ends_with(".google.com"))
 }
 
 fn root_path() -> String {
@@ -671,6 +681,22 @@ mod tests {
     );
     assert_eq!(from("lh3.googleusercontent.com", "NID=x; path=/"), None);
     assert_eq!(from("chat.google.com", "NID=x; domain=.example.com"), None);
+    // Any host can name `google.com` in a header; only a `google.com` host over HTTPS sets its cookies.
+    assert_eq!(from("images.example.com", "SID=x; path=/; domain=.google.com"), None);
+    assert_eq!(from("notgoogle.com", "SID=x; domain=google.com"), None);
+    assert_eq!(from("google.com.example.com", "SID=x; domain=google.com"), None);
+    let plain = "http://chat.google.com/".parse().expect("url");
+    assert!(set_cookie("SID=x; domain=google.com", &plain).is_none());
+  }
+
+  #[test]
+  fn the_jar_keeps_no_google_cookie_from_another_host() {
+    let jar = SessionJar::default();
+    let url = "https://images.example.com/card.png".parse().expect("url");
+    let header = HeaderValue::from_static("SID=x; path=/; domain=.google.com");
+    jar.set_cookies(&mut std::iter::once(&header), &url);
+    assert!(jar.refreshed().is_empty());
+    assert!(jar.cookies(&"https://chat.google.com/".parse().expect("url")).is_none());
   }
 
   #[test]
