@@ -119,12 +119,25 @@ fn classify(att: &Attachment) -> Class {
   }
 }
 
-/// Content type served to the web view: the attachment's own, else by extension.
-fn content_type(att: &Attachment) -> String {
-  if att.mime.contains('/') && att.mime != "application/octet-stream" {
-    return att.mime.clone();
+/// Content type served to the web view, which the class decides, never the attachment alone: a document is a
+/// PDF or plain text, so a file that calls itself HTML is shown as its text and runs nothing; a video or a sound
+/// keeps its own media type, else the one of its extension.
+fn content_type(att: &Attachment, class: Class) -> String {
+  let mime = att.mime.to_ascii_lowercase();
+  let ext = extension(&att.name);
+  if class == Class::Document {
+    let text = matches!(mime.as_str(), "text/plain" | "text/csv" | "application/json");
+    return if mime == "application/pdf" || (ext == "pdf" && !text) {
+      "application/pdf"
+    } else {
+      "text/plain; charset=utf-8"
+    }
+    .to_string();
   }
-  match extension(&att.name).as_str() {
+  if mime.starts_with("video/") || mime.starts_with("audio/") {
+    return mime;
+  }
+  match ext.as_str() {
     "mp4" | "m4v" => "video/mp4",
     "mov" => "video/quicktime",
     "webm" => "video/webm",
@@ -134,10 +147,6 @@ fn content_type(att: &Attachment) -> String {
     "wav" => "audio/wav",
     "ogg" | "oga" => "audio/ogg",
     "flac" => "audio/flac",
-    "pdf" => "application/pdf",
-    "csv" => "text/csv",
-    "json" => "application/json",
-    "txt" | "log" => "text/plain",
     _ => "application/octet-stream",
   }
   .to_string()
@@ -344,6 +353,7 @@ fn serve(
             let response = response
               .status(status)
               .header("Content-Type", content_type.as_str())
+              .header("X-Content-Type-Options", "nosniff")
               .header("Accept-Ranges", "bytes");
             let response = if status == 206 {
               response.header("Content-Range", format!("bytes {start}-{end}/{len}"))
@@ -615,7 +625,7 @@ impl Viewer {
       "media://localhost/media"
     };
     let (escape_tx, escape_rx) = flume::unbounded::<()>();
-    let serve = serve(path.to_path_buf(), len, content_type(&open.att), page);
+    let serve = serve(path.to_path_buf(), len, content_type(&open.att, class), page);
     webview::build(
       move |builder| {
         builder
@@ -1141,7 +1151,7 @@ impl Render for Viewer {
 
 #[cfg(test)]
 mod tests {
-  use super::{Class, classify, extension, human_size, parse_range, poster_url};
+  use super::{Class, classify, content_type, extension, human_size, parse_range, poster_url};
   use gchat_core::{Attachment, AttachmentKind};
 
   fn att(kind: AttachmentKind, name: &str, mime: &str) -> Attachment {
@@ -1171,6 +1181,24 @@ mod tests {
     assert_eq!(classify(&att(AttachmentKind::File, "doc.pdf", "")), Class::Document);
     assert_eq!(classify(&att(AttachmentKind::File, "notes.docx", "")), Class::Other);
     assert_eq!(extension("Photo.PNG"), "png");
+  }
+
+  #[test]
+  fn documents_are_served_as_pdf_or_plain_text() {
+    let served = |name: &str, mime: &str| {
+      let att = att(AttachmentKind::File, name, mime);
+      content_type(&att, classify(&att))
+    };
+    // The extension makes it a document; what it calls itself never makes it a page.
+    assert_eq!(served("notes.txt", "text/html"), "text/plain; charset=utf-8");
+    assert_eq!(served("notes.log", "application/xhtml+xml"), "text/plain; charset=utf-8");
+    assert_eq!(served("report.pdf", "text/html"), "application/pdf");
+    assert_eq!(served("report.pdf", ""), "application/pdf");
+    assert_eq!(served("data.json", "application/json"), "text/plain; charset=utf-8");
+    assert_eq!(served("scan", "application/pdf"), "application/pdf");
+    // Media keeps a media type only.
+    assert_eq!(served("clip.mp4", "text/html"), "video/mp4");
+    assert_eq!(served("song.ogg", "audio/ogg"), "audio/ogg");
   }
 
   #[test]
