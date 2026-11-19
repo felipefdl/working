@@ -575,17 +575,20 @@ pub(crate) fn new_button(id: &'static str, view: Entity<MeetView>, busy: bool) -
   })
 }
 
-/// The menu of the New button: a link to keep, a meeting to join now, or an event to plan in Google Calendar.
+/// The menu of the New button: a link to keep, a meeting to join now, or, while Calendar is on, an event to plan in
+/// Google Calendar.
 fn show_new_menu(view: &Entity<MeetView>, at: Point<Pixels>, window: &mut Window, cx: &mut App) {
   let item = |label: &'static str, glyph: Icon, run: fn(&mut MeetView, &mut Context<MeetView>)| {
     let view = view.clone();
     MenuItem::new(label, move |_, cx| view.update(cx, run)).icon(glyph)
   };
-  let items = vec![
+  let mut items = vec![
     item("Create a meeting for later", Icon::Link, MeetView::create_later),
     item("Start an instant meeting", Icon::Plus, MeetView::create_instant),
-    item("Schedule in Google Calendar", Icon::Calendar, MeetView::schedule),
   ];
+  if cx.global::<Settings>().calendar {
+    items.push(item("Schedule in Google Calendar", Icon::Calendar, MeetView::schedule));
+  }
   menu::show_sized(at, MENU_WIDTH, items, window, cx);
 }
 

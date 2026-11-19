@@ -1,8 +1,12 @@
 use std::time::Duration;
 
 use super::data::{APPROVE, BUILD_BOT, ME};
-use super::{Demo, Window};
-use crate::model::{AttachmentKind, Chip, ChipKind, Command, Event, GroupId, Message, ReadReceipt, Shortcut, SpanKind};
+use super::{Action, Demo, Window};
+use crate::mail::SignaturePlace;
+use crate::model::{
+  AttachmentKind, Chip, ChipKind, Command, Event, GroupId, MailAddress, MailCompose, MailReply, MailThread, Mailbox,
+  Message, ReadReceipt, Shortcut, SpanKind,
+};
 
 fn demo() -> (Demo, flume::Receiver<Event>) {
   let (events, received) = flume::unbounded();
@@ -752,4 +756,620 @@ fn every_picture_fetches_as_a_jpeg_of_its_declared_size() {
     assert!(served.contains(&photo.url()), "no message shows {}", photo.file);
   }
   assert!(super::fetch_bytes("demo:image/missing.jpg").is_err());
+}
+
+/// The threads and `more` a `LoadMail` answers.
+fn load_mail(
+  demo: &mut Demo,
+  events: &flume::Receiver<Event>,
+  mailbox: &Mailbox,
+  more: bool,
+) -> (Vec<MailThread>, bool) {
+  demo.handle(Command::LoadMail { mailbox: mailbox.clone(), more });
+  let answer = drain(events).into_iter().find_map(|event| match event {
+    Event::MailThreads { mailbox: answered, threads, more } if answered == *mailbox => Some(((*threads).clone(), more)),
+    _ => None,
+  });
+  answer.unwrap()
+}
+
+fn unread_of(events: &[Event]) -> Option<u32> {
+  events.iter().rev().find_map(|event| match event {
+    Event::MailUnread(count) => Some(*count),
+    _ => None,
+  })
+}
+
+#[test]
+fn mailboxes_page_by_25_newest_first() {
+  let (mut demo, events) = demo();
+  let (first, more) = load_mail(&mut demo, &events, &Mailbox::Inbox, false);
+  assert_eq!(first.len(), super::mail::PAGE);
+  assert!(more);
+  assert!(first.windows(2).all(|pair| pair[0].time >= pair[1].time));
+  let (all_inbox, more) = load_mail(&mut demo, &events, &Mailbox::Inbox, true);
+  assert_eq!(all_inbox.len(), 28);
+  assert!(!more);
+  assert_eq!(all_inbox.get(..25), Some(first.as_slice()));
+  let (all, more) = load_mail(&mut demo, &events, &Mailbox::All, false);
+  assert_eq!(all.len(), 25);
+  assert!(more);
+  let (all, more) = load_mail(&mut demo, &events, &Mailbox::All, true);
+  assert_eq!(all.len(), 40);
+  assert!(!more);
+  let (starred, more) = load_mail(&mut demo, &events, &Mailbox::Starred, false);
+  assert!(!more);
+  assert!(!starred.is_empty() && starred.iter().all(|thread| thread.starred));
+  let (sent, _) = load_mail(&mut demo, &events, &Mailbox::Sent, false);
+  let me = "amorgan@example.com";
+  assert!(sent.iter().all(|thread| thread.senders.iter().any(|sender| sender.email == me)));
+  assert!(sent.iter().any(|thread| thread.messages > 1));
+  // A reload starts from the newest page again.
+  let (again, more) = load_mail(&mut demo, &events, &Mailbox::Inbox, false);
+  assert_eq!(again.len(), super::mail::PAGE);
+  assert!(more);
+}
+
+#[test]
+fn the_first_inbox_load_says_how_many_threads_are_unread() {
+  let (mut demo, events) = demo();
+  load_mail(&mut demo, &events, &Mailbox::Starred, false);
+  assert!(demo.timeline.is_empty(), "only the inbox starts the watch");
+  demo.handle(Command::LoadMail { mailbox: Mailbox::Inbox, more: false });
+  assert_eq!(unread_of(&drain(&events)), Some(5));
+  demo.handle(Command::LoadMail { mailbox: Mailbox::Inbox, more: false });
+  assert_eq!(unread_of(&drain(&events)), None);
+}
+
+#[test]
+fn mail_search_matches_subject_sender_and_text_case_insensitively() {
+  let (mut demo, events) = demo();
+  let search = |demo: &mut Demo, query: &str| {
+    load_mail(demo, &events, &Mailbox::Search(query.into()), false)
+      .0
+      .into_iter()
+      .map(|thread| thread.subject)
+      .collect::<Vec<_>>()
+  };
+  assert_eq!(search(&mut demo, "FIELDNOTES weekly").len(), 3);
+  let by_sender = search(&mut demo, "riley brooks");
+  assert!(by_sender.contains(&"Lunch Thursday?".to_string()));
+  assert!(by_sender.contains(&"Offsite agenda".to_string()));
+  let by_address = search(&mut demo, "nfischer@example.com");
+  assert!(by_address.contains(&"Q4 budget draft".to_string()));
+  assert_eq!(search(&mut demo, "bridges"), vec!["Book club pick for December".to_string()]);
+  assert_eq!(search(&mut demo, "no such words anywhere"), Vec::<String>::new());
+  let (_, more) = load_mail(&mut demo, &events, &Mailbox::Search("example".into()), false);
+  assert!(more, "a broad search pages too");
+}
+
+#[test]
+fn a_new_email_arrives_after_the_first_inbox_load() {
+  let (mut demo, events) = demo();
+  load_mail(&mut demo, &events, &Mailbox::Inbox, false);
+  assert_eq!(demo.timeline.len(), 1);
+  run_all(&mut demo);
+  let after = drain(&events);
+  let Some(Event::MailIncoming(incoming)) = after.iter().find(|event| matches!(event, Event::MailIncoming(_))) else {
+    panic!("no incoming email");
+  };
+  assert!(incoming.unread);
+  let inbox = after.iter().find_map(|event| match event {
+    Event::MailThreads { mailbox: Mailbox::Inbox, threads, more } => Some((threads.clone(), *more)),
+    _ => None,
+  });
+  let (threads, more) = inbox.unwrap();
+  assert_eq!(threads.first().map(|thread| &thread.id), Some(&incoming.id));
+  assert_eq!(threads.len(), super::mail::PAGE + 1);
+  assert!(more);
+  assert_eq!(unread_of(&after), Some(6));
+  // It arrives once, even after the watch starts again.
+  demo.handle(Command::StopMail);
+  load_mail(&mut demo, &events, &Mailbox::Inbox, false);
+  run_all(&mut demo);
+  assert!(!drain(&events).iter().any(|event| matches!(event, Event::MailIncoming(_))));
+}
+
+#[test]
+fn stopping_mail_cancels_the_new_email_and_starts_fresh() {
+  let (mut demo, events) = demo();
+  load_mail(&mut demo, &events, &Mailbox::Inbox, false);
+  load_mail(&mut demo, &events, &Mailbox::Inbox, true);
+  demo.handle(Command::StopMail);
+  assert!(demo.timeline.is_empty());
+  assert!(drain(&events).is_empty(), "nothing answers StopMail");
+  demo.handle(Command::LoadMail { mailbox: Mailbox::Inbox, more: true });
+  let fresh = drain(&events);
+  assert_eq!(unread_of(&fresh), Some(5));
+  let held = fresh.iter().find_map(|event| match event {
+    Event::MailThreads { threads, .. } => Some(threads.len()),
+    _ => None,
+  });
+  assert_eq!(held, Some(super::mail::PAGE), "the held pages were forgotten");
+  assert_eq!(demo.timeline.len(), 1);
+}
+
+#[test]
+fn opening_a_thread_answers_its_emails_and_their_files_fetch() {
+  let (mut demo, events) = demo();
+  load_mail(&mut demo, &events, &Mailbox::All, false);
+  let (all, _) = load_mail(&mut demo, &events, &Mailbox::All, true);
+  let mut files = 0;
+  let mut inline = 0;
+  for thread in &all {
+    demo.handle(Command::OpenMail(thread.id.clone()));
+    let Some(Event::MailMessages { thread: id, messages }) = drain(&events).pop() else {
+      panic!("no emails for {}", thread.subject);
+    };
+    assert_eq!(id, thread.id);
+    assert_eq!(messages.len(), usize::try_from(thread.messages).unwrap());
+    assert!(messages.windows(2).all(|pair| pair[0].time <= pair[1].time));
+    assert_eq!(messages.iter().any(|message| message.unread), thread.unread);
+    assert!(messages.iter().all(|mail| !mail.html.is_empty() && !mail.text.is_empty()));
+    for attachment in messages.iter().flat_map(|message| &message.attachments) {
+      let bytes = super::fetch_bytes(&attachment.url).unwrap();
+      assert_eq!(u64::try_from(bytes.len()).unwrap(), attachment.size, "{}", attachment.name);
+      files += 1;
+    }
+    for message in messages.iter() {
+      for source in message.html.split("src=\"").skip(1) {
+        let url = source.split('"').next().unwrap();
+        assert!(super::fetch_bytes(url).is_ok(), "{url} does not fetch");
+        inline += 1;
+      }
+    }
+  }
+  assert!(files >= 5);
+  assert_eq!(inline, 1);
+  let ids: std::collections::HashSet<_> = all.iter().map(|thread| &thread.id).collect();
+  assert_eq!(ids.len(), all.len());
+  demo.handle(Command::OpenMail("demo-mail-missing".into()));
+  assert!(matches!(drain(&events).pop(), Some(Event::MailFailed(_))));
+}
+
+fn labels_of(events: &[Event]) -> Option<Vec<crate::model::MailLabel>> {
+  events.iter().rev().find_map(|event| match event {
+    Event::MailLabels(labels) => Some(labels.to_vec()),
+    _ => None,
+  })
+}
+
+#[test]
+fn labels_come_with_the_first_inbox_and_list_their_threads() {
+  let (mut demo, events) = demo();
+  load_mail(&mut demo, &events, &Mailbox::All, false);
+  demo.handle(Command::LoadMail { mailbox: Mailbox::Inbox, more: false });
+  let labels = labels_of(&drain(&events)).expect("the first inbox sends the labels");
+  assert!(labels.len() >= 12);
+  let names: Vec<String> = labels.iter().map(|label| label.name.to_lowercase()).collect();
+  assert!(names.windows(2).all(|pair| pair[0] <= pair[1]), "sorted by name");
+  assert!(labels.iter().any(|label| label.name == "Clients/Brightwater"));
+  assert!(labels.iter().any(|label| label.color.is_some()));
+  assert!(labels.iter().any(|label| label.color.is_none()));
+  assert!(labels.iter().filter(|label| label.unread > 0).count() >= 3);
+  for label in &labels {
+    let (threads, more) = load_mail(&mut demo, &events, &Mailbox::Label(label.id.clone()), false);
+    assert!((1..=8).contains(&threads.len()), "{} lists {}", label.name, threads.len());
+    assert!(!more);
+    let unread = threads.iter().filter(|thread| thread.unread).count();
+    assert_eq!(u32::try_from(unread).unwrap(), label.unread, "{}", label.name);
+  }
+  demo.handle(Command::LoadMail { mailbox: Mailbox::Inbox, more: false });
+  assert_eq!(labels_of(&drain(&events)), None, "only the first inbox sends them");
+  let (threads, more) = load_mail(&mut demo, &events, &Mailbox::Label("Label_missing".into()), false);
+  assert!(threads.is_empty() && !more);
+  demo.handle(Command::StopMail);
+  demo.handle(Command::LoadMail { mailbox: Mailbox::Inbox, more: false });
+  assert!(labels_of(&drain(&events)).is_some(), "StopMail starts fresh");
+}
+
+#[test]
+fn the_new_email_raises_its_labels_unread_count() {
+  let (mut demo, events) = demo();
+  demo.handle(Command::LoadMail { mailbox: Mailbox::Inbox, more: false });
+  let before = labels_of(&drain(&events)).unwrap();
+  run_all(&mut demo);
+  let after = labels_of(&drain(&events)).expect("the count changed, so the labels come again");
+  let changed: Vec<_> = before
+    .iter()
+    .zip(&after)
+    .filter(|(old, new)| old != new)
+    .map(|(old, new)| (old.id.clone(), old.unread, new.unread))
+    .collect();
+  assert_eq!(changed.len(), 1);
+  let (id, old, new) = changed.first().unwrap().clone();
+  assert_eq!(new, old + 1);
+  let (threads, _) = load_mail(&mut demo, &events, &Mailbox::Label(id), false);
+  let first = threads.first().unwrap();
+  assert!(first.unread && first.subject.contains("launch email"));
+}
+
+fn reminders(events: &[Event]) -> Vec<(crate::model::CalendarEvent, u32)> {
+  events
+    .iter()
+    .filter_map(|event| match event {
+      Event::EventReminder { event, minutes } => Some((event.clone(), *minutes)),
+      _ => None,
+    })
+    .collect()
+}
+
+#[test]
+fn watching_events_delivers_one_reminder_for_the_meeting_about_to_start() {
+  let (mut demo, events) = demo();
+  demo.handle(Command::WatchEvents(true));
+  demo.handle(Command::WatchEvents(true));
+  assert_eq!(demo.timeline.len(), 1);
+  run_all(&mut demo);
+  let delivered = reminders(&drain(&events));
+  assert_eq!(delivered.len(), 1);
+  let (event, minutes) = delivered.first().unwrap();
+  assert_eq!(*minutes, 10);
+  assert_eq!(event.start, 1_800_000_000_000_000 + 10 * 60 * 1_000_000);
+  assert!(event.meet_url.is_some());
+  demo.handle(Command::WatchEvents(false));
+  demo.handle(Command::WatchEvents(true));
+  run_all(&mut demo);
+  assert!(reminders(&drain(&events)).is_empty(), "once per run");
+}
+
+#[test]
+fn turning_event_watching_off_cancels_the_reminder() {
+  let (mut demo, events) = demo();
+  demo.handle(Command::WatchEvents(true));
+  demo.handle(Command::WatchEvents(false));
+  assert!(demo.timeline.is_empty());
+  run_all(&mut demo);
+  assert_eq!(reminders(&drain(&events)), Vec::new());
+  demo.handle(Command::WatchEvents(true));
+  run_all(&mut demo);
+  assert_eq!(reminders(&drain(&events)).len(), 1);
+}
+
+fn written(events: &[Event]) -> Option<Result<(), String>> {
+  match events.last() {
+    Some(Event::MailWritten(result)) => Some(result.clone()),
+    _ => None,
+  }
+}
+
+/// The last list sent for a mailbox.
+fn list_of(events: &[Event], wanted: &Mailbox) -> Option<Vec<MailThread>> {
+  events.iter().rev().find_map(|event| match event {
+    Event::MailThreads { mailbox, threads, .. } if mailbox == wanted => Some(threads.to_vec()),
+    _ => None,
+  })
+}
+
+fn label_unread(events: &[Event], name: &str) -> Option<u32> {
+  labels_of(events)?
+    .into_iter()
+    .find(|label| label.name == name)
+    .map(|label| label.unread)
+}
+
+fn emails(demo: &mut Demo, events: &flume::Receiver<Event>, thread: &str) -> Vec<crate::model::MailMessage> {
+  demo.handle(Command::OpenMail(thread.into()));
+  let Some(Event::MailMessages { messages, .. }) = drain(events).pop() else {
+    panic!("no emails for {thread}");
+  };
+  messages.to_vec()
+}
+
+#[test]
+fn marking_mail_updates_lists_counts_and_labels() {
+  let (mut demo, events) = demo();
+  load_mail(&mut demo, &events, &Mailbox::Inbox, false);
+  let launch = "demo-mail-launch-copy";
+  demo.handle(Command::MarkMail { thread: launch.into(), read: true });
+  let out = drain(&events);
+  assert_eq!(written(&out), Some(Ok(())));
+  let inbox = list_of(&out, &Mailbox::Inbox).unwrap();
+  assert!(inbox.iter().any(|thread| thread.id == launch && !thread.unread));
+  assert_eq!(unread_of(&out), Some(4));
+  assert_eq!(label_unread(&out, "Launch"), Some(1));
+  assert!(emails(&mut demo, &events, launch).iter().all(|email| !email.unread));
+
+  demo.handle(Command::MarkMail { thread: launch.into(), read: false });
+  let out = drain(&events);
+  assert_eq!(unread_of(&out), Some(5));
+  assert_eq!(label_unread(&out, "Launch"), Some(2));
+  let messages = emails(&mut demo, &events, launch);
+  assert!(messages.last().unwrap().unread);
+  assert!(!messages.first().unwrap().unread);
+
+  // A thread already read changes nothing the app holds.
+  demo.handle(Command::MarkMail {
+    thread: "demo-mail-interview-loop".into(),
+    read: true,
+  });
+  let out = drain(&events);
+  assert_eq!(out.len(), 1);
+  assert_eq!(written(&out), Some(Ok(())));
+
+  demo.handle(Command::MarkMail {
+    thread: "demo-mail-missing".into(),
+    read: true,
+  });
+  assert_eq!(written(&drain(&events)), Some(Err("This email is no longer there.".into())));
+}
+
+#[test]
+fn archiving_takes_a_thread_out_of_the_inbox_and_back() {
+  let (mut demo, events) = demo();
+  load_mail(&mut demo, &events, &Mailbox::Inbox, false);
+  load_mail(&mut demo, &events, &Mailbox::Inbox, true);
+  let lunch = "demo-mail-lunch-thursday";
+  demo.handle(Command::ArchiveMail { thread: lunch.into(), archive: true });
+  let out = drain(&events);
+  assert_eq!(written(&out), Some(Ok(())));
+  let inbox = list_of(&out, &Mailbox::Inbox).unwrap();
+  assert_eq!(inbox.len(), 27);
+  assert!(!inbox.iter().any(|thread| thread.id == lunch));
+  assert_eq!(unread_of(&out), Some(4));
+  let (all, _) = load_mail(&mut demo, &events, &Mailbox::All, false);
+  assert!(all.iter().any(|thread| thread.id == lunch));
+  let (team, _) = load_mail(&mut demo, &events, &Mailbox::Label("Label_1".into()), false);
+  assert!(team.iter().any(|thread| thread.id == lunch));
+
+  demo.handle(Command::ArchiveMail { thread: lunch.into(), archive: false });
+  let out = drain(&events);
+  let inbox = list_of(&out, &Mailbox::Inbox).unwrap();
+  assert_eq!(inbox.len(), 28);
+  assert!(inbox.iter().any(|thread| thread.id == lunch));
+  assert_eq!(unread_of(&out), Some(5));
+  assert_eq!(written(&out), Some(Ok(())));
+
+  demo.handle(Command::ArchiveMail {
+    thread: "demo-mail-missing".into(),
+    archive: true,
+  });
+  assert!(matches!(written(&drain(&events)), Some(Err(_))));
+}
+
+fn reply_to(thread: &str, message: &str, to: &str, text: &str) -> Command {
+  Command::ReplyMail(Box::new(MailReply {
+    thread: thread.into(),
+    message: message.into(),
+    to: vec![MailAddress { name: String::new(), email: to.into() }],
+    cc: Vec::new(),
+    text: text.into(),
+    signature: false,
+  }))
+}
+
+fn answers_scheduled(demo: &Demo) -> usize {
+  demo
+    .timeline
+    .iter()
+    .filter(|(_, action)| matches!(action, Action::MailAnswer { .. }))
+    .count()
+}
+
+#[test]
+fn a_reply_goes_to_the_top_and_its_person_answers_back_once() {
+  let (mut demo, events) = demo();
+  load_mail(&mut demo, &events, &Mailbox::Inbox, false);
+  load_mail(&mut demo, &events, &Mailbox::Sent, false);
+  demo.timeline.retain(|(_, action)| !matches!(action, Action::MailArrives));
+  let thread = "demo-mail-interview-loop";
+  demo.handle(reply_to(
+    thread,
+    "demo-mail-interview-loop-0",
+    "praman@example.com",
+    "Yes, I can take it.\n\nAvery",
+  ));
+  let out = drain(&events);
+  assert_eq!(written(&out), Some(Ok(())));
+  assert_eq!(list_of(&out, &Mailbox::Inbox).unwrap().first().unwrap().id, thread);
+  assert_eq!(list_of(&out, &Mailbox::Sent).unwrap().first().unwrap().id, thread);
+  let messages = out.iter().find_map(|event| match event {
+    Event::MailMessages { thread: id, messages } if id == thread => Some(messages.to_vec()),
+    _ => None,
+  });
+  let messages = messages.unwrap();
+  assert_eq!(messages.len(), 2);
+  let reply = messages.last().unwrap();
+  assert_eq!(reply.from.email, "amorgan@example.com");
+  assert_eq!(reply.to.first().unwrap().email, "praman@example.com");
+  assert!(
+    reply
+      .html
+      .starts_with("<div dir=\"ltr\"><div>Yes, I can take it.</div><div><br></div><div>Avery</div></div>")
+      && reply.html.contains("gmail_quote")
+  );
+  assert!(!reply.unread);
+  assert_eq!(answers_scheduled(&demo), 1);
+
+  run_all(&mut demo);
+  let out = drain(&events);
+  let incoming = out.iter().find_map(|event| match event {
+    Event::MailIncoming(incoming) => Some(incoming.clone()),
+    _ => None,
+  });
+  let incoming = incoming.expect("Priya answers back");
+  assert_eq!(incoming.id, thread);
+  assert!(incoming.unread);
+  assert_eq!(list_of(&out, &Mailbox::Inbox).unwrap().first().unwrap().id, thread);
+  assert_eq!(unread_of(&out), Some(6));
+  let answer = emails(&mut demo, &events, thread).pop().unwrap();
+  assert_eq!(answer.from.email, "praman@example.com");
+  assert!(answer.unread && answer.text.contains("Priya"));
+
+  // Once per thread.
+  demo.handle(reply_to(thread, &answer.id, "praman@example.com", "Great."));
+  assert_eq!(answers_scheduled(&demo), 0);
+  // An outside sender does not answer.
+  demo.handle(reply_to(
+    "demo-mail-invoice-november",
+    "",
+    "billing@acmecloud.example.com",
+    "Thanks.",
+  ));
+  assert_eq!(answers_scheduled(&demo), 0);
+  drain(&events);
+  demo.handle(reply_to("demo-mail-missing", "", "jpark@example.com", "Hello"));
+  assert_eq!(written(&drain(&events)), Some(Err("This email is no longer there.".into())));
+}
+
+fn compose(to: &[&str], cc: &[&str], subject: &str) -> Command {
+  let addresses = |emails: &[&str]| {
+    emails
+      .iter()
+      .map(|email| MailAddress {
+        name: String::new(),
+        email: (*email).into(),
+      })
+      .collect()
+  };
+  Command::ComposeMail(Box::new(MailCompose {
+    to: addresses(to),
+    cc: addresses(cc),
+    subject: subject.into(),
+    text: "Shall we meet at noon?\n\nAvery".into(),
+    signature: false,
+  }))
+}
+
+#[test]
+fn a_new_email_goes_to_sent_and_its_first_person_answers_back_once() {
+  let (mut demo, events) = demo();
+  load_mail(&mut demo, &events, &Mailbox::Inbox, false);
+  load_mail(&mut demo, &events, &Mailbox::Sent, false);
+  demo.timeline.retain(|(_, action)| !matches!(action, Action::MailArrives));
+  demo.handle(compose(&["praman@example.com"], &["jpark@example.com"], "Lunch on Friday"));
+  let out = drain(&events);
+  assert_eq!(written(&out), Some(Ok(())));
+  assert!(
+    list_of(&out, &Mailbox::Inbox).is_none(),
+    "not to Avery: the inbox stays as it was"
+  );
+  let sent = list_of(&out, &Mailbox::Sent).unwrap();
+  let new = sent.first().unwrap().clone();
+  assert_eq!(new.subject, "Lunch on Friday");
+  assert!(!new.unread);
+  let emailed = emails(&mut demo, &events, &new.id);
+  assert_eq!(emailed.len(), 1);
+  assert_eq!(emailed[0].from.email, "amorgan@example.com");
+  assert_eq!(emailed[0].cc.first().unwrap().email, "jpark@example.com");
+  assert!(
+    emailed[0]
+      .html
+      .starts_with("<div dir=\"ltr\"><div>Shall we meet at noon?</div><div><br></div><div>Avery</div></div>")
+  );
+  assert_eq!(answers_scheduled(&demo), 1);
+
+  run_all(&mut demo);
+  let out = drain(&events);
+  let incoming = out.iter().find_map(|event| match event {
+    Event::MailIncoming(incoming) => Some(incoming.clone()),
+    _ => None,
+  });
+  let incoming = incoming.expect("Priya answers back");
+  assert_eq!(incoming.id, new.id);
+  assert_eq!(list_of(&out, &Mailbox::Inbox).unwrap().first().unwrap().id, new.id);
+  assert_eq!(
+    emails(&mut demo, &events, &new.id).pop().unwrap().from.email,
+    "praman@example.com"
+  );
+
+  // To Avery too: in the inbox, read, so the unread count stays; an outside first recipient never answers.
+  demo.handle(compose(&["billing@acmecloud.example.com"], &["amorgan@example.com"], ""));
+  let out = drain(&events);
+  assert_eq!(written(&out), Some(Ok(())));
+  let top = list_of(&out, &Mailbox::Inbox).unwrap().first().unwrap().clone();
+  assert!(top.id != new.id && !top.unread);
+  assert_eq!(list_of(&out, &Mailbox::Sent).unwrap().first().unwrap().id, top.id);
+  assert_eq!(unread_of(&out), None);
+  assert!(!out.iter().any(|event| matches!(event, Event::MailIncoming(_))));
+  assert_eq!(answers_scheduled(&demo), 0);
+
+  // Nobody, or no address: an error before anything changes.
+  demo.handle(compose(&[], &[], "Nobody"));
+  let out = drain(&events);
+  assert_eq!(written(&out), Some(Err("Add someone to send the email to.".into())));
+  assert!(list_of(&out, &Mailbox::Sent).is_none());
+  demo.handle(compose(&["priya"], &[], "No address"));
+  let out = drain(&events);
+  assert!(matches!(written(&out), Some(Err(_))));
+  assert!(list_of(&out, &Mailbox::Sent).is_none());
+}
+
+/// The same new email or reply, with the signature.
+fn signed(command: Command) -> Command {
+  match command {
+    Command::ComposeMail(mut compose) => {
+      compose.signature = true;
+      Command::ComposeMail(compose)
+    },
+    Command::ReplyMail(mut reply) => {
+      reply.signature = true;
+      Command::ReplyMail(reply)
+    },
+    other => other,
+  }
+}
+
+#[test]
+fn signatures_come_with_the_first_inbox_and_sign_what_avery_sends() {
+  let (mut demo, events) = demo();
+  demo.handle(Command::LoadMail { mailbox: Mailbox::Inbox, more: false });
+  let signatures = drain(&events).into_iter().find_map(|event| match event {
+    Event::MailSignatures { new, reply } => Some((new.unwrap(), reply.unwrap())),
+    _ => None,
+  });
+  let (new, reply) = signatures.expect("told with the first inbox");
+  assert!(new.text.contains("Avery Morgan") && new.text.len() > reply.text.len());
+  // Only once.
+  demo.handle(Command::LoadMail { mailbox: Mailbox::Inbox, more: false });
+  assert!(!drain(&events).iter().any(|event| matches!(event, Event::MailSignatures { .. })));
+  load_mail(&mut demo, &events, &Mailbox::Sent, false);
+  demo.timeline.retain(|(_, action)| !matches!(action, Action::MailArrives));
+
+  // A new email with the signature for new emails, after the `-- ` line.
+  demo.handle(signed(compose(&["billing@acmecloud.example.com"], &[], "Signed")));
+  let out = drain(&events);
+  let id = list_of(&out, &Mailbox::Sent).unwrap().first().unwrap().id.clone();
+  let email = emails(&mut demo, &events, &id).pop().unwrap();
+  assert!(email.html.ends_with(&crate::mail::signature_block(
+    &new.html,
+    SignaturePlace::NewEmail { with_text: true }
+  )));
+  assert!(email.text.ends_with(&format!("-- \n{}", new.text)));
+  // Without it, as before.
+  demo.handle(compose(&["billing@acmecloud.example.com"], &[], "Plain"));
+  let out = drain(&events);
+  let id = list_of(&out, &Mailbox::Sent).unwrap().first().unwrap().id.clone();
+  assert!(!emails(&mut demo, &events, &id).pop().unwrap().html.contains("gmail_signature"));
+
+  // A reply with the shorter one, after the quoted email.
+  demo.handle(signed(reply_to(
+    "demo-mail-invoice-november",
+    "demo-mail-invoice-november-0",
+    "billing@acmecloud.example.com",
+    "Thanks.",
+  )));
+  drain(&events);
+  let sent = emails(&mut demo, &events, "demo-mail-invoice-november").pop().unwrap();
+  let quote_ends = sent.html.find("</blockquote>").unwrap();
+  let signed_at = sent.html.find("gmail_signature_prefix").unwrap();
+  assert!(signed_at > quote_ends);
+  assert!(
+    sent
+      .html
+      .ends_with(&crate::mail::signature_block(&reply.html, SignaturePlace::AfterQuote))
+  );
+}
+
+#[test]
+fn a_newsletter_names_where_answers_go() {
+  let (mut demo, events) = demo();
+  let newsletter = emails(&mut demo, &events, "demo-mail-fieldnotes-112");
+  let reply_to = &newsletter.first().unwrap().reply_to;
+  assert_eq!(
+    reply_to.first().map(|address| address.email.as_str()),
+    Some("editors@fieldnotes.example.org")
+  );
+  let ordinary = emails(&mut demo, &events, "demo-mail-interview-loop");
+  assert!(ordinary.iter().all(|email| email.reply_to.is_empty()));
 }

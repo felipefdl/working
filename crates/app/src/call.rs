@@ -929,10 +929,11 @@ impl Render for CallView {
   }
 }
 
-/// Opens the meeting at `url`. Built-in Meet uses a call window (the browser if that window cannot be made);
-/// otherwise the link opens in the browser like any other.
+/// Opens the meeting at `url`. Built-in Meet uses a call window (the browser if that window cannot be made); otherwise,
+/// and while the Meet feature is off, the link opens in the browser like any other.
 pub fn open(url: &str, cx: &mut App) {
-  if !cx.global::<Settings>().meet_builtin {
+  let settings = cx.global::<Settings>();
+  if !settings.meet_builtin || !settings.meet {
     cx.open_url(url);
     return;
   }

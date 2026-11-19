@@ -27,6 +27,7 @@ use crate::emoji_font;
 use crate::emoji_picker::{EmojiHandle, EmojiPicker};
 use crate::home::HomeView;
 use crate::keys::{self, Hotkey1, Hotkey2, Hotkey3, Hotkey4, Hotkey5, Hotkey6, Hotkey7, Hotkey8, Hotkey9};
+use crate::mail::{MailView, OpenMail};
 use crate::meet::{MeetEvent, MeetView, OpenMeet};
 use crate::menu::{ContextMenu, MenuHandle};
 use crate::new_chat::{NewChat, NewChatEvent, OpenNewChat};
@@ -94,6 +95,30 @@ const HOT_ZONE_WIDTH: f32 = 12.0;
 /// Width of the grab area on a column's inner edge.
 const RESIZE_HANDLE_WIDTH: f32 = 8.0;
 
+/// The gap between the content panel and the window's edge, or the column beside it (`mr_2`, `ml_2`).
+const PANEL_MARGIN: f32 = 8.0;
+
+/// How wide the column(s) of the layout are together.
+fn columns_width(cx: &App) -> f32 {
+  let settings = cx.global::<settings::Settings>();
+  let rail = if settings.layout == Layout::Rail {
+    RAIL_WIDTH
+  } else {
+    0.
+  };
+  settings.column_width(settings.layout) + rail
+}
+
+/// How wide the content panel is: the window less the column(s) beside it, while they are open, and its margins.
+pub fn panel_width(window: &Window, cx: &App) -> f32 {
+  let window_width = window.viewport_size().width.as_f32();
+  if cx.global::<settings::Settings>().sidebar == SidebarMode::Open {
+    window_width - columns_width(cx) - PANEL_MARGIN
+  } else {
+    2.0_f32.mul_add(-PANEL_MARGIN, window_width)
+  }
+}
+
 /// The application menus: the macOS menu bar, and on Linux and Windows the submenus of the top bar's menu button. A
 /// view with a number key (`Settings::hotkeys`) is listed with that key's action, so the menu shows the key.
 pub fn menus(cx: &App) -> Vec<Menu> {
@@ -121,6 +146,31 @@ pub fn menus(cx: &App) -> Vec<Menu> {
     MenuItem::separator(),
   ]);
   app.push(MenuItem::action("Quit Working", Quit));
+  let features = cx.global::<settings::Settings>().features();
+  let mut go = vec![
+    MenuItem::action("Back", GoBack),
+    MenuItem::action("Forward", GoForward),
+    MenuItem::separator(),
+    place("Home", Place::Home, Box::new(GoHome)),
+  ];
+  // A feature that is off has no entry.
+  if features.calendar {
+    go.push(place("Calendar", Place::Calendar, Box::new(OpenCalendar)));
+  }
+  if features.meet {
+    go.push(place("Meet", Place::Meet, Box::new(OpenMeet)));
+  }
+  if features.mail {
+    go.push(place("Mail", Place::Mail, Box::new(OpenMail)));
+  }
+  go.extend([
+    MenuItem::action("New Chat…", OpenNewChat),
+    MenuItem::action("Quick Switcher…", OpenSwitcher),
+    MenuItem::separator(),
+    MenuItem::action("Next Conversation", NextConversation),
+    MenuItem::action("Previous Conversation", PreviousConversation),
+    MenuItem::action("Next Unread", NextUnread),
+  ]);
   #[cfg_attr(
     not(target_os = "macos"),
     expect(unused_mut, reason = "only macOS adds the Window menu")
@@ -158,20 +208,7 @@ pub fn menus(cx: &App) -> Vec<Menu> {
     Menu {
       name: "Go".into(),
       disabled: false,
-      items: vec![
-        MenuItem::action("Back", GoBack),
-        MenuItem::action("Forward", GoForward),
-        MenuItem::separator(),
-        place("Home", Place::Home, Box::new(GoHome)),
-        place("Calendar", Place::Calendar, Box::new(OpenCalendar)),
-        place("Meet", Place::Meet, Box::new(OpenMeet)),
-        MenuItem::action("New Chat…", OpenNewChat),
-        MenuItem::action("Quick Switcher…", OpenSwitcher),
-        MenuItem::separator(),
-        MenuItem::action("Next Conversation", NextConversation),
-        MenuItem::action("Previous Conversation", PreviousConversation),
-        MenuItem::action("Next Unread", NextUnread),
-      ],
+      items: go,
     },
   ];
   #[cfg(target_os = "macos")]
@@ -207,6 +244,7 @@ pub fn bind_menu_commands(cx: &mut App, on_main: fn(&mut App, MenuCommand)) {
   bind::<GoHome>(cx, on_main, RootView::go_home);
   bind::<OpenCalendar>(cx, on_main, RootView::open_calendar);
   bind::<OpenMeet>(cx, on_main, RootView::open_meet);
+  bind::<OpenMail>(cx, on_main, RootView::open_mail);
   bind::<OpenNewChat>(cx, on_main, RootView::open_new_chat);
   bind::<OpenSwitcher>(cx, on_main, RootView::open_switcher);
   bind::<NextConversation>(cx, on_main, |root, window, cx| root.step_conversation(true, window, cx));
@@ -261,6 +299,7 @@ pub struct RootView {
   shortcuts: Entity<ShortcutView>,
   calendar: Entity<CalendarView>,
   meet: Entity<MeetView>,
+  mail: Entity<MailView>,
   search: Entity<InputState>,
   focus: FocusHandle,
   /// The top-bar mark, for the dark look and for the light one.
@@ -305,6 +344,7 @@ impl RootView {
     let shortcuts = cx.new(|_| ShortcutView::new(store.clone()));
     let calendar = cx.new(|cx| CalendarView::new(store.clone(), window, cx));
     let meet = cx.new(|cx| MeetView::new(store.clone(), window, cx));
+    let mail = cx.new(|cx| MailView::new(store.clone(), window, cx));
     let search = cx.new(|cx| InputState::new(window, cx).placeholder("Search chat"));
     let focus = cx.focus_handle();
     window.focus(&focus, cx);
@@ -356,6 +396,15 @@ impl RootView {
         cx.notify();
       }),
       cx.observe_global::<status::Mine>(|_, cx| cx.notify()),
+      // The window's own overlays coming and going decide whether Mail's webviews, native views drawn over GPUI's,
+      // may show (`covers_panel`).
+      cx.observe(&menu, |_, _, cx| cx.notify()),
+      cx.observe(&viewer, |_, _, cx| cx.notify()),
+      cx.observe(&text_panel, |_, _, cx| cx.notify()),
+      cx.observe(&emoji, |_, _, cx| cx.notify()),
+      cx.observe(&composer, |_, _, cx| cx.notify()),
+      // Mail's labels popover is one of them.
+      cx.observe(&mail, |_, _, cx| cx.notify()),
       // Meet's "Schedule in Google Calendar" opens the calendar's editor.
       cx.subscribe_in(&meet, window, |this, _, event: &MeetEvent, window, cx| {
         let MeetEvent::Schedule(day) = event;
@@ -419,6 +468,7 @@ impl RootView {
       shortcuts,
       calendar,
       meet,
+      mail,
       #[cfg(not(target_os = "macos"))]
       menu_target: Rc::default(),
       logo,
@@ -501,13 +551,19 @@ impl RootView {
 
   /// Number key `slot`: opens the place the settings give it, if any.
   fn open_hotkey(&mut self, slot: u8, window: &mut Window, cx: &mut Context<Self>) {
-    let Some(place) = cx.global::<settings::Settings>().hotkeys.get(&slot).cloned() else {
+    let settings = cx.global::<settings::Settings>();
+    let Some(place) = settings.hotkeys.get(&slot).cloned() else {
       return;
     };
+    // A feature that is off keeps its key, and the key does nothing.
+    if !settings.features().opens(&place) {
+      return;
+    }
     match place {
       Place::Home => self.go_home(window, cx),
       Place::Calendar => self.open_calendar(window, cx),
       Place::Meet => self.open_meet(window, cx),
+      Place::Mail => self.open_mail(window, cx),
       Place::Mentions => self.open_shortcut(Shortcut::Mentions, window, cx),
       Place::Starred => self.open_shortcut(Shortcut::Starred, window, cx),
       Place::Conversation(id) => {
@@ -532,6 +588,10 @@ impl RootView {
 
   fn rewrite_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     if self.modal_open(cx) {
+      return;
+    }
+    if self.store.read(cx).view == crate::store::View::Mail {
+      self.mail.update(cx, |mail, cx| mail.rewrite_hotkey(window, cx));
       return;
     }
     let Some(conv) = self.store.read(cx).conv.clone() else {
@@ -607,8 +667,8 @@ impl RootView {
     cx.notify();
   }
 
-  /// Gives the keyboard back once an overlay closes: to the open conversation's composer, to the calendar or Meet, or
-  /// to the window.
+  /// Gives the keyboard back once an overlay closes: to the open conversation's composer, to the calendar, Meet, or
+  /// Mail, or to the window.
   fn refocus(&self, window: &mut Window, cx: &mut Context<Self>) {
     if self.store.read(cx).view == View::Calendar {
       self.focus_calendar(window, cx);
@@ -616,6 +676,10 @@ impl RootView {
     }
     if self.store.read(cx).view == View::Meet {
       self.focus_meet(window, cx);
+      return;
+    }
+    if self.store.read(cx).view == View::Mail {
+      self.focus_mail(window, cx);
       return;
     }
     match self.store.read(cx).conv.clone() {
@@ -633,7 +697,10 @@ impl RootView {
     self.new_chat = None;
     self.close_overlay_state();
     self.store.update(cx, super::store::Store::open_calendar);
-    self.focus_calendar(window, cx);
+    // Calendar stays shut while it is off.
+    if self.store.read(cx).view == View::Calendar {
+      self.focus_calendar(window, cx);
+    }
   }
 
   fn focus_calendar(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -660,11 +727,34 @@ impl RootView {
     self.new_chat = None;
     self.close_overlay_state();
     self.store.update(cx, super::store::Store::open_meet);
-    self.focus_meet(window, cx);
+    // Meet stays shut while it is off.
+    if self.store.read(cx).view == View::Meet {
+      self.focus_meet(window, cx);
+    }
   }
 
   fn focus_meet(&self, window: &mut Window, cx: &mut Context<Self>) {
     let focus = self.meet.read(cx).focus_handle(cx);
+    window.focus(&focus, cx);
+  }
+
+  /// Shows Gmail and gives it the keyboard.
+  fn open_mail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if !self.can_navigate(window, cx) {
+      return;
+    }
+    self.switcher = None;
+    self.new_chat = None;
+    self.close_overlay_state();
+    self.store.update(cx, super::store::Store::open_mail);
+    // Mail stays shut while it is off: Gmail is not read then.
+    if self.store.read(cx).view == View::Mail {
+      self.focus_mail(window, cx);
+    }
+  }
+
+  fn focus_mail(&self, window: &mut Window, cx: &mut Context<Self>) {
+    let focus = self.mail.read(cx).focus_handle();
     window.focus(&focus, cx);
   }
 
@@ -706,7 +796,7 @@ impl RootView {
 
   /// The grip on the inner edge of the open column(s): drag to resize, double-click for the default width.
   fn resize_handle(&self, cx: &mut Context<Self>) -> AnyElement {
-    let edge = px(self.columns_width(cx) - RESIZE_HANDLE_WIDTH / 2.);
+    let edge = px(columns_width(cx) - RESIZE_HANDLE_WIDTH / 2.);
     let dragging = self.resizing.is_some();
     div()
       .id("column-resize")
@@ -844,7 +934,7 @@ impl RootView {
       }
       return;
     }
-    if from_edge < px(self.columns_width(cx) + OVERLAY_INSET) {
+    if from_edge < px(columns_width(cx) + OVERLAY_INSET) {
       self._overlay_hide = None;
       if self.overlay_leaving {
         self.overlay_leaving = false;
@@ -890,6 +980,8 @@ impl RootView {
       self.close_overlay(window, cx);
     } else if self.meet.update(cx, |meet, cx| meet.dismiss(window, cx)) {
       // The link card closed, or a text field of Meet gave the keyboard back.
+    } else if self.mail.update(cx, |mail, cx| mail.dismiss(window, cx)) {
+      // The search field of Mail gave the keyboard back, or the thread open closed.
     } else if !self.store.read(cx).query.is_empty() {
       self.search.update(cx, |state, cx| state.set_value("", window, cx));
       self.store.update(cx, |store, cx| store.set_query(String::new(), cx));
@@ -920,6 +1012,18 @@ impl RootView {
       || self.theme_picker.is_some()
       || self.new_chat.is_some()
       || self.calendar.read(cx).has_modal()
+  }
+
+  /// Something the window draws over the content panel is open: a modal, a menu, a picker, the media viewer, the
+  /// status composer, or the floating sidebar. Mail's webviews hide meanwhile (`MailView::set_covered`).
+  fn covers_panel(&self, cx: &App) -> bool {
+    self.modal_open(cx)
+      || self.overlay.is_some()
+      || self.menu.read(cx).is_open()
+      || self.viewer.read(cx).is_open()
+      || self.emoji.read(cx).is_open()
+      || self.composer.read(cx).is_open()
+      || self.mail.read(cx).labels_open
   }
 
   /// The open conversation's thread as a pop-up over the window, when one is open and the setting asks for that.
@@ -962,6 +1066,7 @@ impl RootView {
       View::Home | View::Shortcut(_) => window.focus(&self.focus, cx),
       View::Calendar => self.focus_calendar(window, cx),
       View::Meet => self.focus_meet(window, cx),
+      View::Mail => self.focus_mail(window, cx),
       View::Conversation(_) => {},
     }
   }
@@ -1066,20 +1171,10 @@ impl RootView {
     }
   }
 
-  /// How wide the column(s) are together.
-  fn columns_width(&self, cx: &App) -> f32 {
-    let rail = if self.layout == Layout::Rail {
-      RAIL_WIDTH
-    } else {
-      0.
-    };
-    cx.global::<settings::Settings>().column_width(self.layout) + rail
-  }
-
   /// The hidden column(s) as a floating card over the panel: inset from the window's edges, rounded like the panel,
   /// same widths, no scrim, nothing reflows. It leaves when the pointer does.
   fn overlay_element(&self, cx: &App) -> AnyElement {
-    let width = self.columns_width(cx);
+    let width = columns_width(cx);
     let right = Self::sidebar_side(cx) == SidebarSide::Right;
     let card = h_flex()
       .id("sidebar-overlay")
@@ -1187,6 +1282,14 @@ impl Render for RootView {
     let on_shortcut = matches!(store.view, View::Shortcut(_));
     let on_calendar = store.view == View::Calendar;
     let on_meet = store.view == View::Meet;
+    let on_mail = store.view == View::Mail;
+    let covered = self.covers_panel(cx);
+    // Only a change of cover writes to the Mail view: an update of another entity on every root render is a write
+    // made while the window draws.
+    if self.mail.read(cx).covered() != covered {
+      self.mail.update(cx, |mail, cx| mail.set_covered(covered, cx));
+    }
+    let store = self.store.read(cx);
     let open_conv = match (&store.view, &store.conv) {
       (View::Conversation(_), Some(conv)) => Some(conv.clone()),
       _ => None,
@@ -1223,14 +1326,22 @@ impl Render for RootView {
         window.focus(&focus, cx);
       });
     }
+    if on_mail && window.focused(cx).is_none() {
+      let mail = self.mail.clone();
+      window.defer(cx, move |window, cx| {
+        let focus = mail.read(cx).focus_handle();
+        window.focus(&focus, cx);
+      });
+    }
 
     // Home and the conversation redraw themselves when what they draw changes, so they are cached. The others redraw
-    // with the window root: Mentions and Starred, Calendar, and Meet each read more than they observe.
+    // with the window root: Mentions and Starred, Calendar, Meet, and Mail each read more than they observe.
     let content: AnyElement = match open_conv {
       Some(conv) => conv.cached(StyleRefinement::default().size_full()).into_any_element(),
       None if on_shortcut => self.shortcuts.clone().into_any_element(),
       None if on_calendar => self.calendar.clone().into_any_element(),
       None if on_meet => self.meet.clone().into_any_element(),
+      None if on_mail => self.mail.clone().into_any_element(),
       None => self
         .home
         .clone()
@@ -1346,6 +1457,7 @@ impl Render for RootView {
       .on_action(cx.listener(|this, _: &GoHome, window, cx| this.go_home(window, cx)))
       .on_action(cx.listener(|this, _: &OpenCalendar, window, cx| this.open_calendar(window, cx)))
       .on_action(cx.listener(|this, _: &OpenMeet, window, cx| this.open_meet(window, cx)))
+      .on_action(cx.listener(|this, _: &OpenMail, window, cx| this.open_mail(window, cx)))
       .on_action(cx.listener(|this, _: &GoBack, window, cx| this.step(true, window, cx)))
       .on_action(cx.listener(|this, _: &GoForward, window, cx| this.step(false, window, cx)))
       .on_action(cx.listener(|this, _: &NextConversation, window, cx| this.step_conversation(true, window, cx)))

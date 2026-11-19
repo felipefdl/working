@@ -155,6 +155,11 @@ impl CalendarView {
     if !self.active {
       return;
     }
+    // A clicked reminder: its day, with its card.
+    if let Some(event) = self.store.update(cx, |store, _| store.take_reveal()) {
+      self.go_to(crate::util::local(event.start).date_naive(), cx);
+      self.open_card(&event, point(px(360.), px(160.)), window, cx);
+    }
     self.refresh_events(cx);
     let written = self.store.update(cx, |store, _| store.take_calendar_write());
     match written {

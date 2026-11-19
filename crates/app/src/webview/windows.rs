@@ -100,6 +100,11 @@ fn reachable(url: &str) -> String {
   }
 }
 
+/// `WebView2` names a custom protocol's pages by their HTTP host (`reachable`).
+pub fn is_under(url: &str, base: &str) -> bool {
+  url.starts_with(&reachable(base))
+}
+
 /// The GPUI window's handle, kept for the build, which outlives the update the handle was read in.
 struct Parent(RawWindowHandle);
 
@@ -113,12 +118,19 @@ impl HasWindowHandle for Parent {
 
 #[cfg(test)]
 mod tests {
-  use super::reachable;
+  use super::{is_under, reachable};
 
   #[test]
   fn custom_protocols_load_through_their_http_host() {
     assert_eq!(reachable("media://localhost/index.html"), "http://media.localhost/index.html");
     assert_eq!(reachable("https://accounts.google.com/"), "https://accounts.google.com/");
     assert_eq!(reachable("about:blank"), "about:blank");
+  }
+
+  #[test]
+  fn a_custom_protocol_page_is_known_by_its_http_host() {
+    assert!(is_under("http://mailbody.localhost/", "mailbody://localhost/"));
+    assert!(is_under("http://mailbody.localhost/#top", "mailbody://localhost/"));
+    assert!(!is_under("https://example.com/", "mailbody://localhost/"));
   }
 }

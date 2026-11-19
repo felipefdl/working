@@ -93,6 +93,11 @@ pub fn rgb(tone: Tone) -> Rgba {
   gpui_kit::rgb((tone.0)(&current().colors))
 }
 
+/// A tone of the theme in use as `0xRRGGBB`, for a page a webview draws in the theme's colors.
+pub fn hex(tone: Tone) -> u32 {
+  (tone.0)(&current().colors)
+}
+
 /// The fill of a button, field, or picker on a settings card. A faint wash of the text color shows over every
 /// theme's card, where a theme tone such as `FIELD` or `BG` can match the card and leave only the label.
 pub fn control_fill() -> Rgba {

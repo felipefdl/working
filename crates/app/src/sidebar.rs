@@ -1,5 +1,5 @@
-//! Fixed-width, virtualized sidebar: Home, Mentions, Starred, Calendar, and Meet, then the Direct messages / Apps /
-//! Spaces sections.
+//! Fixed-width, virtualized sidebar: Home, Mentions, Starred, Calendar, Meet, and Mail, then the Direct messages /
+//! Apps / Spaces sections.
 
 use std::ops::Range;
 use std::rc::Rc;
@@ -13,6 +13,7 @@ use gchat_core::Shortcut;
 use crate::calendar::OpenCalendar;
 use crate::conv_list::place_tip;
 use crate::home::conversation_menu;
+use crate::mail::OpenMail;
 use crate::meet::OpenMeet;
 use crate::menu;
 use crate::new_chat::OpenNewChat;
@@ -51,13 +52,14 @@ impl Sidebar {
     let selected_home = store.view == View::Home;
     let selected_shortcut = match &store.view {
       View::Shortcut(shortcut) => Some(*shortcut),
-      View::Home | View::Calendar | View::Meet | View::Conversation(_) => None,
+      View::Home | View::Calendar | View::Meet | View::Mail | View::Conversation(_) => None,
     };
     let selected_calendar = store.view == View::Calendar;
     let selected_meet = store.view == View::Meet;
+    let selected_mail = store.view == View::Mail;
     let selected_group = match &store.view {
       View::Conversation(id) => Some(id.clone()),
-      View::Home | View::Shortcut(_) | View::Calendar | View::Meet => None,
+      View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => None,
     };
     let mut out = Vec::with_capacity(range.len());
     for ix in range {
@@ -121,6 +123,31 @@ impl Sidebar {
               .children(key_hint(&Place::Meet, cx)),
           )
           .into_any_element(),
+        // Bright and bold while the inbox has unread threads, with their number at the right.
+        SidebarItem::Mail => {
+          let unread = store.mail.unread;
+          row
+            .child(
+              item_frame(selected_mail)
+                .tooltip(place_tip("Mail", Place::Mail))
+                .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Mail))
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMail), cx))
+                .child(icon(Icon::Mail, 16., TEXT))
+                .child(label("Mail", unread > 0).flex_1())
+                .when(unread > 0, |d| {
+                  d.child(
+                    div()
+                      .flex_shrink_0()
+                      .text_size(px(12.))
+                      .font_weight(FontWeight::SEMIBOLD)
+                      .text_color(rgb(ACCENT))
+                      .child(unread.to_string()),
+                  )
+                })
+                .children(key_hint(&Place::Mail, cx)),
+            )
+            .into_any_element()
+        },
         SidebarItem::Header(section) => {
           let section = section.clone();
           let title = section.title().to_string();

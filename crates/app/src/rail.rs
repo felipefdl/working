@@ -1,5 +1,5 @@
 //! The Rail layout's icon column: one button per pane (Home, Mentions, Starred, then each section and kind) with its
-//! unread count, and Calendar, Meet, and New chat at the bottom.
+//! unread count, and Calendar, Meet, Mail (with its unread count), and New chat at the bottom.
 
 use gchat_core::Shortcut;
 use gpui_kit::component::tooltip::Tooltip;
@@ -9,13 +9,14 @@ use gpui_kit::*;
 
 use crate::calendar::OpenCalendar;
 use crate::conv_list::{new_chat_tip, pane_title, place_tip};
+use crate::mail::OpenMail;
 use crate::meet::OpenMeet;
 use crate::menu;
 use crate::new_chat::OpenNewChat;
 use crate::settings::{Place, Settings};
 use crate::store::{Kind, Pane, Section, Store, Tab, View};
-use crate::theme::{ACCENT, BG, FIELD, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, TEXT_STRONG, Tone, rgb};
-use crate::ui::{Icon, icon};
+use crate::theme::{FIELD, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, TEXT_STRONG, Tone, rgb};
+use crate::ui::{Icon, count_badge, icon};
 use crate::util;
 
 /// Width of the column.
@@ -98,27 +99,7 @@ fn glyph_element(glyph: Glyph, color: Tone) -> AnyElement {
 
 /// The unread count over a button's glyph.
 fn badge(count: usize) -> Div {
-  let text = if count > 99 {
-    "99+".to_string()
-  } else {
-    count.to_string()
-  };
-  div()
-    .absolute()
-    .top(px(-5.))
-    .right(px(-9.))
-    .min_w(px(16.))
-    .h(px(16.))
-    .px_1()
-    .flex()
-    .items_center()
-    .justify_center()
-    .rounded_full()
-    .bg(rgb(ACCENT))
-    .text_size(px(10.))
-    .font_weight(FontWeight::SEMIBOLD)
-    .text_color(rgb(BG))
-    .child(text)
+  count_badge(count).absolute().top(px(-5.)).right(px(-9.))
 }
 
 /// Whether a button is the pane in use. The Unread pane a Messages chip may have left is All narrowed to the unread.
@@ -165,9 +146,9 @@ fn tab_button(handle: &Entity<Store>, ix: usize, tab: &Tab, selected: bool) -> S
     )
 }
 
-/// A button under the panes for a view of its own, Calendar or Meet: it changes what the panel shows, not which
-/// conversations are listed.
-fn view_button(id: &'static str, glyph: Icon, name: &'static str, selected: bool) -> Stateful<Div> {
+/// A button under the panes for a view of its own, Calendar, Meet, or Mail: it changes what the panel shows, not which
+/// conversations are listed. `unread` goes over its glyph, as on the panes, when there is any.
+fn view_button(id: &'static str, glyph: Icon, name: &'static str, selected: bool, unread: usize) -> Stateful<Div> {
   let color = if selected { TEXT_STRONG } else { MUTED };
   v_flex()
     .id(id)
@@ -182,20 +163,22 @@ fn view_button(id: &'static str, glyph: Icon, name: &'static str, selected: bool
     .when(!selected, |button| button.hover(|s| s.bg(rgb(ROW_HOVER))))
     .child(
       div()
+        .relative()
         .size(px(24.))
         .flex()
         .items_center()
         .justify_center()
-        .child(icon(glyph, 20., color)),
+        .child(icon(glyph, 20., color))
+        .when(unread > 0, |holder| holder.child(badge(unread))),
     )
     .child(div().text_size(px(11.)).text_color(rgb(color)).child(name))
 }
 
 impl Render for Rail {
   fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-    let (show_calendar, show_meet) = {
+    let (show_calendar, show_meet, show_mail) = {
       let settings = cx.global::<Settings>();
-      (settings.show_calendar, settings.show_meet)
+      (settings.calendar, settings.meet, settings.mail)
     };
     let store = self.store.read(cx);
     let tabs = store
@@ -225,7 +208,7 @@ impl Render for Rail {
       )
       .when(show_calendar, |rail| {
         rail.child(
-          view_button("rail-calendar", Icon::Calendar, "Calendar", store.view == View::Calendar)
+          view_button("rail-calendar", Icon::Calendar, "Calendar", store.view == View::Calendar, 0)
             .tooltip(place_tip("Calendar", Place::Calendar))
             .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Calendar))
             .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenCalendar), cx)),
@@ -233,10 +216,24 @@ impl Render for Rail {
       })
       .when(show_meet, |rail| {
         rail.child(
-          view_button("rail-meet", Icon::Video, "Meet", store.view == View::Meet)
+          view_button("rail-meet", Icon::Video, "Meet", store.view == View::Meet, 0)
             .tooltip(place_tip("Meet", Place::Meet))
             .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Meet))
             .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMeet), cx)),
+        )
+      })
+      .when(show_mail, |rail| {
+        rail.child(
+          view_button(
+            "rail-mail",
+            Icon::Mail,
+            "Mail",
+            store.view == View::Mail,
+            store.mail.unread as usize,
+          )
+          .tooltip(place_tip("Mail", Place::Mail))
+          .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Mail))
+          .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMail), cx)),
         )
       })
       .child(

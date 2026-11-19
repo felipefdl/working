@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 use gchat_core::{Command, Core, Event};
 
 fn main() {
+  // Only the core traces: the HTTP stack's debug lines print `Set-Cookie` values.
   let _ = tracing_subscriber::fmt()
-    .with_env_filter("debug")
+    .with_env_filter("warn,gchat_core=debug,probe=debug")
     .with_writer(std::io::stderr)
     .try_init();
   let listen = std::env::args().nth(1).and_then(|value| value.parse().ok()).unwrap_or(20u64);
@@ -31,10 +32,22 @@ fn main() {
   if let Some(query) = std::env::args().nth(2) {
     core.send(Command::Search(query));
   }
-  // `WORKING_MCP_PORT=<port>` also serves the MCP tools for the run (sending stays refused: read-only).
+  // `WORKING_MCP_PORT=<port>` also serves every MCP server for the run, at `/mcp/chat`, `/mcp/mail`, `/mcp/calendar`,
+  // and `/mcp/meet` (sending, mail changes, and calendar changes are offered, and still refused under
+  // `WORKING_READONLY=1`).
   if let Some(port) = std::env::var("WORKING_MCP_PORT").ok().and_then(|port| port.parse().ok()) {
     let token = gchat_core::mcp::token().expect("the MCP token can be stored");
-    core.send(Command::SetMcp(Some(gchat_core::McpConfig { port, token, allow_send: true })));
+    core.send(Command::SetMcp(Some(gchat_core::McpConfig {
+      port,
+      token,
+      chat: true,
+      allow_send: true,
+      mail: true,
+      mail_write: true,
+      calendar: true,
+      calendar_write: true,
+      meet: true,
+    })));
   }
   let mut opened = false;
   let mut asked_older = false;
@@ -62,6 +75,31 @@ fn main() {
   if std::env::var("WORKING_PROBE_MEET_CREATE").is_ok_and(|value| value == "1") {
     core.send(Command::CreateMeeting);
   }
+  // Gmail, read only: the inbox (which starts its watch), then the first thread already read, so nothing changes.
+  // Only counts and shapes are printed, never names, addresses, subjects, or bodies.
+  core.send(Command::LoadMail {
+    mailbox: gchat_core::Mailbox::Inbox,
+    more: false,
+  });
+  let mut mail_opened = false;
+  let mut label_listed = false;
+  // `WORKING_PROBE_MAIL_WRITE=1` (without `WORKING_READONLY`): on the test thread only, found by its exact subject,
+  // mark unread, mark read, archive, and move back to the inbox. Prints step names and results only.
+  const WRITE_SUBJECT: &str = "Working write capture";
+  let mail_write = std::env::var("WORKING_PROBE_MAIL_WRITE").is_ok_and(|value| value == "1");
+  let mut write_searched = false;
+  let mut write_thread: Option<String> = None;
+  let mut write_done = 0_usize;
+  /// A write step: its name and the command it sends for the test thread.
+  type WriteStep = (&'static str, fn(String) -> Command);
+  let write_steps: [WriteStep; 4] = [
+    ("mark unread", |thread| Command::MarkMail { thread, read: false }),
+    ("mark read", |thread| Command::MarkMail { thread, read: true }),
+    ("archive", |thread| Command::ArchiveMail { thread, archive: true }),
+    ("move to inbox", |thread| Command::ArchiveMail { thread, archive: false }),
+  ];
+  // Event reminders: the next day's events, read only; a reminder prints its minutes, never the event.
+  core.send(Command::WatchEvents(true));
   while let Ok(event) = core.events().recv_deadline(deadline) {
     let at = started.elapsed().as_millis();
     if let Event::History { group, messages, .. } = &event {
@@ -349,6 +387,99 @@ fn main() {
       },
       Event::CalendarWritten(result) => println!("[{at}ms] calendar written: {result:?}"),
       Event::CalendarFailed(error) => println!("[{at}ms] calendar failed: {error}"),
+      Event::MailThreads { mailbox, threads, more } => {
+        let kind = match &mailbox {
+          gchat_core::Mailbox::Inbox => "inbox",
+          gchat_core::Mailbox::Starred => "starred",
+          gchat_core::Mailbox::Sent => "sent",
+          gchat_core::Mailbox::All => "all",
+          gchat_core::Mailbox::Label(_) => "label",
+          gchat_core::Mailbox::Search(_) => "search",
+        };
+        println!(
+          "[{at}ms] mail threads: {kind}, {} threads, {} unread, {} starred, {} with files, {} messages, more={more}",
+          threads.len(),
+          threads.iter().filter(|thread| thread.unread).count(),
+          threads.iter().filter(|thread| thread.starred).count(),
+          threads.iter().filter(|thread| thread.attachments).count(),
+          threads.iter().map(|thread| thread.messages).sum::<u32>(),
+        );
+        if !mail_opened && let Some(read) = threads.iter().find(|thread| !thread.unread) {
+          mail_opened = true;
+          core.send(Command::OpenMail(read.id.clone()));
+        }
+        if mail_write && !write_searched && mailbox == gchat_core::Mailbox::Inbox {
+          write_searched = true;
+          core.send(Command::LoadMail {
+            mailbox: gchat_core::Mailbox::Search(format!("subject:\"{WRITE_SUBJECT}\"")),
+            more: false,
+          });
+        }
+        if write_searched
+          && write_thread.is_none()
+          && write_done == 0
+          && matches!(mailbox, gchat_core::Mailbox::Search(_))
+          && let Some(thread) = threads.iter().find(|thread| thread.subject == WRITE_SUBJECT)
+        {
+          println!("[{at}ms] mail write: test thread found");
+          write_thread = Some(thread.id.clone());
+          core.send(write_steps[0].1(thread.id.clone()));
+        }
+      },
+      Event::MailWritten(result) => {
+        let Some(thread) = write_thread.clone() else {
+          println!("[{at}ms] mail written: {result:?}");
+          continue;
+        };
+        println!("[{at}ms] mail write: {}: {result:?}", write_steps[write_done].0);
+        write_done += 1;
+        if result.is_ok() && write_done < write_steps.len() {
+          core.send(write_steps[write_done].1(thread));
+        } else {
+          write_thread = None;
+        }
+      },
+      Event::MailMessages { messages, .. } => println!(
+        "[{at}ms] mail messages: {}, html bytes {}, text bytes {}, {} recipients, {} files, {} unread",
+        messages.len(),
+        messages.iter().map(|message| message.html.len()).sum::<usize>(),
+        messages.iter().map(|message| message.text.len()).sum::<usize>(),
+        messages
+          .iter()
+          .map(|message| message.to.len() + message.cc.len())
+          .sum::<usize>(),
+        messages.iter().map(|message| message.attachments.len()).sum::<usize>(),
+        messages.iter().filter(|message| message.unread).count(),
+      ),
+      Event::MailUnread(count) => println!("[{at}ms] mail unread: {count}"),
+      Event::MailIncoming(_) => println!("[{at}ms] mail incoming"),
+      Event::MailFailed(error) => println!("[{at}ms] mail failed: {error}"),
+      Event::MailLabels(labels) => {
+        println!(
+          "[{at}ms] mail labels: {}, {} nested, {} with a color, {} unread threads",
+          labels.len(),
+          labels.iter().filter(|label| label.name.contains('/')).count(),
+          labels.iter().filter(|label| label.color.is_some()).count(),
+          labels.iter().map(|label| label.unread).sum::<u32>(),
+        );
+        if !label_listed && let Some(label) = labels.iter().find(|label| label.name.contains('/')) {
+          label_listed = true;
+          core.send(Command::LoadMail {
+            mailbox: gchat_core::Mailbox::Label(label.id.clone()),
+            more: false,
+          });
+        }
+      },
+      Event::MailSignatures { new, reply } => {
+        // Which kinds exist, never the signature.
+        println!(
+          "[{at}ms] mail signatures: new {}, reply {}, same {}",
+          new.is_some(),
+          reply.is_some(),
+          new.is_some() && new == reply
+        );
+      },
+      Event::EventReminder { minutes, .. } => println!("[{at}ms] event reminder: {minutes} minutes before"),
       Event::Error(error) => println!("[{at}ms] error: {error}"),
     }
   }

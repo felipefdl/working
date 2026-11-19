@@ -11,6 +11,7 @@ use gpui_kit::component::kbd::Kbd;
 use gpui_kit::*;
 
 use crate::conversation::{FormatBold, FormatBulletedList, FormatItalic, FormatStrikethrough};
+use crate::mail::{CloseMailThread, OpenMailLabels, OpenSelectedThread, SelectNextThread, SelectPreviousThread};
 use crate::new_chat::OpenNewChat;
 use crate::root::{
   FindInChat, FindNext, FindPrevious, GoBack, GoForward, NextConversation, NextUnread, OpenSettings, OpenSwitcher,
@@ -80,6 +81,9 @@ const TOGGLE_SIDEBAR: &str = "ctrl-cmd-s";
 #[cfg(not(target_os = "macos"))]
 const TOGGLE_SIDEBAR: &str = "ctrl-shift-s";
 
+/// Opens the Mail view's labels popover (`mail_labels.rs`), in the Mail context.
+pub const MAIL_LABELS: &str = "secondary-l";
+
 /// This OS, for spelling a `secondary-` binding.
 #[cfg(target_os = "macos")]
 const OS: OperatingSystem = OperatingSystem::Mac;
@@ -121,6 +125,15 @@ fn table() -> Vec<(&'static str, Box<dyn Action>, Option<&'static str>)> {
     ("escape", Box::new(Escape), Some("Overlay")),
     // The event editor closes on Escape from any of its controls, not only its text fields.
     ("escape", Box::new(Escape), Some("EventEditor")),
+    // The Mail view's list: the arrows move the selection, Enter opens it, Escape goes back to the list. Its search
+    // field is a text field, whose "Input" context is deeper and keeps these keys for itself.
+    ("down", Box::new(SelectNextThread), Some("Mail")),
+    ("up", Box::new(SelectPreviousThread), Some("Mail")),
+    ("enter", Box::new(OpenSelectedThread), Some("Mail")),
+    ("escape", Box::new(CloseMailThread), Some("Mail")),
+    // The labels popover of the Mail view; the search field keeps no Cmd or Ctrl letter of its own, so it works
+    // from there too.
+    (MAIL_LABELS, Box::new(OpenMailLabels), Some("Mail")),
     ("secondary-,", Box::new(OpenSettings), None),
     ("secondary-shift-r", Box::new(RewriteDraft), None),
     // Formatting a draft, with Google Chat's keys. In the kit's "Input" context, so they are live while a text field

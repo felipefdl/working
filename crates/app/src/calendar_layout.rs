@@ -553,6 +553,17 @@ fn when_line_with(event: &CalendarEvent, h24: bool) -> String {
   )
 }
 
+/// When an event starts, as its reminder says it: `Starting now`, `In 10 minutes`, `In 1 hour`, `In 2 hours 30
+/// minutes`.
+pub fn starts_in(minutes: u32) -> String {
+  let unit = |count: u32, one: &str, many: &str| format!("{count} {}", if count == 1 { one } else { many });
+  match (minutes / 60, minutes % 60) {
+    (0, 0) => "Starting now".into(),
+    (0, rest) => format!("In {}", unit(rest, "minute", "minutes")),
+    (hours, 0) => format!("In {}", unit(hours, "hour", "hours")),
+    (hours, rest) => format!("In {} {}", unit(hours, "hour", "hours"), unit(rest, "minute", "minutes")),
+  }
+}
 #[cfg(test)]
 mod tests {
   use gchat_core::{EventKind, Reminder, Visibility};
@@ -768,5 +779,20 @@ mod tests {
       (hour_label_with(0, true), hour_label_with(12, true), hour_label_with(13, true)),
       ("0:00".into(), "12:00".into(), "13:00".into())
     );
+  }
+}
+
+#[cfg(test)]
+mod starts_in_tests {
+  use super::starts_in;
+
+  #[test]
+  fn a_reminder_says_when_its_event_starts() {
+    assert_eq!(starts_in(0), "Starting now");
+    assert_eq!(starts_in(1), "In 1 minute");
+    assert_eq!(starts_in(10), "In 10 minutes");
+    assert_eq!(starts_in(60), "In 1 hour");
+    assert_eq!(starts_in(150), "In 2 hours 30 minutes");
+    assert_eq!(starts_in(1440), "In 24 hours");
   }
 }

@@ -143,6 +143,7 @@ fn place_name(store: &Store, place: &Place) -> Option<String> {
     Place::Starred => "Starred".into(),
     Place::Calendar => "Calendar".into(),
     Place::Meet => "Meet".into(),
+    Place::Mail => "Mail".into(),
     Place::Conversation(id) => store.group(id)?.g.name.clone(),
   })
 }
@@ -151,11 +152,16 @@ fn place_name(store: &Store, place: &Place) -> Option<String> {
 /// replace, then Remove shortcut while it has one. A pick gives `place` that key, taking it from what had it.
 pub fn hotkey_menu(store: &Store, place: &Place, cx: &App) -> MenuItem {
   let settings = cx.global::<Settings>();
+  let features = settings.features();
   let current = settings.hotkey_of(place);
   let mut items: Vec<MenuItem> = keys::HOTKEY_SLOTS
     .filter_map(|slot| {
       let keys = keys::text(keys::hotkey_keys(slot)?);
-      let taken = settings.hotkeys.get(&slot).filter(|held| *held != place);
+      // A key held by a feature that is off opens nothing, so it is not named as taken.
+      let taken = settings
+        .hotkeys
+        .get(&slot)
+        .filter(|held| *held != place && features.opens(held));
       let label = match taken.and_then(|held| place_name(store, held)) {
         Some(name) => format!("{keys} · replaces {name}"),
         None => keys,

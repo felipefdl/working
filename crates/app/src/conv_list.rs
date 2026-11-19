@@ -14,13 +14,14 @@ use crate::calendar::OpenCalendar;
 use crate::emoji_font;
 use crate::home::{ROW_HEIGHT, RowMarks, conv_row, conversation_menu, hit_row, minute_clock, unread_toggle};
 use crate::keys;
+use crate::mail::OpenMail;
 use crate::meet::OpenMeet;
 use crate::menu;
 use crate::new_chat::OpenNewChat;
 use crate::settings::{Layout, Place, Settings};
 use crate::store::{Conv, Kind, ListRow, Pane, Store, View};
 use crate::theme::{ACCENT, ACCENT_BG, BORDER, FIELD, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, mono, rgb};
-use crate::ui::{Icon, icon, person_status, status_dot};
+use crate::ui::{Icon, count_badge, icon, person_status, status_dot};
 
 /// A list row: the shared conversation row with a sliver of air above and below, so selected rows stand apart.
 const LIST_ROW_HEIGHT: f32 = ROW_HEIGHT + 4.0;
@@ -120,7 +121,7 @@ impl ConvList {
   fn follow_open(&mut self, store: &Store) {
     let open = match &store.view {
       View::Conversation(id) => Some(id),
-      View::Home | View::Shortcut(_) | View::Calendar | View::Meet => None,
+      View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => None,
     };
     if open == self.followed.as_ref() {
       return;
@@ -153,7 +154,7 @@ impl ConvList {
   fn conversation_rows(&self, range: Range<usize>, store: &Store, cx: &App) -> Vec<AnyElement> {
     let open = match &store.view {
       View::Conversation(id) => Some(id),
-      View::Home | View::Shortcut(_) | View::Calendar | View::Meet => None,
+      View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => None,
     };
     let irc = cx.global::<Settings>().layout == Layout::Irc;
     let mut out = Vec::with_capacity(range.len());
@@ -270,13 +271,13 @@ impl ConvList {
       .when_some(person_status(g, cx), |row, status| row.child(status_dot(status)))
   }
 
-  /// Messages: the title with buttons for Mentions, Starred, Calendar, Meet, and New chat, then the filter chips. A
-  /// column too narrow for both drops the title and makes the buttons smaller.
+  /// Messages: the title with buttons for Mentions, Starred, Calendar, Meet, Mail (with its unread count), and New
+  /// chat, then the filter chips. A column too narrow for both drops the title and makes the buttons smaller.
   /// IRC: one line, the filter in use (its menu also holds the two orders) and then the buttons, smaller.
   fn messages_header(&self, store: &Store, cx: &Context<Self>) -> Div {
     let shown = match &store.view {
       View::Shortcut(shortcut) => Some(*shortcut),
-      View::Home | View::Calendar | View::Meet | View::Conversation(_) => None,
+      View::Home | View::Calendar | View::Meet | View::Mail | View::Conversation(_) => None,
     };
     let shortcut_button = |id: &'static str, glyph: Icon, name: &'static str, shortcut: Shortcut| {
       let handle = self.store.clone();
@@ -285,13 +286,14 @@ impl ConvList {
         .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, shortcut.into()))
         .on_click(move |_, _, cx| handle.update(cx, |s, cx| s.open_shortcut(shortcut, cx)))
     };
-    let (show_mentions, show_starred, show_calendar, show_meet) = {
+    let (show_mentions, show_starred, show_calendar, show_meet, show_mail) = {
       let settings = cx.global::<Settings>();
       (
         settings.show_mentions,
         settings.show_starred,
-        settings.show_calendar,
-        settings.show_meet,
+        settings.calendar,
+        settings.meet,
+        settings.mail,
       )
     };
     let irc = cx.global::<Settings>().layout == Layout::Irc;
@@ -321,6 +323,19 @@ impl ConvList {
             .tooltip(place_tip("Meet", Place::Meet))
             .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Meet))
             .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMeet), cx)),
+        ))
+      })
+      .when(show_mail, |actions| {
+        let unread = store.mail.unread as usize;
+        actions.child(fit(
+          header_button("mail", Icon::Mail, store.view == View::Mail)
+            .relative()
+            .tooltip(place_tip("Mail", Place::Mail))
+            .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Mail))
+            .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMail), cx))
+            .when(unread > 0, |button| {
+              button.child(count_badge(unread).absolute().top(px(-4.)).right(px(-6.)))
+            }),
         ))
       })
       .when(!irc, |actions| actions.child(fit(sort_button("sort-list", cx))))

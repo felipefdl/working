@@ -17,7 +17,7 @@ use crate::notify;
 #[cfg(target_os = "macos")]
 use crate::permissions::{self, Media, Status};
 use crate::settings::{
-  self, ActivityStatus, Appearance, DEFAULT_REWRITE_INSTRUCTION, Layout, ListWindow, McpState, MessageStyle, Place,
+  self, ActivityStatus, Appearance, DEFAULT_REWRITE_INSTRUCTION, Layout, ListWindow, McpState, MessageStyle,
   RewriteTool, Settings, SidebarMode, SidebarSide, Sound, ThreadView,
 };
 use crate::status::{self, DndState};
@@ -38,16 +38,14 @@ const INSTRUCTION_SAVE_DELAY: Duration = Duration::from_millis(500);
 const SETTINGS_SIZE: (Size<f32>, Size<f32>) =
   (Size { width: 780.0, height: 500.0 }, Size { width: 1120.0, height: 860.0 });
 
-/// What still opens a view whose button is hidden: its number key, while it has one, and the Go menu.
-fn still_opens(settings: &Settings, place: &Place) -> String {
-  match settings.hotkey_of(place).and_then(keys::hotkey_keys) {
-    Some(binding) => format!("{} and the Go menu still open it.", keys::text(binding)),
-    None => "The Go menu still opens it.".into(),
-  }
+/// What a row of a feature that is off says, in place of what it would do.
+fn feature_off(feature: &str) -> String {
+  format!("{feature} is off in Settings, Features.")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Section {
+  Features,
   Appearance,
   Layout,
   Messages,
@@ -63,7 +61,8 @@ enum Section {
 
 impl Section {
   #[cfg(target_os = "macos")]
-  const ALL: [Self; 9] = [
+  const ALL: [Self; 10] = [
+    Self::Features,
     Self::Appearance,
     Self::Layout,
     Self::Messages,
@@ -75,7 +74,8 @@ impl Section {
     Self::Permissions,
   ];
   #[cfg(not(target_os = "macos"))]
-  const ALL: [Self; 8] = [
+  const ALL: [Self; 9] = [
+    Self::Features,
     Self::Appearance,
     Self::Layout,
     Self::Messages,
@@ -88,6 +88,7 @@ impl Section {
 
   const fn title(self) -> &'static str {
     match self {
+      Self::Features => "Features",
       Self::Appearance => "Appearance",
       Self::Layout => "Layout",
       Self::Messages => "Messages",
@@ -103,6 +104,7 @@ impl Section {
 
   const fn icon(self) -> Icon {
     match self {
+      Self::Features => Icon::LayoutGrid,
       Self::Appearance => Icon::Monitor,
       Self::Layout => Icon::PanelLeft,
       Self::Messages => Icon::Thread,
@@ -117,25 +119,59 @@ impl Section {
   }
 }
 
-/// What an agent's settings need to reach the MCP server, each copied by a button of its own.
+/// One of the MCP servers, each switched on by itself and reached at a path of its own under `/mcp`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Server {
+  Chat,
+  Mail,
+  Calendar,
+  Meet,
+}
+
+impl Server {
+  /// The last part of its address, and of its name in Claude Code (`working-chat`).
+  const fn path(self) -> &'static str {
+    match self {
+      Self::Chat => "chat",
+      Self::Mail => "mail",
+      Self::Calendar => "calendar",
+      Self::Meet => "meet",
+    }
+  }
+
+  /// Its place among the servers, for the ids of its copy buttons.
+  const fn ix(self) -> usize {
+    match self {
+      Self::Chat => 0,
+      Self::Mail => 1,
+      Self::Calendar => 2,
+      Self::Meet => 3,
+    }
+  }
+}
+
+/// What an agent's settings need to reach an MCP server, each copied by a button of its own.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Access {
   /// One address with the token in it.
   Link,
   /// The shell command that adds the server to Claude Code for every project of the user.
   ClaudeCode,
+  /// The token every server shares.
   Token,
 }
 
 impl Access {
-  fn text(self, port: u16) -> std::io::Result<String> {
+  fn text(self, port: u16, server: Server) -> std::io::Result<String> {
     let token = gchat_core::mcp::token()?;
-    let endpoint = format!("http://127.0.0.1:{port}/mcp");
+    let path = server.path();
+    let endpoint = format!("http://127.0.0.1:{port}/mcp/{path}");
     Ok(match self {
       Self::Link => format!("{endpoint}/{token}"),
       Self::ClaudeCode => {
         format!(
-          "claude mcp add --scope user --transport http working {endpoint} --header \"Authorization: Bearer {token}\""
+          "claude mcp add --scope user --transport http working-{path} {endpoint} --header \"Authorization: Bearer \
+           {token}\""
         )
       },
       Self::Token => token,
@@ -163,7 +199,7 @@ pub struct SettingsView {
   #[cfg(target_os = "macos")]
   allowed: Allowed,
   /// What was just copied: its button says so for a moment.
-  copied: Option<Access>,
+  copied: Option<(Server, Access)>,
   /// The do-not-disturb schedule whose days and times are open for changing.
   editing: Option<usize>,
   rewrite_instruction: Entity<TextareaState>,
@@ -283,7 +319,7 @@ impl SettingsView {
     let (thread_view, thread_view_sub) = Self::thread_view_select(window, cx);
     Self {
       core,
-      section: Section::Appearance,
+      section: Section::Features,
       #[cfg(target_os = "macos")]
       allowed: Self::read_allowed(),
       copied: None,
@@ -323,15 +359,15 @@ impl SettingsView {
     view
   }
 
-  fn copy(&mut self, access: Access, cx: &mut Context<Self>) {
-    match access.text(cx.global::<Settings>().mcp_port) {
+  fn copy(&mut self, server: Server, access: Access, cx: &mut Context<Self>) {
+    match access.text(cx.global::<Settings>().mcp_port, server) {
       Ok(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
       Err(error) => {
         tracing::warn!("could not read the MCP token: {error}");
         return;
       },
     }
-    self.copied = Some(access);
+    self.copied = Some((server, access));
     self._copied_reset = Some(cx.spawn(async move |this, cx| {
       cx.background_executor().timer(Duration::from_millis(1500)).await;
       this
@@ -408,6 +444,62 @@ impl SettingsView {
 
   fn toggle(id: impl Into<ElementId>, on: bool) -> Stateful<Div> {
     switch(on, 24.).id(id).cursor_pointer()
+  }
+
+  /// A switch that flips `flip` while `enabled`, and is dimmed and does nothing while not (its feature is off).
+  fn gated_toggle(
+    id: impl Into<ElementId>,
+    on: bool,
+    enabled: bool,
+    flip: impl Fn(&mut Settings) + 'static,
+  ) -> Stateful<Div> {
+    let switch = Self::toggle(id, on);
+    if enabled {
+      switch.on_click(move |_, _, cx| Settings::update(cx, &flip))
+    } else {
+      switch.opacity(0.4).cursor_default()
+    }
+  }
+
+  /// Calendar, Meet, and Mail, each on or off as a whole.
+  fn features(settings: &Settings) -> Div {
+    let feature =
+      |id: &'static str, title: &'static str, detail: &'static str, on: bool, first: bool, flip: fn(&mut Settings)| {
+        Self::row(title, detail, first).child(Self::toggle(id, on).on_click(move |_, _, cx| Settings::update(cx, flip)))
+      };
+    Self::group(
+      "Features",
+      Self::card()
+        .child(feature(
+          "feature-calendar",
+          "Calendar",
+          "Google Calendar: your calendars and events, and reminders when an event is about to start. Off removes it \
+           everywhere: its view and buttons, its reminders, and its tools for agents.",
+          settings.calendar,
+          true,
+          |settings| settings.calendar.toggle(),
+        ))
+        .child(feature(
+          "feature-meet",
+          "Meet",
+          "Google Meet: start and join meetings, call people, and take calls in Working's own window. Off removes it \
+           everywhere: its view and buttons, the call window and its notifications, and its tools for agents. Meeting \
+           links then open in the browser.",
+          settings.meet,
+          false,
+          |settings| settings.meet.toggle(),
+        ))
+        .child(feature(
+          "feature-mail",
+          "Mail",
+          "Gmail: read and write email, with the unread count. Off removes it everywhere: its view and buttons, its \
+           notifications and its count in the Dock, and its tools for agents. While it is off, Working does not read \
+           Gmail.",
+          settings.mail,
+          false,
+          |settings| settings.mail.toggle(),
+        )),
+    )
   }
 
   fn appearance_picker(current: Appearance) -> Div {
@@ -999,34 +1091,6 @@ impl SettingsView {
               Self::toggle("show-starred", settings.show_starred)
                 .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_starred.toggle())),
             ),
-          )
-          .child(
-            Self::row(
-              "Show Calendar",
-              format!(
-                "The Calendar button in the sidebar, the Chats header, or the rail. {}",
-                still_opens(&settings, &Place::Calendar)
-              ),
-              false,
-            )
-            .child(
-              Self::toggle("show-calendar", settings.show_calendar)
-                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_calendar.toggle())),
-            ),
-          )
-          .child(
-            Self::row(
-              "Show Meet",
-              format!(
-                "The Meet button in the sidebar, the Chats header, or the rail. {}",
-                still_opens(&settings, &Place::Meet)
-              ),
-              false,
-            )
-            .child(
-              Self::toggle("show-meet", settings.show_meet)
-                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.show_meet.toggle())),
-            ),
           ),
       ))
   }
@@ -1070,13 +1134,21 @@ impl SettingsView {
             card.child(
               Self::row(
                 "Built-in Google Meet",
-                "Open meetings in Working. Off opens them in the browser.",
+                if settings.meet {
+                  "Open meetings in Working. Off opens them in the browser.".to_string()
+                } else {
+                  format!("Meetings open in the browser. {}", feature_off("Meet"))
+                },
                 true,
               )
-              .child(
-                Self::toggle("meet-builtin", settings.meet_builtin)
-                  .on_click(|_, _, cx| Settings::update(cx, |settings| settings.meet_builtin.toggle())),
-              ),
+              .child(Self::gated_toggle(
+                "meet-builtin",
+                settings.meet_builtin,
+                settings.meet,
+                |settings| {
+                  settings.meet_builtin.toggle();
+                },
+              )),
             )
           })
           .child(
@@ -1097,13 +1169,21 @@ impl SettingsView {
           Self::card().child(
             Self::row(
               "Camera always off",
-              "Calls never get the camera, and have no camera button.",
+              if settings.meet {
+                "Calls never get the camera, and have no camera button.".to_string()
+              } else {
+                format!("Calls never get the camera. {}", feature_off("Meet"))
+              },
               true,
             )
-            .child(
-              Self::toggle("camera-off", settings.camera_off)
-                .on_click(|_, _, cx| Settings::update(cx, |settings| settings.camera_off.toggle())),
-            ),
+            .child(Self::gated_toggle(
+              "camera-off",
+              settings.camera_off,
+              settings.meet,
+              |settings| {
+                settings.camera_off.toggle();
+              },
+            )),
           ),
         ))
       })
@@ -1257,9 +1337,52 @@ impl SettingsView {
           .child(sound.label()),
       );
     }
+    let mail = Self::row(
+      "New mail",
+      if settings.mail {
+        "Notify when an unread email reaches the inbox. Do not disturb quiets it too.".to_string()
+      } else {
+        format!("Notify when an unread email reaches the inbox. {}", feature_off("Mail"))
+      },
+      true,
+    )
+    .child(Self::gated_toggle(
+      "mail-notify",
+      settings.mail_notify,
+      settings.mail,
+      |settings| {
+        settings.mail_notify.toggle();
+      },
+    ));
     let out = v_flex()
       .gap_5()
-      .child(Self::group("Notification sound", Self::card().child(sounds)));
+      .child(Self::group("Notification sound", Self::card().child(sounds)))
+      .child(Self::group("Mail", Self::card().child(mail)))
+      .child(Self::group(
+        "Calendar",
+        Self::card().child(
+          Self::row(
+            "Event reminders",
+            if settings.calendar {
+              "Notify when an event's reminder time comes, as Google Calendar sets it.".to_string()
+            } else {
+              format!(
+                "Notify when an event's reminder time comes, as Google Calendar sets it. {}",
+                feature_off("Calendar")
+              )
+            },
+            true,
+          )
+          .child(Self::gated_toggle(
+            "event-reminders",
+            settings.event_reminders,
+            settings.calendar,
+            |settings| {
+              settings.event_reminders.toggle();
+            },
+          )),
+        ),
+      ));
 
     let Some(dnd) = cx.global::<DndState>().0.clone() else {
       let waiting = Self::row(
@@ -1496,7 +1619,7 @@ impl SettingsView {
       .child(
         Self::row(
           "Tool",
-          "The CLI on this computer that rewrites a draft. Off hides the button.",
+          "The CLI on this computer that rewrites a draft in Chat and in Mail. Off hides the button.",
           true,
         )
         .child(Self::rewrite_picker(settings.rewrite)),
@@ -1504,7 +1627,7 @@ impl SettingsView {
       .child(
         Self::row(
           "Always rewrite",
-          "Rewrite every message before it sends. Right-click the rewrite button to switch.",
+          "Rewrite every Chat message or email before it sends. Right-click the rewrite button to switch.",
           false,
         )
         .child(
@@ -1576,30 +1699,54 @@ impl SettingsView {
   }
 
   fn agents(&self, settings: Settings, cx: &mut Context<Self>) -> Div {
-    let server = Self::card()
+    let out = v_flex()
+      .gap_5()
       .child(
-        Self::row(
-          "MCP server",
-          "Lets AI agents on this computer read your Google Chat through Working.",
-          true,
-        )
-        .child(
-          Self::toggle("mcp", settings.mcp).on_click(|_, _, cx| Settings::update(cx, |settings| settings.mcp.toggle())),
+        self.server_group(
+          &settings,
+          Server::Chat,
+          "Chat",
+          "Agents catch up on unread conversations and your recent activity, and find, read, and search conversations."
+            .into(),
+          Some((
+            "Let agents send messages",
+            "Adds a tool that posts as you. Without it agents only read.",
+          )),
+          cx,
         ),
       )
-      .child(
-        Self::row(
-          "Let agents send messages",
-          "Adds a tool that posts as you. Without it agents only read.",
-          false,
-        )
-        .child(
-          Self::toggle("mcp-send", settings.mcp_send)
-            .on_click(|_, _, cx| Settings::update(cx, |settings| settings.mcp_send.toggle())),
-        ),
-      );
-    let out = v_flex().gap_5().child(Self::group("Server", server));
-    if !settings.mcp {
+      .child(self.server_group(
+        &settings,
+        Server::Mail,
+        "Mail",
+        "Agents list, search, and read your mail and labels. They change nothing unless you let them below.".into(),
+        Some((
+          "Let agents send and change mail",
+          "Adds tools that send new emails and replies from your address, archive, and mark read. What they send is \
+           real email. Without it agents only read.",
+        )),
+        cx,
+      ))
+      .child(self.server_group(
+        &settings,
+        Server::Calendar,
+        "Calendar",
+        "Agents list your calendars and read their events.".into(),
+        Some((
+          "Let agents change events",
+          "Adds tools that create, change, and delete events and answer invitations. Without it agents only read.",
+        )),
+        cx,
+      ))
+      .child(self.server_group(
+        &settings,
+        Server::Meet,
+        "Meet",
+        "Agents make new meetings and list your events with a Meet link in the next 7 days.".into(),
+        None,
+        cx,
+      ));
+    if !settings.any_mcp() {
       return out;
     }
 
@@ -1620,48 +1767,128 @@ impl SettingsView {
       },
       McpStatus::Off => (MUTED, "Starts once you are signed in.".to_string()),
     };
-    let copy = |access: Access, id: &'static str, label: &'static str, cx: &mut Context<Self>| {
-      Self::pill(
-        id,
-        if self.copied == Some(access) {
-          "Copied"
-        } else {
-          label
-        },
-      )
-      .on_click(cx.listener(move |this, _, _, cx| this.copy(access, cx)))
-    };
-    let connect = Self::card()
+    let token = Self::pill(
+      "copy-token",
+      if self.copied.is_some_and(|(_, access)| access == Access::Token) {
+        "Copied"
+      } else {
+        "Copy token"
+      },
+    )
+    .on_click(cx.listener(|this, _, _, cx| this.copy(Server::Chat, Access::Token, cx)));
+    let status = Self::card()
       .child(Self::row("Status", state, true).child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(rgb(color))))
       .child(
         Self::row(
-          "Link",
-          "One address with the token inside, for an agent that only takes a URL.",
-          false,
-        )
-        .child(copy(Access::Link, "copy-link", "Copy link", cx)),
-      )
-      .child(
-        Self::row(
-          "Claude Code",
-          "The command that adds this server to Claude Code, in every project.",
-          false,
-        )
-        .child(copy(Access::ClaudeCode, "copy-claude", "Copy command", cx)),
-      )
-      .child(
-        Self::row(
           "Token",
-          "For an agent that takes the address and an Authorization: Bearer header.",
+          "Every server takes it, for an agent that takes the address and an Authorization: Bearer header.",
           false,
         )
-        .child(copy(Access::Token, "copy-token", "Copy token", cx)),
+        .child(token),
       )
       .child(
         Self::row("New token", "Cuts off every agent that has the current one.", false)
           .child(Self::pill("new-token", "Replace").on_click(|_, _, cx| settings::replace_mcp_token(cx))),
       );
-    out.child(Self::group("Connect an agent", connect))
+    out.child(Self::group("Servers", status))
+  }
+
+  /// One MCP server: its switch with what agents get, its write switch when it has one (off while the server is),
+  /// and while it is on, its link and its Claude Code command.
+  fn server_group(
+    &self,
+    settings: &Settings,
+    server: Server,
+    title: &'static str,
+    detail: String,
+    write: Option<(&'static str, &'static str)>,
+    cx: &mut Context<Self>,
+  ) -> Div {
+    let on = match server {
+      Server::Chat => settings.mcp_chat,
+      Server::Mail => settings.mcp_mail,
+      Server::Calendar => settings.mcp_calendar,
+      Server::Meet => settings.mcp_meet,
+    };
+    // A server whose feature is off is not served, whatever its switches say.
+    let feature = match server {
+      Server::Chat => true,
+      Server::Mail => settings.mail,
+      Server::Calendar => settings.calendar,
+      Server::Meet => settings.meet,
+    };
+    let detail = if feature {
+      detail
+    } else {
+      format!("{detail} {}", feature_off(title))
+    };
+    let flip = move |settings: &mut Settings| match server {
+      Server::Chat => settings.mcp_chat.toggle(),
+      Server::Mail => settings.mcp_mail.toggle(),
+      Server::Calendar => settings.mcp_calendar.toggle(),
+      Server::Meet => settings.mcp_meet.toggle(),
+    };
+    let mut card = Self::card().child(Self::row(format!("{title} server"), detail, true).child(Self::gated_toggle(
+      ("mcp-server", server.ix()),
+      on,
+      feature,
+      flip,
+    )));
+    if let Some((label, what)) = write {
+      let allowed = match server {
+        Server::Calendar => settings.mcp_calendar_write,
+        Server::Mail => settings.mcp_mail_write,
+        _ => settings.mcp_send,
+      };
+      // Off while its server is, or its feature: there is nothing to allow.
+      let switch = Self::gated_toggle(
+        ("mcp-write", server.ix()),
+        allowed,
+        on && feature,
+        move |settings| match server {
+          Server::Calendar => settings.mcp_calendar_write.toggle(),
+          Server::Mail => settings.mcp_mail_write.toggle(),
+          _ => settings.mcp_send.toggle(),
+        },
+      );
+      card = card.child(Self::row(label, what, false).child(switch));
+    }
+    let on = on && feature;
+    if on {
+      let copy = |access: Access, id: &'static str, label: &'static str, cx: &mut Context<Self>| {
+        Self::pill(
+          (id, server.ix()),
+          if self.copied == Some((server, access)) {
+            "Copied"
+          } else {
+            label
+          },
+        )
+        .on_click(cx.listener(move |this, _, _, cx| this.copy(server, access, cx)))
+      };
+      card = card
+        .child(
+          Self::row(
+            "Link",
+            format!(
+              "http://127.0.0.1:{}/mcp/{} with the token inside, for an agent that only takes a URL.",
+              settings.mcp_port,
+              server.path()
+            ),
+            false,
+          )
+          .child(copy(Access::Link, "copy-link", "Copy link", cx)),
+        )
+        .child(
+          Self::row(
+            "Claude Code",
+            "The command that adds this server to Claude Code, in every project.",
+            false,
+          )
+          .child(copy(Access::ClaudeCode, "copy-claude", "Copy command", cx)),
+        );
+    }
+    Self::group(title, card)
   }
 }
 
@@ -1715,6 +1942,7 @@ impl Render for SettingsView {
     );
 
     let body = match self.section {
+      Section::Features => Self::features(&settings),
       Section::Appearance => self.appearance(settings).children(Self::desktop(cx)),
       Section::Layout => self.layout(settings),
       Section::Messages => self.messages(settings),

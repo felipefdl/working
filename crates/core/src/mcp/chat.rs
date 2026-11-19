@@ -1,7 +1,7 @@
-//! The tools agents get, shaped so a model does not have to think: few of them, one per thing a person would
-//! ask for; a conversation is named the way a person names it (the server finds it); answers are plain text
-//! with names, local times and the exact value to pass to the next call; and a mistake is answered with what
-//! to do instead.
+//! The chat server (`/mcp/chat`): Google Chat, with tools shaped so a model does not have to think: few of them,
+//! one per thing a person would ask for; a conversation is named the way a person names it (the server finds it);
+//! answers are plain text with names, local times and the exact value to pass to the next call; and a mistake is
+//! answered with what to do instead.
 #![allow(
   clippy::too_many_lines,
   clippy::as_conversions,
@@ -21,25 +21,27 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
-use serde::de::{DeserializeOwned, Error as _};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::task::JoinSet;
 
+use super::shared::{
+  MAX_ANSWER, answer, clip, cursor, keep_end, local, loose_count, loose_flag, loose_text, now_line, parse, read_only,
+  stamp, writes,
+};
 use crate::engine::{Engine, Page};
 use crate::fuzzy::Fuzzy;
 use crate::model::{AttachmentKind, Group, GroupId, GroupKind, Message, Micros, Notify, SpanKind};
 
-/// System prompt for MCP clients: how to name conversations and that reads do not mark messages read.
-pub const INSTRUCTIONS: &str = "Google Chat of the person signed in to the Working app on this computer. \
+/// The server's name.
+pub(super) const NAME: &str = "working-chat";
+
+/// System prompt for MCP clients of this server: how to name conversations and that reads do not mark messages read.
+pub(super) const INSTRUCTIONS: &str = "Google Chat of the person signed in to the Working app on this computer. \
 Catch up with inbox. To answer someone the user did not name, start with recent_activity. Find a chat with find_conversations, read it with read_conversation, and find a word or \
 topic across every chat with search_messages. Wherever a `conversation` is asked for, a name (\"Jordan Park\"), \
 part of one, or an id (dm/…, space/…) works. Times are this computer's local time. Reading changes nothing: \
 messages stay unread.";
-
-/// Longest answer of a tool, in bytes: about 12,000 tokens.
-const MAX_ANSWER: usize = 48_000;
 
 const MINUTE: Micros = 60_000_000;
 /// How far back `recent_activity` looks.
@@ -56,7 +58,7 @@ const STAMPS: usize = 8;
 /// Conversations read with `read_conversation` since the last send. `send_message` writes only to one of them, so
 /// the model has the conversation in front of it when it writes the message.
 #[derive(Default)]
-pub struct Reads(Mutex<HashSet<GroupId>>);
+pub(super) struct Reads(Mutex<HashSet<GroupId>>);
 
 impl Reads {
   fn mark(&self, group: &GroupId) {
@@ -73,8 +75,8 @@ impl Reads {
 }
 
 /// Tool descriptors. `send_message` is included only when `allow_send` is true.
-pub fn list(allow_send: bool) -> Vec<Value> {
-  let read_only = json!({ "readOnlyHint": true, "openWorldHint": true });
+pub(super) fn list(allow_send: bool) -> Vec<Value> {
+  let read_only = read_only();
   let mut tools = vec![
     json!({
       "name": "inbox",
@@ -200,14 +202,14 @@ Read the conversation with read_conversation first: a send to a conversation not
         "required": ["conversation"],
         "additionalProperties": false
       },
-      "annotations": { "readOnlyHint": false, "destructiveHint": false, "idempotentHint": false, "openWorldHint": true },
+      "annotations": writes(false, false),
     }));
   }
   tools
 }
 
 /// Runs a tool. `None` when there is no tool of that name.
-pub async fn call(
+pub(super) async fn call(
   engine: &Arc<Engine>,
   reads: &Reads,
   allow_send: bool,
@@ -226,64 +228,7 @@ pub async fn call(
     ),
     _ => return None,
   };
-  let (text, failed) = match outcome {
-    Ok(text) => (text, false),
-    Err(text) => (text, true),
-  };
-  Some(json!({ "content": [{ "type": "text", "text": text }], "isError": failed }))
-}
-
-// ---- Arguments ----
-//
-// Models send numbers as text and flags as "true" often enough to take both.
-
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum Loose {
-  Flag(bool),
-  Number(f64),
-  Text(String),
-}
-
-fn loose_count<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<usize>, D::Error> {
-  match Option::<Loose>::deserialize(deserializer)? {
-    None => Ok(None),
-    Some(Loose::Number(number)) if number >= 0.0 => Ok(Some(number as usize)),
-    Some(Loose::Text(text)) => match text.trim().parse() {
-      Ok(number) => Ok(Some(number)),
-      Err(_) => Err(D::Error::custom(format!("\"{text}\" is not a number"))),
-    },
-    Some(_) => Err(D::Error::custom("expected a number, zero or more")),
-  }
-}
-
-fn loose_flag<'de, D: Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
-  match Option::<Loose>::deserialize(deserializer)? {
-    None => Ok(false),
-    Some(Loose::Flag(flag)) => Ok(flag),
-    Some(Loose::Text(text)) if text.eq_ignore_ascii_case("true") => Ok(true),
-    Some(Loose::Text(text)) if text.eq_ignore_ascii_case("false") => Ok(false),
-    Some(_) => Err(D::Error::custom("expected true or false")),
-  }
-}
-
-/// Optional text; a cursor that came back as a number is taken too. Blank counts as absent.
-fn loose_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {
-  match Option::<Loose>::deserialize(deserializer)? {
-    None => Ok(None),
-    Some(Loose::Text(text)) => Ok(Some(text.trim().to_string()).filter(|text| !text.is_empty())),
-    Some(Loose::Number(number)) => Ok(Some(format!("{number:.0}"))),
-    Some(Loose::Flag(_)) => Err(D::Error::custom("expected text")),
-  }
-}
-
-fn parse<T: DeserializeOwned>(arguments: Value) -> Result<T, String> {
-  let arguments = if arguments.is_null() {
-    json!({})
-  } else {
-    arguments
-  };
-  serde_json::from_value(arguments).map_err(|error| format!("Invalid arguments: {error}."))
+  Some(answer(outcome))
 }
 
 #[derive(Deserialize)]
@@ -368,43 +313,6 @@ struct SendArgs {
 
 // ---- Words for things ----
 
-fn local(time: Micros) -> DateTime<Local> {
-  DateTime::from_timestamp_micros(time).unwrap_or_default().with_timezone(&Local)
-}
-
-fn stamp(time: Micros) -> String {
-  local(time).format("%Y-%m-%d %H:%M").to_string()
-}
-
-fn now_line() -> String {
-  Local::now().format("Now: %a %Y-%m-%d %H:%M (UTC%:z).").to_string()
-}
-
-/// A point in a conversation: the number a previous answer gave, or a local date or date and time.
-fn cursor(text: &str) -> Result<Micros, String> {
-  // Anything this long is a count of microseconds, not a year.
-  if text.len() > 12
-    && let Ok(micros) = text.parse::<Micros>()
-  {
-    return Ok(micros);
-  }
-  let formats = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"];
-  let timed = formats
-    .iter()
-    .find_map(|format| NaiveDateTime::parse_from_str(text, format).ok());
-  let day = || {
-    NaiveDate::parse_from_str(text, "%Y-%m-%d")
-      .ok()
-      .map(|day| day.and_time(NaiveTime::MIN))
-  };
-  let moment = timed
-    .or_else(day)
-    .and_then(|naive| Local.from_local_datetime(&naive).earliest());
-  moment.map(|moment| moment.timestamp_micros()).ok_or_else(|| {
-    format!("\"{text}\" is not a point in time. Pass the value a previous answer gave, or a date such as 2026-11-01 or 2026-11-01T14:30.")
-  })
-}
-
 fn id_text(id: &GroupId) -> String {
   match id {
     GroupId::Dm(id) => format!("dm/{id}"),
@@ -432,16 +340,6 @@ const fn kind_text(kind: GroupKind) -> &'static str {
 /// A conversation as answers name it: `Jordan Park (direct message, dm/abc)`.
 fn label(group: &Group) -> String {
   format!("{} ({}, {})", group.name, kind_text(group.kind), id_text(&group.id))
-}
-
-/// At most `max` characters of `text` on one line.
-fn clip(text: &str, max: usize) -> String {
-  let mut line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-  if let Some((cut, _)) = line.char_indices().nth(max) {
-    line.truncate(cut);
-    line.push('…');
-  }
-  line
 }
 
 fn offline(error: anyhow::Error) -> String {
@@ -601,19 +499,6 @@ fn transcript<'a>(messages: impl IntoIterator<Item = &'a Arc<Message>>, me: &str
     out.push('\n');
   }
   out
-}
-
-/// Cuts an answer that grew too long at its start, where the oldest messages are.
-fn keep_end(text: String) -> String {
-  if text.len() <= MAX_ANSWER {
-    return text;
-  }
-  let mut start = text.len() - MAX_ANSWER;
-  while !text.is_char_boundary(start) {
-    start += 1;
-  }
-  let start = text[start..].find('\n').map_or(start, |newline| start + newline + 1);
-  format!("(the oldest messages were left out to keep this short)\n{}", &text[start..])
 }
 
 type Topic = (Micros, Vec<Arc<Message>>);
@@ -920,7 +805,7 @@ async fn recent_activity(engine: &Arc<Engine>, arguments: Value) -> Result<Strin
   let args: ActivityArgs = parse(arguments)?;
   let limit = args.limit.unwrap_or(10).clamp(1, 25);
   let me = engine.me().map_or_default(|me| me.id);
-  let now = Local::now().timestamp_micros();
+  let now = chrono::Local::now().timestamp_micros();
   let since = now - RECENT;
 
   let groups: Vec<Group> = directory(engine)
@@ -1324,9 +1209,7 @@ async fn send_message(engine: &Arc<Engine>, reads: &Reads, arguments: Value) -> 
 
 #[cfg(test)]
 mod tests {
-  use super::{
-    InboxArgs, MINUTE, ago, clip, cursor, id_text, involvement, keep_newest, keep_oldest, list, parse, parse_id,
-  };
+  use super::{InboxArgs, MINUTE, ago, id_text, involvement, keep_newest, keep_oldest, list, parse, parse_id};
   use crate::model::{Group, GroupId, GroupKind, Message, Micros, Notify, Placement, Reaction, Span, SpanKind};
   use serde_json::json;
   use std::sync::Arc;
@@ -1479,20 +1362,6 @@ mod tests {
     assert_eq!(parse_id("space_xyz"), Some(GroupId::Space("xyz".into())));
     assert_eq!(parse_id("room/abc"), None);
     assert_eq!(id_text(&GroupId::Dm("abc".into())), "dm/abc");
-  }
-
-  #[test]
-  fn clip_collapses_space_and_cuts_on_a_char() {
-    assert_eq!(clip("hello   world", 20), "hello world");
-    assert_eq!(clip("éééé", 2), "éé…");
-  }
-
-  #[test]
-  fn cursor_reads_micros_and_dates() {
-    assert_eq!(cursor("1700000000000000").unwrap(), 1_700_000_000_000_000);
-    assert!(cursor("not-a-time").is_err());
-    let day = cursor("2026-11-01").expect("date");
-    assert!(day > 0);
   }
 
   #[test]

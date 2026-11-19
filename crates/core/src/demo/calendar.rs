@@ -20,6 +20,10 @@ const HOLIDAYS: &str = "demo-holidays";
 /// Days before and after today that hold the recurring events.
 const PAST_DAYS: u64 = 60;
 const FUTURE_DAYS: u64 = 180;
+/// The event that starts soon after the demo does.
+pub const SOON: &str = "demo-design-sync";
+/// Minutes from the demo's start to `SOON`'s, which its reminder is set for.
+pub const SOON_MINUTES: u32 = 10;
 
 pub struct DemoCalendar {
   pub calendars: Vec<Calendar>,
@@ -124,6 +128,7 @@ impl DemoCalendar {
       serial: 0,
     };
     calendar.fill(date_of(now));
+    calendar.soon(now);
     calendar
   }
 
@@ -203,6 +208,22 @@ impl DemoCalendar {
     let mut away = event("demo-away", OWN, "Out of office", at(plus(12), 13, 0), at(plus(12), 18, 0));
     away.kind = EventKind::OutOfOffice;
     self.events.push(away);
+  }
+
+  /// A meeting that starts ten minutes after the demo does, for the reminder `Command::WatchEvents` delivers.
+  fn soon(&mut self, now: Micros) {
+    let start = now + i64::from(SOON_MINUTES) * 60_000_000;
+    let mut sync = event(SOON, OWN, "Design sync", start, start + 30 * 60_000_000);
+    sync.meet_url = Some("https://meet.google.com/demo-design".into());
+    sync.description = "Onboarding mock-ups, second step.".into();
+    sync.reminder = Reminder::Minutes(SOON_MINUTES);
+    let sync = self.invited(sync, "praman@example.com", &["mtanaka@example.com"], Rsvp::Accepted);
+    self.events.push(sync);
+  }
+
+  /// An event by id.
+  pub fn event(&self, id: &str) -> Option<CalendarEvent> {
+    self.events.iter().find(|event| event.id == id).cloned()
   }
 
   /// The events that repeat on `day`.

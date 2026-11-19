@@ -11,7 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Group, GroupId, Message, Micros, SearchHit, Shortcut, User};
+use crate::model::{Group, GroupId, MailThread, Message, Micros, SearchHit, Shortcut, User};
 
 /// Bytes of images and downloads kept; the ones used longest ago go first.
 const IMAGE_BUDGET: u64 = 512 * 1024 * 1024;
@@ -35,6 +35,14 @@ pub struct HistoryCache {
   /// Sort time of the oldest topic held: where the next older page starts.
   #[serde(default)]
   pub anchor: Micros,
+}
+
+/// The inbox's newest threads as last loaded, shown at once while Gmail answers.
+#[derive(Default, Serialize, Deserialize)]
+pub struct MailCache {
+  pub threads: Vec<MailThread>,
+  /// Gmail has older threads than these.
+  pub more: bool,
 }
 
 #[derive(Clone)]
@@ -128,6 +136,15 @@ impl Cache {
 
   pub fn save_shortcut(&self, shortcut: Shortcut, hits: &[SearchHit]) {
     let _ = self.write(&self.shortcut_path(shortcut), &hits);
+  }
+
+  /// The inbox as last loaded.
+  pub fn mail(&self) -> Option<MailCache> {
+    self.read(self.dir.join("mail.json"))
+  }
+
+  pub fn save_mail(&self, mail: &MailCache) {
+    let _ = self.write(&self.dir.join("mail.json"), mail);
   }
 
   /// Where a URL's bytes are kept: named by the SHA-1 of the URL, the same on every build.

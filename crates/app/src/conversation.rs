@@ -1511,7 +1511,6 @@ impl ConversationView {
     if tool == RewriteTool::Off {
       return;
     }
-    let extra = settings.rewrite_instruction.clone();
     let composer = match (&self.thread, in_thread) {
       (Some(thread), true) => thread.composer.clone(),
       _ => self.composer.clone(),
@@ -1527,47 +1526,43 @@ impl ConversationView {
     }
     self.rewrite_error = None;
     self.rewriting = Some(in_thread);
-    composer.update(cx, |state, cx| state.set_disabled(true, cx));
-    let background = cx.background_executor().clone();
-    self.rewrite_task = Some(cx.spawn_in(window, async move |this, cx| {
-      let result = background.spawn(async move { crate::rewrite::run(tool, &extra, &draft) }).await;
-      cx.update(|window, cx| {
-        this.update(cx, |this, cx| {
-          this.rewrite_task = None;
-          this.rewriting = None;
-          composer.update(cx, |state, cx| {
-            state.set_disabled(false, cx);
-            if let Ok(text) = &result {
-              state.replace_all(text.clone(), window, cx);
-              for (range, token) in completion::reattach(text, &tokens) {
-                state.replace_range_with_token(range, token, window, cx).ok();
-              }
+    let field = composer.clone();
+    self.rewrite_task = Some(crate::rewrite::spawn(
+      composer,
+      crate::rewrite::Kind::Chat,
+      window,
+      cx,
+      move |this, result, window, cx| {
+        this.rewrite_task = None;
+        this.rewriting = None;
+        if let Ok(text) = &result {
+          field.update(cx, |state, cx| {
+            for (range, token) in completion::reattach(text, &tokens) {
+              state.replace_range_with_token(range, token, window, cx).ok();
             }
-            state.focus(window, cx);
           });
-          if then_send && result.is_ok() {
-            this.send_from(in_thread, window, cx);
-          }
-          if let Err(error) = result {
-            let error = if then_send {
-              format!("{error} Not sent.")
-            } else {
-              error
-            };
-            this.rewrite_error = Some(error);
-            this._rewrite_error_clear = Some(cx.spawn(async move |this, cx| {
-              cx.background_executor().timer(Duration::from_secs(4)).await;
-              let _ = this.update(cx, |this, cx| {
-                this.rewrite_error = None;
-                cx.notify();
-              });
-            }));
-          }
-          cx.notify();
-        })
-      })
-      .ok();
-    }));
+        }
+        if then_send && result.is_ok() {
+          this.send_from(in_thread, window, cx);
+        }
+        if let Err(error) = result {
+          let error = if then_send {
+            format!("{error} Not sent.")
+          } else {
+            error
+          };
+          this.rewrite_error = Some(error);
+          this._rewrite_error_clear = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(4)).await;
+            let _ = this.update(cx, |this, cx| {
+              this.rewrite_error = None;
+              cx.notify();
+            });
+          }));
+        }
+        cx.notify();
+      },
+    ));
     cx.notify();
   }
 
@@ -1654,18 +1649,6 @@ impl ConversationView {
     let always = settings.rewrite_always;
     let bar = settings.show_format_bar;
     let busy = self.rewriting == Some(in_thread);
-    let sparkle = icon(Icon::Sparkles, 18., if busy || always { ACCENT } else { MUTED });
-    let sparkle = if busy {
-      sparkle
-        .with_animation(
-          ("rewrite-pulse", usize::from(in_thread)),
-          Animation::new(Duration::from_millis(900)).repeat(),
-          |this, delta| this.opacity(0.65f32.mul_add((delta * std::f32::consts::PI).sin().abs(), 0.35)),
-        )
-        .into_any_element()
-    } else {
-      sparkle.into_any_element()
-    };
     let row = h_flex()
       .w_full()
       .pl_2()
@@ -1716,34 +1699,14 @@ impl ConversationView {
           .child(icon(Icon::Baseline, 21., if bar { ACCENT } else { MUTED })),
       )
       .when(rewrite, |row| {
-        row.child(
-          div()
-            .id(("rewrite", usize::from(in_thread)))
-            .size(px(28.))
-            .mb(px(3.))
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_full()
-            .cursor_pointer()
-            .hover(|s| s.bg(rgb(BORDER)))
-            .when(always, |button| button.bg(rgb(ACCENT_BG)))
-            .tooltip(move |window, cx| {
-              Tooltip::new(if always {
-                "Rewrite. Always rewrite is on: right-click to turn it off"
-              } else {
-                "Rewrite. Right-click to always rewrite before sending"
-              })
-              .build(window, cx)
-            })
-            .on_click(cx.listener(move |this, _, window, cx| this.rewrite(in_thread, false, window, cx)))
-            .on_mouse_down(MouseButton::Right, |_, _, cx| {
-              cx.stop_propagation();
-              Settings::update(cx, |settings| settings.rewrite_always.toggle());
-            })
-            .child(sparkle),
-        )
+        row.child(crate::rewrite::button(
+          ("rewrite", usize::from(in_thread)),
+          ("rewrite-pulse", usize::from(in_thread)),
+          busy,
+          always,
+          cx,
+          move |this, _, window, cx| this.rewrite(in_thread, false, window, cx),
+        ))
       });
     let field = v_flex()
       .w_full()

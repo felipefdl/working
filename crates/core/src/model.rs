@@ -491,15 +491,35 @@ pub enum Connection {
   Offline,
 }
 
-/// How the MCP server for AI agents runs: on loopback at `port`, for requests that carry `token`.
+/// How the MCP servers for AI agents run.
+///
+/// One listener on loopback at `port`, for requests that carry `token`, with one server per product at its own path
+/// (`/mcp/chat`, `/mcp/mail`, `/mcp/calendar`, `/mcp/meet`). Each is on or off by itself; a path whose server is off
+/// answers as if it were not there.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+  clippy::struct_excessive_bools,
+  reason = "each flag is one switch of the MCP settings"
+)]
 pub struct McpConfig {
   /// Loopback port.
   pub port: u16,
-  /// Bearer (or path) secret.
+  /// Bearer (or path) secret, shared by every server.
   pub token: String,
-  /// Offer the tool that sends messages. Without it agents can only read.
+  /// Serve the chat tools.
+  pub chat: bool,
+  /// Offer the chat tool that sends messages. Without it agents can only read chat.
   pub allow_send: bool,
+  /// Serve the mail tools. They answer only while Mail is on.
+  pub mail: bool,
+  /// Offer the mail tools that send a new email, reply, archive, and mark read. Without it agents can only read mail.
+  pub mail_write: bool,
+  /// Serve the calendar tools.
+  pub calendar: bool,
+  /// Offer the calendar tools that create, change, delete, and answer events. Without it agents can only read.
+  pub calendar_write: bool,
+  /// Serve the Meet tools.
+  pub meet: bool,
 }
 
 /// How another person shows right now.
@@ -869,6 +889,148 @@ pub struct EventDraft {
   pub notify: bool,
 }
 
+/// Someone an email is from or to.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MailAddress {
+  /// Display name, empty when the email carries none.
+  pub name: String,
+  /// Email address.
+  pub email: String,
+}
+
+/// Which threads a mail list holds.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Mailbox {
+  /// Threads in the inbox.
+  Inbox,
+  /// Starred threads.
+  Starred,
+  /// Threads with a message the user sent.
+  Sent,
+  /// Every thread but spam and trash.
+  All,
+  /// Threads that carry one of the user's labels, by `MailLabel::id`.
+  Label(String),
+  /// Threads that match a Gmail search, written as in Gmail's search box.
+  Search(String),
+}
+
+/// One of the user's own Gmail labels. Gmail's built-in ones (inbox, sent, categories) are not labels here.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MailLabel {
+  /// What `Mailbox::Label` takes.
+  pub id: String,
+  /// Its full name; a nested label's is its parents' names and its own joined by `/`.
+  pub name: String,
+  /// Its color as `0xRRGGBB`, when the user gave it one.
+  pub color: Option<u32>,
+  /// How many of its threads are unread.
+  pub unread: u32,
+}
+
+/// One email thread in a list, as Gmail summarizes it.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MailThread {
+  /// Gmail's thread id.
+  pub id: String,
+  /// Subject, `(no subject)` when it has none.
+  pub subject: String,
+  /// Start of the newest message, on one line.
+  pub snippet: String,
+  /// Who wrote its messages, oldest first, each person once.
+  pub senders: Vec<MailAddress>,
+  /// When the newest message arrived.
+  pub time: Micros,
+  /// How many messages it has.
+  pub messages: u32,
+  /// It has a message not read yet.
+  pub unread: bool,
+  /// It is starred.
+  pub starred: bool,
+  /// One of its messages carries a file.
+  pub attachments: bool,
+}
+
+/// A file attached to an email.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MailAttachment {
+  /// File name.
+  pub name: String,
+  /// MIME type.
+  pub mime: String,
+  /// Size in bytes.
+  pub size: u64,
+  /// Where `Core::fetch` reads it.
+  pub url: String,
+}
+
+/// One email of a thread.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MailMessage {
+  /// Gmail's message id.
+  pub id: String,
+  /// Who wrote it.
+  pub from: MailAddress,
+  /// Who it is addressed to.
+  pub to: Vec<MailAddress>,
+  /// Who got a copy.
+  pub cc: Vec<MailAddress>,
+  /// Where an answer goes instead of `from`, when the email names somewhere else.
+  pub reply_to: Vec<MailAddress>,
+  /// When it arrived.
+  pub time: Micros,
+  /// Its body as HTML, as Gmail serves it to its own page: scripts removed, images through Google's proxy.
+  pub html: String,
+  /// Its body as plain text, for search results, notifications, and agents.
+  pub text: String,
+  /// It is not read yet.
+  pub unread: bool,
+  /// Its files.
+  pub attachments: Vec<MailAttachment>,
+}
+
+/// An answer to an email, as plain text. `gchat_core::reply_recipients` fills `to` and `cc` the way Gmail's Reply and
+/// Reply all do.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MailReply {
+  /// Thread it goes into.
+  pub thread: String,
+  /// The email it answers, quoted under the text.
+  pub message: String,
+  /// Who it is addressed to.
+  pub to: Vec<MailAddress>,
+  /// Who gets a copy.
+  pub cc: Vec<MailAddress>,
+  /// What the user wrote; a blank line starts a paragraph.
+  pub text: String,
+  /// Add the signature Gmail sets for answers (`Event::MailSignatures`), where Gmail puts it.
+  pub signature: bool,
+}
+
+/// A new email, as plain text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MailCompose {
+  /// Who it is addressed to. At least one of `to` and `cc` has someone.
+  pub to: Vec<MailAddress>,
+  /// Who gets a copy.
+  pub cc: Vec<MailAddress>,
+  /// Subject; may be empty.
+  pub subject: String,
+  /// What the user wrote; a blank line starts a paragraph.
+  pub text: String,
+  /// Add the signature Gmail sets for new emails (`Event::MailSignatures`).
+  pub signature: bool,
+}
+
+/// A signature the user set in Gmail's settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MailSignature {
+  /// As HTML, the way Gmail adds it to an email.
+  pub html: String,
+  /// As plain text, to show under what the user writes.
+  pub text: String,
+}
+
 /// Everything the core tells the UI. Lists are complete replacements unless stated otherwise.
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -1006,6 +1168,50 @@ pub enum Event {
   CalendarFailed(String),
   /// A command or stream step failed. The string is already safe to show.
   Error(String),
+  /// The threads held for a mailbox, newest first: answer to `Command::LoadMail`, and again when the inbox changes.
+  /// Replaces what came before for that mailbox.
+  MailThreads {
+    /// Mailbox these threads belong to.
+    mailbox: Mailbox,
+    /// Newest first.
+    threads: Arc<Vec<MailThread>>,
+    /// Gmail has older threads than these.
+    more: bool,
+  },
+  /// A thread's emails, oldest first: answer to `Command::OpenMail`.
+  MailMessages {
+    /// Thread these emails belong to.
+    thread: String,
+    /// Oldest first.
+    messages: Arc<Vec<MailMessage>>,
+  },
+  /// How many inbox threads are unread. Sent with the first inbox and whenever the count changes.
+  MailUnread(u32),
+  /// An unread thread reached the inbox after the first load, for a notification.
+  MailIncoming(MailThread),
+  /// Gmail could not be read. Safe to show.
+  MailFailed(String),
+  /// The user's labels, by name: sent with the first inbox and whenever a label or its unread count changes.
+  /// Replaces what came before.
+  MailLabels(Arc<Vec<MailLabel>>),
+  /// An event's notification time came, while `Command::WatchEvents` is on.
+  EventReminder {
+    /// The event.
+    event: CalendarEvent,
+    /// Minutes until it starts; 0 when it starts now.
+    minutes: u32,
+  },
+  /// A mail write (read mark, archive, reply, or new email) finished: `Ok` once Gmail has it, or why it failed,
+  /// already safe to show. The lists and the thread it changes are sent again at once, before Gmail answers, and once
+  /// more as they were when it fails.
+  MailWritten(Result<(), String>),
+  /// The signatures Gmail adds for the signed-in address: sent with the first inbox, and again when they change.
+  MailSignatures {
+    /// For new emails, when Gmail's settings pick one.
+    new: Option<MailSignature>,
+    /// For answers, when Gmail's settings pick one.
+    reply: Option<MailSignature>,
+  },
 }
 
 /// Everything the UI asks the core to do.
@@ -1239,6 +1445,41 @@ pub enum Command {
     /// The answer.
     rsvp: Rsvp,
   },
+  /// Fetch a mailbox's threads: its newest page, or with `more` the page after the threads held. Answers
+  /// `Event::MailThreads`. The first one for the inbox also starts watching it for new mail; until then nothing
+  /// asks Gmail for anything.
+  LoadMail {
+    /// Which threads.
+    mailbox: Mailbox,
+    /// Add the next older page to what is held.
+    more: bool,
+  },
+  /// Fetch a thread's emails. Answers `Event::MailMessages`. Leaves the thread unread.
+  OpenMail(String),
+  /// Stop watching the inbox and forget the mail held: nothing asks Gmail again until the next `LoadMail`.
+  StopMail,
+  /// Marks every email of a thread read, or the thread unread. Answers `Event::MailWritten`.
+  MarkMail {
+    /// The thread.
+    thread: String,
+    /// Read, or unread.
+    read: bool,
+  },
+  /// Takes a thread out of the inbox, or puts it back. Answers `Event::MailWritten`.
+  ArchiveMail {
+    /// The thread.
+    thread: String,
+    /// Out of the inbox, or back into it.
+    archive: bool,
+  },
+  /// Sends an answer into a thread, from the signed-in address. Answers `Event::MailWritten`, and
+  /// `Event::MailMessages` with the thread once it is sent.
+  ReplyMail(Box<MailReply>),
+  /// Sends a new email from the signed-in address. Answers `Event::MailWritten`; the lists it shows in follow.
+  ComposeMail(Box<MailCompose>),
+  /// Start or stop watching the calendars for events about to start. While on, each event the user has not declined
+  /// answers `Event::EventReminder` once, at the time its notification is set for.
+  WatchEvents(bool),
 }
 
 #[cfg(test)]

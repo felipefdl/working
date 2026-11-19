@@ -341,6 +341,7 @@ pub enum Place {
   Starred,
   Calendar,
   Meet,
+  Mail,
   Conversation(GroupId),
 }
 
@@ -350,6 +351,52 @@ impl From<Shortcut> for Place {
       Shortcut::Mentions => Self::Mentions,
       Shortcut::Starred => Self::Starred,
     }
+  }
+}
+
+/// Which of Calendar, Meet, and Mail are on (`Settings::features`). A feature that is off is gone everywhere: no
+/// button, key, menu entry, view, notification, MCP server, or core traffic of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Features {
+  pub calendar: bool,
+  pub meet: bool,
+  pub mail: bool,
+}
+
+impl Default for Features {
+  fn default() -> Self {
+    Self { calendar: true, meet: true, mail: true }
+  }
+}
+
+impl Features {
+  /// Whether `place` can be opened: a view of a feature that is off cannot, wherever it is asked from.
+  pub const fn opens(self, place: &Place) -> bool {
+    match place {
+      Place::Calendar => self.calendar,
+      Place::Meet => self.meet,
+      Place::Mail => self.mail,
+      Place::Home | Place::Mentions | Place::Starred | Place::Conversation(_) => true,
+    }
+  }
+}
+
+/// Which MCP servers and write tools run, from their switches and the features (`Settings::mcp_servers`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct McpServers {
+  pub chat: bool,
+  pub allow_send: bool,
+  pub mail: bool,
+  pub mail_write: bool,
+  pub calendar: bool,
+  pub calendar_write: bool,
+  pub meet: bool,
+}
+
+impl McpServers {
+  /// Whether any server runs.
+  pub const fn any(self) -> bool {
+    self.chat || self.mail || self.calendar || self.meet
   }
 }
 
@@ -374,12 +421,23 @@ pub struct Settings {
   pub show_mentions: bool,
   /// The Starred button of every layout. Off removes only the button: the view still opens from anywhere else.
   pub show_starred: bool,
-  /// The Calendar button of every layout. Off removes only the button: its key (`hotkeys`) and the Go menu still open
-  /// the view.
-  pub show_calendar: bool,
-  /// The Meet button of every layout. Off removes only the button: its key (`hotkeys`) and the Go menu still open the
-  /// view.
-  pub show_meet: bool,
+  /// Google Calendar, a feature (`Features`). Off removes it everywhere: its view and buttons, its key and Go menu
+  /// entry, its event reminders, and its MCP server.
+  pub calendar: bool,
+  /// Google Meet, a feature (`Features`). Off removes its view and buttons, its key and Go menu entry, the call window
+  /// (meetings open in the browser), and its MCP server.
+  pub meet: bool,
+  /// Gmail, a feature (`Features`). Off, Working does not read Gmail at all: no view, buttons, key, or Go menu entry,
+  /// no new-mail notifications, no mail in the Dock number, and no MCP server.
+  pub mail: bool,
+  /// A notification for each unread email that reaches the inbox, while `mail` is on.
+  pub mail_notify: bool,
+  /// Every email shown whole is drawn on the other background (`mail_page::Colors::other`: a light page under a dark
+  /// theme, a dark one under a light theme), for emails whose own colors do not read on the theme's. The contrast
+  /// button on an email card switches it.
+  pub mail_other_background: bool,
+  /// A notification when an event's own reminder time comes, while `calendar` is on (`Command::WatchEvents`).
+  pub event_reminders: bool,
   /// What each number key opens, by its number (1 to 9). A right-click on a view's button or a conversation assigns
   /// one.
   pub hotkeys: BTreeMap<u8, Place>,
@@ -404,11 +462,22 @@ pub struct Settings {
   pub hours_start: u16,
   pub hours_end: u16,
   pub sound: Sound,
-  /// Serve the MCP tools to AI agents on this computer.
-  pub mcp: bool,
+  /// Serve the chat tools to AI agents on this computer, at `/mcp/chat`.
+  pub mcp_chat: bool,
+  /// The port every MCP server listens on.
   pub mcp_port: u16,
-  /// Agents may send messages, not only read.
+  /// Agents may send chat messages, not only read.
   pub mcp_send: bool,
+  /// Serve the mail tools, at `/mcp/mail`. They are served only while `mail` is on.
+  pub mcp_mail: bool,
+  /// Agents may send new emails and replies, archive, and mark read, not only read. Only while `mcp_mail` is on.
+  pub mcp_mail_write: bool,
+  /// Serve the calendar tools, at `/mcp/calendar`, while `calendar` is on.
+  pub mcp_calendar: bool,
+  /// Agents may create, change, delete, and answer events, not only read.
+  pub mcp_calendar_write: bool,
+  /// Serve the Meet tools, at `/mcp/meet`, while `meet` is on.
+  pub mcp_meet: bool,
   /// The status button's "Set as away". Stays until Automatic is chosen, whatever the activity status says.
   #[serde(default)]
   pub away: bool,
@@ -451,9 +520,13 @@ impl Default for Settings {
       sidebar_side: SidebarSide::default(),
       show_mentions: true,
       show_starred: true,
-      show_calendar: true,
-      show_meet: true,
-      hotkeys: BTreeMap::from([(1, Place::Home), (2, Place::Calendar), (3, Place::Meet)]),
+      calendar: true,
+      meet: true,
+      mail: true,
+      mail_notify: true,
+      mail_other_background: false,
+      event_reminders: true,
+      hotkeys: BTreeMap::from([(1, Place::Home), (2, Place::Calendar), (3, Place::Meet), (4, Place::Mail)]),
       column_widths: BTreeMap::new(),
       list_sort: Sort::default(),
       list_window: ListWindow::default(),
@@ -466,9 +539,14 @@ impl Default for Settings {
       hours_start: 9 * 60,
       hours_end: 18 * 60,
       sound: Sound::default(),
-      mcp: false,
+      mcp_chat: false,
       mcp_port: MCP_PORT,
       mcp_send: false,
+      mcp_mail: false,
+      mcp_mail_write: false,
+      mcp_calendar: false,
+      mcp_calendar_write: false,
+      mcp_meet: false,
       away: false,
       rewrite: RewriteTool::Off,
       rewrite_instruction: DEFAULT_REWRITE_INSTRUCTION.into(),
@@ -600,16 +678,53 @@ impl Settings {
       .clamp(COLUMN_MIN_WIDTH, COLUMN_MAX_WIDTH)
   }
 
-  /// How the MCP server should run: `None` while it is off.
+  /// Whether any MCP server switch is on.
+  pub const fn any_mcp(&self) -> bool {
+    self.mcp_chat || self.mcp_mail || self.mcp_calendar || self.mcp_meet
+  }
+
+  /// Which of Calendar, Meet, and Mail are on.
+  pub const fn features(&self) -> Features {
+    Features {
+      calendar: self.calendar,
+      meet: self.meet,
+      mail: self.mail,
+    }
+  }
+
+  /// Which servers and write tools run: a server whose feature is off does not, whatever its switch says, and a
+  /// write flag holds only while its server runs.
+  pub const fn mcp_servers(&self) -> McpServers {
+    let mail = self.mail && self.mcp_mail;
+    let calendar = self.calendar && self.mcp_calendar;
+    McpServers {
+      chat: self.mcp_chat,
+      allow_send: self.mcp_chat && self.mcp_send,
+      mail,
+      mail_write: mail && self.mcp_mail_write,
+      calendar,
+      calendar_write: calendar && self.mcp_calendar_write,
+      meet: self.meet && self.mcp_meet,
+    }
+  }
+
+  /// How the MCP servers should run: `None` while none is served.
   fn mcp_config(&self) -> Option<McpConfig> {
-    if !self.mcp {
+    let servers = self.mcp_servers();
+    if !servers.any() {
       return None;
     }
     match gchat_core::mcp::token() {
       Ok(token) => Some(McpConfig {
         port: self.mcp_port,
         token,
-        allow_send: self.mcp_send,
+        chat: servers.chat,
+        allow_send: servers.allow_send,
+        mail: servers.mail,
+        mail_write: servers.mail_write,
+        calendar: servers.calendar,
+        calendar_write: servers.calendar_write,
+        meet: servers.meet,
       }),
       Err(error) => {
         tracing::warn!("could not store the MCP token: {error}");
@@ -707,7 +822,8 @@ pub fn keep_mcp(core: Core, cx: &mut App) {
   let mut follow = move |cx: &mut App| {
     let settings = cx.global::<Settings>();
     let rotations = cx.try_global::<TokenRotations>().map_or(0, |rotations| rotations.0);
-    let ask = (settings.mcp, settings.mcp_port, settings.mcp_send, rotations);
+    // The servers as they would run: a feature or a switch going on or off restarts them.
+    let ask = (settings.mcp_servers(), settings.mcp_port, rotations);
     if asked == Some(ask) {
       return;
     }
@@ -786,7 +902,7 @@ pub fn show_theme(index: usize, cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-  use super::{Appearance, Place, Settings, Sound, installed_family};
+  use super::{Appearance, Features, Place, Settings, Sound, installed_family};
   use crate::theme::find;
 
   #[test]
@@ -822,10 +938,13 @@ mod tests {
     let settings = Settings::default();
     assert!(settings.meet_builtin);
     assert!(settings.meet_auto_open);
-    assert!(settings.show_calendar);
+    assert!(settings.calendar);
     assert!(settings.show_mentions);
     assert!(settings.show_starred);
-    assert!(settings.show_meet);
+    assert!(settings.meet);
+    assert!(settings.mail);
+    assert!(settings.mail_notify);
+    assert!(settings.event_reminders);
   }
 
   #[test]
@@ -833,10 +952,13 @@ mod tests {
     let settings: Settings = serde_json::from_str("{}").expect("empty object uses Default");
     assert!(settings.meet_builtin);
     assert!(settings.meet_auto_open);
-    assert!(settings.show_calendar);
+    assert!(settings.calendar);
     assert!(settings.show_mentions);
     assert!(settings.show_starred);
-    assert!(settings.show_meet);
+    assert!(settings.meet);
+    assert!(settings.mail);
+    assert!(settings.mail_notify);
+    assert!(settings.event_reminders);
   }
 
   #[test]
@@ -853,20 +975,60 @@ mod tests {
   }
 
   #[test]
-  fn view_buttons_off_roundtrip() {
+  fn mail_other_background_is_off_until_switched() {
+    assert!(!Settings::default().mail_other_background);
+    let settings: Settings = serde_json::from_str("{}").expect("empty object uses Default");
+    assert!(!settings.mail_other_background);
+  }
+
+  #[test]
+  fn mail_other_background_roundtrip() {
     let settings = Settings {
-      show_mentions: false,
-      show_starred: false,
-      show_calendar: false,
-      show_meet: false,
+      mail_other_background: true,
       ..Settings::default()
     };
     let text = serde_json::to_string(&settings).expect("serialize");
     let loaded: Settings = serde_json::from_str(&text).expect("deserialize");
-    assert!(!loaded.show_calendar);
+    assert!(loaded.mail_other_background);
+  }
+
+  #[test]
+  fn view_buttons_and_features_off_roundtrip() {
+    let settings = Settings {
+      show_mentions: false,
+      show_starred: false,
+      calendar: false,
+      meet: false,
+      mail: false,
+      ..Settings::default()
+    };
+    let text = serde_json::to_string(&settings).expect("serialize");
+    let loaded: Settings = serde_json::from_str(&text).expect("deserialize");
+    assert!(!loaded.calendar);
     assert!(!loaded.show_mentions);
     assert!(!loaded.show_starred);
-    assert!(!loaded.show_meet);
+    assert!(!loaded.meet);
+    assert!(!loaded.mail);
+    assert_eq!(
+      loaded.features(),
+      Features {
+        calendar: false,
+        meet: false,
+        mail: false
+      }
+    );
+  }
+
+  #[test]
+  fn a_feature_that_is_off_opens_nowhere() {
+    let features = Features { calendar: false, meet: true, mail: false };
+    assert!(features.opens(&Place::Home));
+    assert!(features.opens(&Place::Mentions));
+    assert!(!features.opens(&Place::Calendar));
+    assert!(features.opens(&Place::Meet));
+    assert!(!features.opens(&Place::Mail));
+    assert!(features.opens(&Place::Conversation(gchat_core::GroupId::Dm("jpark".into()))));
+    assert!(Features::default().opens(&Place::Mail));
   }
 
   #[test]
@@ -935,11 +1097,12 @@ mod tests {
   }
 
   #[test]
-  fn number_keys_default_to_home_calendar_and_meet() {
+  fn number_keys_default_to_home_calendar_meet_and_mail() {
     let settings: Settings = serde_json::from_str("{}").unwrap();
     assert_eq!(settings.hotkey_of(&Place::Home), Some(1));
     assert_eq!(settings.hotkey_of(&Place::Calendar), Some(2));
     assert_eq!(settings.hotkey_of(&Place::Meet), Some(3));
+    assert_eq!(settings.hotkey_of(&Place::Mail), Some(4));
     assert_eq!(settings.hotkey_of(&Place::Mentions), None);
   }
 
@@ -958,5 +1121,87 @@ mod tests {
     assert_eq!(back.hotkeys, settings.hotkeys);
     settings.assign_hotkey(None, chat.clone());
     assert_eq!(settings.hotkey_of(&chat), None);
+  }
+}
+
+#[cfg(test)]
+mod mcp_tests {
+  use super::Settings;
+
+  #[test]
+  fn every_mcp_server_starts_off() {
+    let settings: Settings = serde_json::from_str("{}").expect("empty object uses Default");
+    assert!(!settings.mcp_chat && !settings.mcp_send);
+    assert!(!settings.mcp_mail && !settings.mcp_mail_write);
+    assert!(!settings.mcp_calendar && !settings.mcp_calendar_write);
+    assert!(!settings.mcp_meet);
+    assert!(!settings.any_mcp());
+    assert_eq!(settings.mcp_port, super::MCP_PORT);
+  }
+
+  #[test]
+  fn each_mcp_server_keeps_its_own_switch() {
+    let settings = Settings {
+      mcp_mail: true,
+      mcp_calendar: true,
+      mcp_calendar_write: true,
+      ..Settings::default()
+    };
+    let text = serde_json::to_string(&settings).expect("serialize");
+    let loaded: Settings = serde_json::from_str(&text).expect("deserialize");
+    assert!(loaded.mcp_mail && loaded.mcp_calendar && loaded.mcp_calendar_write);
+    assert!(!loaded.mcp_chat && !loaded.mcp_send && !loaded.mcp_meet);
+    assert!(loaded.any_mcp());
+  }
+
+  #[test]
+  fn mail_writes_need_the_mail_server() {
+    let settings: Settings = serde_json::from_str(r#"{"mcp_mail_write":true}"#).expect("deserialize");
+    assert!(settings.mcp_mail_write);
+    assert!(!settings.mcp_servers().mail_write);
+    let settings = Settings {
+      mcp_mail: true,
+      mcp_mail_write: true,
+      ..Settings::default()
+    };
+    let text = serde_json::to_string(&settings).expect("serialize");
+    let loaded: Settings = serde_json::from_str(&text).expect("deserialize");
+    assert!(loaded.mcp_mail_write && loaded.mcp_servers().mail_write);
+    assert!(!loaded.mcp_send && !loaded.mcp_calendar_write);
+  }
+
+  #[test]
+  fn a_feature_that_is_off_serves_no_mcp_server() {
+    let all = Settings {
+      mcp_chat: true,
+      mcp_send: true,
+      mcp_mail: true,
+      mcp_mail_write: true,
+      mcp_calendar: true,
+      mcp_calendar_write: true,
+      mcp_meet: true,
+      ..Settings::default()
+    };
+    let servers = all.mcp_servers();
+    assert!(servers.mail && servers.mail_write && servers.calendar && servers.calendar_write && servers.meet);
+    let off = Settings {
+      mail: false,
+      calendar: false,
+      meet: false,
+      ..all.clone()
+    };
+    let servers = off.mcp_servers();
+    assert!(!servers.mail && !servers.mail_write);
+    assert!(!servers.calendar && !servers.calendar_write);
+    assert!(!servers.meet);
+    assert!(servers.chat && servers.allow_send && servers.any());
+    let only_mail = Settings {
+      mail: false,
+      mcp_chat: false,
+      mcp_calendar: false,
+      mcp_meet: false,
+      ..all
+    };
+    assert!(!only_mail.mcp_servers().any());
   }
 }

@@ -11,6 +11,7 @@ mod demo;
 mod engine;
 pub mod fuzzy;
 mod http;
+mod mail;
 mod markup;
 pub mod mcp;
 pub mod model;
@@ -25,6 +26,7 @@ use std::time::Duration;
 pub use calendar::{EVENT_COLORS, boundary_date, local_midnight};
 pub use engine::device_time_zone;
 pub use http::SessionCookie;
+pub use mail::reply_recipients;
 pub use model::*;
 pub use paths::{cache_dir, config_dir};
 #[cfg(target_os = "windows")]
@@ -143,8 +145,9 @@ impl Core {
     &self.events
   }
 
-  /// Downloads `url` with the session (avatars, attachment thumbnails). Results are cached on disk, so a repeat
-  /// call, also after a restart, answers without the network.
+  /// Downloads `url` with the session (avatars, attachment thumbnails). A `mail.google.com` URL (an email's
+  /// attachment or image) goes through Gmail's own session. Results are cached on disk, so a repeat call, also after
+  /// a restart, answers without the network; an email attachment that is not an image is never written to disk.
   pub async fn fetch(&self, url: String) -> anyhow::Result<Arc<Vec<u8>>> {
     self.fetcher.fetch(url).await
   }

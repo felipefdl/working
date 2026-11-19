@@ -1,18 +1,20 @@
 //! The one entity holding everything the core tells us, plus the precomputed lists the views render.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 use gchat_core::fuzzy::Fuzzy;
 use gchat_core::{
-  AttachmentKind, Calendar, CalendarEvent, Command, Connection, Core, Event, Group, GroupId, GroupKind, Message,
-  Micros, Notify, Placement, ReadReceipt, SearchHit, Shortcut, Snippet, SpanKind, User,
+  AttachmentKind, Calendar, CalendarEvent, Command, Connection, Core, Event, Group, GroupId, GroupKind, MailCompose,
+  MailLabel, MailMessage, MailReply, MailSignature, MailThread, Mailbox, Message, Micros, Notify, Placement,
+  ReadReceipt, SearchHit, Shortcut, Snippet, SpanKind, User,
 };
 use gpui_kit::*;
 
 use crate::conversation::ConversationView;
 use crate::images::Images;
-use crate::settings::{Layout, ListWindow, Settings, Sort};
+use crate::mail_lists::{MailLists, mailbox_kind};
+use crate::settings::{Features, Layout, ListWindow, Settings, Sort};
 
 /// Sidebar sections, laid out as the Google Chat web app does.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -125,6 +127,8 @@ pub enum SidebarItem {
   Calendar,
   /// Google Meet, under Calendar.
   Meet,
+  /// Gmail, under Meet.
+  Mail,
   Header(Section),
   Conv(Arc<Conv>),
   Toggle(Section),
@@ -195,6 +199,15 @@ pub struct Tab {
 /// Steps Back can go, at most.
 const HISTORY_LIMIT: usize = 50;
 
+/// How a mail notification's key starts: `mail/<thread id>`. A click on it opens Mail on that thread (`open_key`).
+const MAIL_KEY: &str = "mail/";
+
+/// How an event reminder's key starts: `event/<calendar id>/<event id>`. A click opens Calendar on it (`open_key`).
+const EVENT_KEY: &str = "event/";
+
+/// How many reminders' events a click can still find.
+const REMINDED_LIMIT: usize = 20;
+
 #[derive(Clone, PartialEq, Eq)]
 pub enum View {
   Home,
@@ -204,6 +217,8 @@ pub enum View {
   Calendar,
   /// Google Meet.
   Meet,
+  /// Gmail.
+  Mail,
   Conversation(GroupId),
 }
 
@@ -223,6 +238,10 @@ pub struct CalendarData {
   pub writing: bool,
   /// How the last write went, until the view takes it.
   written: Option<Result<(), String>>,
+  /// An event whose reminder was clicked, until the view shows its card (`take_reveal`).
+  reveal: Option<CalendarEvent>,
+  /// The events of the reminders posted, by notification key, newest last: what a click on one shows.
+  reminded: Vec<(String, CalendarEvent)>,
 }
 
 /// What a meeting being made is for.
@@ -294,6 +313,60 @@ pub struct MeetData {
   pub error: Option<String>,
   /// The link of a meeting made for later, until the view takes it.
   made: Option<String>,
+}
+
+/// A write sent to Gmail, by what its answer is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MailWrite {
+  /// A thread marked read or unread, archived or put back: a failure shows where Mail shows failures.
+  Change,
+  /// A reply: its box hears how it went.
+  Reply,
+  /// A new email: its form hears how it went.
+  Compose,
+}
+
+/// Which send `MailWritten` answered, so the reply box and the new-email form each take their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MailSent {
+  /// The reply box.
+  Reply,
+  /// The new-email form.
+  Compose,
+}
+
+/// Gmail as the core last answered it, for the Mail view and the Mail buttons, with the writes on their way.
+#[derive(Default)]
+pub struct MailData {
+  /// The threads of each mailbox asked for (`mail_lists.rs`).
+  pub lists: MailLists,
+  /// The thread open, by Gmail's thread id.
+  pub open: Option<String>,
+  /// The emails of `open`, oldest first, once the core answers. Those of another thread are never kept here.
+  pub messages: Option<Arc<Vec<MailMessage>>>,
+  /// The emails of `open` are on their way.
+  pub opening: bool,
+  /// Unread inbox threads, as the core last counted them.
+  pub unread: u32,
+  /// Why Gmail could not be read, until a read works.
+  pub error: Option<String>,
+  /// A reply or a new email is on its way, until the core answers `MailWritten`.
+  pub sending: bool,
+  /// Why the last send did not go, until the next try: the reply box or the new-email form shows it.
+  pub send_error: Option<String>,
+  /// Which send went, until the view takes it (`take_sent`).
+  sent: Option<MailSent>,
+  /// The writes sent and not answered yet, oldest first. The core runs them one at a time in order and answers each
+  /// with one `MailWritten`, so an answer is for the first of them.
+  writes: VecDeque<MailWrite>,
+  /// The user's labels, by name, as the core last listed them.
+  pub labels: Arc<Vec<MailLabel>>,
+  /// The signature Gmail adds to new emails, when it sets one.
+  pub signature_new: Option<MailSignature>,
+  /// The signature Gmail adds to answers, when it sets one.
+  pub signature_reply: Option<MailSignature>,
+  /// The inbox was asked for: the core watches it from then on, and it is not asked for again at startup.
+  watching: bool,
 }
 
 #[derive(Clone)]
@@ -457,7 +530,7 @@ pub struct Store {
   pub shortcut: Option<ShortcutList>,
   pub unread_only: bool,
   /// Copies of `Settings::list_sort`, `Settings::section_sort`, and the `show_*` switches of the Mentions, Starred,
-  /// Calendar, and Meet buttons, taken by `sync_settings`.
+  /// Calendar, Meet, and Mail buttons, taken by `sync_settings`.
   pub list_sort: Sort,
   /// A copy of `Settings::layout`, taken by `sync_settings` too: it says which of `sidebar`, `home`, and `list` are on
   /// screen, so only those are built, and IRC's list keeps each kind of conversation together (`Kind::buffer_rank`).
@@ -467,8 +540,13 @@ pub struct Store {
   section_sort: std::collections::BTreeMap<String, Sort>,
   show_mentions: bool,
   show_starred: bool,
-  show_calendar: bool,
-  show_meet: bool,
+  /// A copy of `Settings::features`: a feature that is off has no view, button, notification, or core traffic. Mail
+  /// off also means Gmail is not read at all.
+  features: Features,
+  /// A copy of `Settings::event_reminders`, taken by `sync_settings`.
+  event_reminders: bool,
+  /// `Command::WatchEvents(true)` was sent last.
+  watching_events: bool,
   collapsed: HashSet<Section>,
   show_all: HashSet<Section>,
   histories: HashMap<GroupId, History>,
@@ -477,7 +555,7 @@ pub struct Store {
   receipts: Option<OpenReceipts>,
   /// Recently opened conversations, newest first.
   pub recent: Vec<GroupId>,
-  /// Unread conversations shown on the Dock icon.
+  /// What the Dock icon shows: unread conversations, and unread inbox threads while Mail is on.
   badge: usize,
   /// `notified` changed since `badge` was counted.
   badge_dirty: bool,
@@ -487,6 +565,7 @@ pub struct Store {
   pub people: Directory,
   pub calendar: CalendarData,
   pub meet: MeetData,
+  pub mail: MailData,
 }
 
 impl Store {
@@ -511,6 +590,7 @@ impl Store {
         SidebarItem::Shortcut(Shortcut::Starred),
         SidebarItem::Calendar,
         SidebarItem::Meet,
+        SidebarItem::Mail,
       ],
       view: View::Home,
       back: Vec::new(),
@@ -527,8 +607,9 @@ impl Store {
       section_sort: std::collections::BTreeMap::new(),
       show_mentions: true,
       show_starred: true,
-      show_calendar: true,
-      show_meet: true,
+      features: Features::default(),
+      event_reminders: true,
+      watching_events: false,
       // The web app keeps Meetings folded at the bottom.
       collapsed: HashSet::from([Section::Meetings]),
       show_all: HashSet::new(),
@@ -541,6 +622,7 @@ impl Store {
       people: Directory::default(),
       calendar: CalendarData::default(),
       meet: MeetData::default(),
+      mail: MailData::default(),
     }
   }
 
@@ -591,6 +673,9 @@ impl Store {
             self.core.send(Command::LoadDnd);
           }
           self.connection = connection;
+          // The session is good: Gmail is read from now on, while the Mail button is on.
+          self.start_mail();
+          self.sync_event_watch();
           changed = true;
         },
         Event::World(list) => {
@@ -730,6 +815,11 @@ impl Store {
           // What was asked for before is not answered now.
           self.meet.creating = None;
           self.meet.calling = None;
+          // The account's mail goes with it. The next sign-in reads Gmail again from the start.
+          self.mail = MailData::default();
+          self.badge_dirty = true;
+          // The next session watches the calendars again once it is up (`sync_event_watch`).
+          self.watching_events = false;
           changed = true;
         },
         // The call button posts the link. Auto-open then joins it (built-in window or browser).
@@ -828,6 +918,109 @@ impl Store {
             changed = true;
           }
         },
+        // Answers already on their way when the Mail switch went off: Gmail is not read while it is off.
+        Event::MailThreads { .. }
+        | Event::MailMessages { .. }
+        | Event::MailUnread(_)
+        | Event::MailWritten(_)
+        | Event::MailIncoming(_)
+        | Event::MailFailed(_)
+        | Event::MailLabels(_)
+        | Event::MailSignatures { .. }
+          if !self.features.mail => {},
+        Event::MailThreads { mailbox, threads, more } => {
+          tracing::debug!(mailbox = mailbox_kind(&mailbox), threads = threads.len(), more, "mail: threads");
+          self.mail.lists.answered(mailbox, threads, more);
+          changed = true;
+        },
+        Event::MailMessages { thread, messages } => {
+          let open = self.mail.open.as_ref() == Some(&thread);
+          tracing::debug!(emails = messages.len(), open, "mail: thread");
+          // Only the thread open: an answer for one left meanwhile is dropped.
+          if open {
+            // Shown to the user, with the window in front: read, as a conversation opened is. The core sends the
+            // thread again read, so this goes once.
+            let unread = messages.iter().any(|message| message.unread);
+            if unread && self.view == View::Mail && window.is_window_active() {
+              self.core.send(Command::MarkMail { thread, read: true });
+              self.mail.writes.push_back(MailWrite::Change);
+            }
+            self.mail.messages = Some(messages);
+            self.mail.opening = false;
+            self.mail.error = None;
+            changed = true;
+          }
+        },
+        Event::MailUnread(count) => {
+          tracing::debug!(count, "mail: unread");
+          if self.mail.unread != count {
+            self.mail.unread = count;
+            // The Dock number counts unread mail too.
+            self.badge_dirty = true;
+            changed = true;
+          }
+        },
+        Event::MailIncoming(thread) => {
+          tracing::debug!("mail: incoming");
+          self.notify_mail(&thread, window, cx);
+          changed |= self.mail.lists.incoming(thread);
+        },
+        Event::MailFailed(message) => {
+          tracing::warn!("mail: {message}");
+          // The lists on their way say why in their place, with a Retry; a thread that did not open, in its pane.
+          let lists = self.mail.lists.failed(&message);
+          if self.mail.opening || !lists {
+            self.mail.error = Some(message);
+          }
+          self.mail.opening = false;
+          changed = true;
+        },
+        Event::MailWritten(result) => {
+          let kind = self.mail.writes.pop_front();
+          let send = matches!(kind, Some(MailWrite::Reply | MailWrite::Compose));
+          tracing::debug!(
+            reply = matches!(kind, Some(MailWrite::Reply)),
+            compose = matches!(kind, Some(MailWrite::Compose)),
+            ok = result.is_ok(),
+            pending = self.mail.writes.len(),
+            "mail: written"
+          );
+          if send {
+            self.mail.sending = false;
+          }
+          match result {
+            Ok(()) if send => {
+              self.mail.sent = match kind {
+                Some(MailWrite::Compose) => Some(MailSent::Compose),
+                _ => Some(MailSent::Reply),
+              };
+              self.mail.send_error = None;
+            },
+            Ok(()) => {},
+            Err(message) => {
+              tracing::warn!("mail: {message}");
+              // A send that did not go says why in its box; a mark or an archive, where Mail shows failures.
+              if send {
+                self.mail.send_error = Some(message);
+              } else {
+                self.mail.error = Some(message);
+              }
+            },
+          }
+          changed = true;
+        },
+        Event::MailSignatures { new, reply } => {
+          tracing::debug!(new = new.is_some(), reply = reply.is_some(), "mail: signatures");
+          self.mail.signature_new = new;
+          self.mail.signature_reply = reply;
+          changed = true;
+        },
+        Event::MailLabels(labels) => {
+          tracing::debug!(labels = labels.len(), "mail: labels");
+          self.mail.labels = labels;
+          changed = true;
+        },
+        Event::EventReminder { event, minutes } => self.remind(event, minutes, window, cx),
       }
     }
     if groups_dirty {
@@ -842,11 +1035,11 @@ impl Store {
   }
 
   /// Counts the Dock number again: unread conversations set to notify for everything, and the others only while a
-  /// notification Working posted for them (a mention) is still unread. Hidden and blocked conversations are out of
-  /// the lists, so they are out of it too.
+  /// notification Working posted for them (a mention) is still unread, plus the unread inbox threads while Mail is on.
+  /// Hidden and blocked conversations are out of the lists, so they are out of it too.
   fn count_badge(&mut self) {
     self.badge_dirty = false;
-    let badge = self
+    let chats = self
       .all
       .iter()
       .filter(|c| c.g.unread)
@@ -856,6 +1049,13 @@ impl Store {
         Notify::Off => false,
       })
       .count();
+    // Unread mail counts while Mail is on; `mail` is cleared as it goes off, so its count is 0 then too.
+    let mail = if self.features.mail {
+      self.mail.unread as usize
+    } else {
+      0
+    };
+    let badge = chats + mail;
     if badge != self.badge {
       self.badge = badge;
       crate::notify::set_badge(badge);
@@ -866,12 +1066,91 @@ impl Store {
     matches!(&self.view, View::Conversation(open) if open == group)
   }
 
-  /// Opens the conversation a clicked notification belongs to.
+  /// Opens what a clicked notification belongs to: a conversation, or with a `mail/<thread id>` key Mail on that
+  /// thread.
   pub fn open_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+    if let Some(thread) = key.strip_prefix(MAIL_KEY) {
+      let thread = thread.to_string();
+      self.open_mail(cx);
+      if self.view == View::Mail {
+        self.open_mail_thread(thread, cx);
+      }
+      return;
+    }
+    if key.starts_with(EVENT_KEY) {
+      let event = self.calendar.reminded.iter().rev().find(|(held, _)| held == key);
+      self.calendar.reveal = event.map(|(_, event)| event.clone());
+      self.open_calendar(cx);
+      return;
+    }
     if let Some(id) = self.groups.keys().find(|id| id.key() == key).cloned() {
       self.clear_notifications(&id);
       self.open(id, window, cx);
     }
+  }
+
+  /// A desktop notification for an unread email that reached the inbox: its sender, subject, and start, unless mail
+  /// notifications are off, the user is quiet (`status::quiet`), or the window is in front showing Mail.
+  fn notify_mail(&self, thread: &MailThread, window: &Window, cx: &App) {
+    let settings = cx.global::<Settings>();
+    if !settings.mail_notify || crate::status::quiet(cx) {
+      return;
+    }
+    if window.is_window_active() && self.view == View::Mail {
+      return;
+    }
+    let sender = thread.senders.last().map_or("Gmail", crate::mail_logic::person);
+    let key = format!("{MAIL_KEY}{}", thread.id);
+    let sound = settings.sound.resolved();
+    crate::notify::post(&key, &key, sender, Some(&thread.subject), &thread.snippet, sound);
+  }
+
+  /// An event's reminder came: a notification with its title, when it starts, its time, and where, unless reminders
+  /// are off or the user is quiet (`status::quiet`). Its event is kept so a click shows it.
+  fn remind(&mut self, event: CalendarEvent, minutes: u32, _window: &Window, cx: &App) {
+    if !self.event_reminders || !self.features.calendar || crate::status::quiet(cx) {
+      return;
+    }
+    let key = format!("{EVENT_KEY}{}/{}", event.calendar_id, event.id);
+    let h24 = crate::clock::is_24_hour();
+    let when = if event.all_day {
+      "All day".to_string()
+    } else {
+      let clock = |time| crate::util::clock_text(crate::util::local(time), h24);
+      format!("{} to {}", clock(event.start), clock(event.end))
+    };
+    let place = if event.location.trim().is_empty() {
+      event.meet_url.as_ref().map(|_| "Google Meet".to_string())
+    } else {
+      Some(event.location.trim().to_string())
+    };
+    let body = place.map_or_else(|| when.clone(), |place| format!("{when}, {place}"));
+    let lead = crate::calendar_layout::starts_in(minutes);
+    let sound = cx.global::<Settings>().sound.resolved();
+    crate::notify::post(&key, &key, &event.title, Some(&lead), &body, sound);
+    self.calendar.reminded.retain(|(held, _)| *held != key);
+    self.calendar.reminded.push((key, event));
+    if self.calendar.reminded.len() > REMINDED_LIMIT {
+      self.calendar.reminded.remove(0);
+    }
+  }
+
+  /// Has the core watch the calendars for reminders while `Settings::event_reminders` and the Calendar feature are
+  /// both on, from the first time the connection is up, and stop when either goes off.
+  fn sync_event_watch(&mut self) {
+    let wanted = self.event_reminders && self.features.calendar;
+    if wanted && !self.watching_events && self.connection == Connection::Online {
+      self.core.send(Command::WatchEvents(true));
+      self.watching_events = true;
+    } else if !wanted && self.watching_events {
+      self.core.send(Command::WatchEvents(false));
+      self.watching_events = false;
+    }
+  }
+
+  /// The event whose reminder was clicked, once: the Calendar view shows its day and its card.
+  pub const fn take_reveal(&mut self) -> Option<CalendarEvent> {
+    self.calendar.reveal.take()
   }
 
   fn clear_notifications(&mut self, group: &GroupId) {
@@ -1099,7 +1378,7 @@ impl Store {
   fn set_list(&mut self, list: Vec<Arc<Conv>>, searching: bool) {
     let open = match &self.view {
       View::Conversation(id) => Some(id),
-      View::Home | View::Shortcut(_) | View::Calendar | View::Meet => None,
+      View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => None,
     };
     let now = crate::calendar_layout::now_micros();
     self.list.set(list, searching, self.list_window, open, now);
@@ -1126,11 +1405,14 @@ impl Store {
       if self.show_starred {
         items.push(SidebarItem::Shortcut(Shortcut::Starred));
       }
-      if self.show_calendar {
+      if self.features.calendar {
         items.push(SidebarItem::Calendar);
       }
-      if self.show_meet {
+      if self.features.meet {
         items.push(SidebarItem::Meet);
+      }
+      if self.features.mail {
+        items.push(SidebarItem::Mail);
       }
     }
     let mut by_section: HashMap<&Section, Vec<&Arc<Conv>>> = HashMap::new();
@@ -1277,8 +1559,10 @@ impl Store {
       .unwrap_or_else(|| section.default_sort())
   }
 
-  /// Takes the layout, the sort orders, the list's window, and the Mentions, Starred, Calendar, and Meet buttons from
-  /// the settings, rebuilding the lists when they changed. Call at start and whenever the settings change.
+  /// Takes the layout, the sort orders, the list's window, the Mentions and Starred buttons, and the features from the
+  /// settings, rebuilding the lists when they changed. Call at start and whenever the settings change. Mail turning on
+  /// starts reading Gmail, and turning off stops it (`stop_mail`); a feature going off with its view on screen goes
+  /// Home.
   pub fn sync_settings(&mut self, cx: &mut Context<Self>) {
     let settings = cx.global::<Settings>();
     if settings.list_sort == self.list_sort
@@ -1287,8 +1571,8 @@ impl Store {
       && settings.section_sort == self.section_sort
       && settings.show_mentions == self.show_mentions
       && settings.show_starred == self.show_starred
-      && settings.show_calendar == self.show_calendar
-      && settings.show_meet == self.show_meet
+      && settings.features() == self.features
+      && settings.event_reminders == self.event_reminders
     {
       return;
     }
@@ -1298,8 +1582,19 @@ impl Store {
     self.section_sort = settings.section_sort.clone();
     self.show_mentions = settings.show_mentions;
     self.show_starred = settings.show_starred;
-    self.show_calendar = settings.show_calendar;
-    self.show_meet = settings.show_meet;
+    let mail_was = self.features.mail;
+    self.features = settings.features();
+    self.event_reminders = settings.event_reminders;
+    if self.features.mail {
+      self.start_mail();
+    } else if mail_was {
+      self.stop_mail(cx);
+    }
+    self.sync_event_watch();
+    // The view on screen belongs to a feature just switched off: the window goes Home.
+    if !shows(&self.view, self.features) {
+      self.go_home(cx);
+    }
     self.rebuild_sidebar();
     self.rebuild_lists();
     cx.notify();
@@ -1314,7 +1609,7 @@ impl Store {
     };
     let current = match &self.view {
       View::Conversation(id) => order.iter().position(|conv| &conv.g.id == id),
-      View::Home | View::Shortcut(_) | View::Calendar | View::Meet => None,
+      View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => None,
     };
     let next = match (current, forward) {
       (Some(ix), true) => (ix + 1).min(last),
@@ -1330,7 +1625,7 @@ impl Store {
   pub fn open_next_unread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
     let open = match &self.view {
       View::Conversation(id) => Some(id),
-      View::Home | View::Shortcut(_) | View::Calendar | View::Meet => None,
+      View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => None,
     };
     let Some(id) = self
       .all
@@ -1454,7 +1749,9 @@ impl Store {
     while let Some(view) = stack.pop() {
       let shown = match &view {
         View::Conversation(id) => self.groups.get(id).is_some_and(|conv| listed(&conv.g)),
-        View::Home | View::Shortcut(_) | View::Calendar | View::Meet => true,
+        View::Home | View::Shortcut(_) => true,
+        // A feature that is off is never landed on.
+        View::Calendar | View::Meet | View::Mail => shows(&view, self.features),
       };
       if shown && view != self.view {
         return Some(view);
@@ -1470,6 +1767,7 @@ impl Store {
       View::Shortcut(shortcut) => self.open_shortcut(shortcut, cx),
       View::Calendar => self.open_calendar(cx),
       View::Meet => self.open_meet(cx),
+      View::Mail => self.open_mail(cx),
       View::Conversation(id) => self.open(id, window, cx),
     }
     self.moving = false;
@@ -1499,6 +1797,9 @@ impl Store {
 
   /// Shows Google Calendar. The view asks for the time it shows.
   pub fn open_calendar(&mut self, cx: &mut Context<Self>) {
+    if !self.features.calendar {
+      return;
+    }
     if matches!(self.view, View::Conversation(_)) {
       self.core.send(Command::Close);
     }
@@ -1510,6 +1811,9 @@ impl Store {
 
   /// Shows Meet. The view asks for the day it shows.
   pub fn open_meet(&mut self, cx: &mut Context<Self>) {
+    if !self.features.meet {
+      return;
+    }
     if matches!(self.view, View::Conversation(_)) {
       self.core.send(Command::Close);
     }
@@ -1518,6 +1822,146 @@ impl Store {
     self.drop_shortcut(cx);
     self.meet.error = None;
     cx.notify();
+  }
+
+  /// Shows Gmail. The inbox is asked for when it is not held yet and not on its way, as after the last read failed.
+  /// Nothing happens while the Mail switch is off: Gmail is not read then.
+  pub fn open_mail(&mut self, cx: &mut Context<Self>) {
+    if !self.features.mail {
+      return;
+    }
+    if matches!(self.view, View::Conversation(_)) {
+      self.core.send(Command::Close);
+    }
+    self.set_view(View::Mail);
+    self.conv = None;
+    self.drop_shortcut(cx);
+    // As after the last read of it failed, too: opening Mail tries again.
+    let inbox = self.mail.lists.get(&Mailbox::Inbox);
+    if inbox.is_none_or(|inbox| !inbox.loaded && !inbox.loading) {
+      self.request_mail(Mailbox::Inbox, false);
+    }
+    cx.notify();
+  }
+
+  /// Asks for a mailbox's newest threads, or with `more` for the next older page after those held. Nothing goes while
+  /// a page of that mailbox is on its way, nor for `more` once Gmail said there is nothing older. The threads held stay
+  /// until the answer comes.
+  pub fn load_mail(&mut self, mailbox: Mailbox, more: bool, cx: &mut Context<Self>) {
+    if self.request_mail(mailbox, more) {
+      cx.notify();
+    }
+  }
+
+  /// Sends `LoadMail` unless it would ask again for what is on its way or for a page that is not there. Answers whether
+  /// it went.
+  fn request_mail(&mut self, mailbox: Mailbox, more: bool) -> bool {
+    let asked = self.mail.lists.ask(&mailbox, more);
+    tracing::debug!(mailbox = mailbox_kind(&mailbox), more, asked, "mail: load");
+    if !asked {
+      return false;
+    }
+    // The core watches the inbox from its first load on.
+    if mailbox == Mailbox::Inbox {
+      self.mail.watching = true;
+    }
+    self.core.send(Command::LoadMail { mailbox, more });
+    true
+  }
+
+  /// Reads Gmail from now on: asks for the inbox once, which also has the core watch it, while the Mail switch is on
+  /// and the connection is up (the session is good). Never while the switch is off.
+  fn start_mail(&mut self) {
+    if self.features.mail && !self.mail.watching && self.connection == Connection::Online {
+      self.request_mail(Mailbox::Inbox, false);
+    }
+  }
+
+  /// The Mail switch went off: the core stops watching the inbox and forgets its mail, the mail held here goes, the
+  /// Dock number drops its count, and the Mail view, if it is on screen, goes Home.
+  fn stop_mail(&mut self, cx: &mut Context<Self>) {
+    self.core.send(Command::StopMail);
+    self.mail = MailData::default();
+    self.count_badge();
+    if self.view == View::Mail {
+      self.go_home(cx);
+    }
+  }
+
+  /// Opens a thread, by Gmail's thread id, and asks for its emails. Its emails held stay while they are asked for
+  /// again; another thread's go at once. Its emails reaching the screen, with the window in front, mark it read
+  /// (`Event::MailMessages`).
+  pub fn open_mail_thread(&mut self, id: String, cx: &mut Context<Self>) {
+    if !self.features.mail {
+      return;
+    }
+    if self.mail.open.as_ref() == Some(&id) {
+      if self.mail.opening {
+        return;
+      }
+    } else {
+      self.mail.open = Some(id.clone());
+      self.mail.messages = None;
+    }
+    self.mail.opening = true;
+    self.core.send(Command::OpenMail(id));
+    cx.notify();
+  }
+
+  /// Marks a thread read or unread in Gmail. The core changes the lists at once and answers `MailWritten`.
+  pub fn mark_mail(&mut self, thread: String, read: bool, cx: &mut Context<Self>) {
+    if self.features.mail {
+      self.core.send(Command::MarkMail { thread, read });
+      self.mail.writes.push_back(MailWrite::Change);
+      cx.notify();
+    }
+  }
+
+  /// Takes a thread out of the inbox, or puts it back. The core changes the lists at once and answers `MailWritten`.
+  pub fn archive_mail(&mut self, thread: String, archive: bool, cx: &mut Context<Self>) {
+    if self.features.mail {
+      self.core.send(Command::ArchiveMail { thread, archive });
+      self.mail.writes.push_back(MailWrite::Change);
+      cx.notify();
+    }
+  }
+
+  /// Sends a reply, unless a send is on its way. `MailWritten` answers; the thread comes again with it once it went.
+  pub fn reply_mail(&mut self, reply: MailReply, cx: &mut Context<Self>) {
+    if !self.features.mail || self.mail.sending {
+      return;
+    }
+    self.mail.sending = true;
+    self.mail.send_error = None;
+    self.core.send(Command::ReplyMail(Box::new(reply)));
+    self.mail.writes.push_back(MailWrite::Reply);
+    cx.notify();
+  }
+
+  /// Sends a new email, unless a send is on its way. `MailWritten` answers; the lists it shows in follow.
+  pub fn compose_mail(&mut self, compose: MailCompose, cx: &mut Context<Self>) {
+    if !self.features.mail || self.mail.sending {
+      return;
+    }
+    self.mail.sending = true;
+    self.mail.send_error = None;
+    self.core.send(Command::ComposeMail(Box::new(compose)));
+    self.mail.writes.push_back(MailWrite::Compose);
+    cx.notify();
+  }
+
+  /// Which send went since the view last asked, once.
+  pub const fn take_sent(&mut self) -> Option<MailSent> {
+    self.mail.sent.take()
+  }
+
+  /// Closes the thread open: the Mail view shows its list again.
+  pub fn close_mail_thread(&mut self, cx: &mut Context<Self>) {
+    if self.mail.open.take().is_some() {
+      self.mail.messages = None;
+      self.mail.opening = false;
+      cx.notify();
+    }
   }
 
   /// Asks for the events of `start..end`, and for the calendars when none are held. The events on screen stay until
@@ -1745,13 +2189,42 @@ fn ordered<'a>(present: impl Iterator<Item = &'a Section>) -> Vec<Section> {
   order
 }
 
+/// Whether `view` can be on screen while `features` are on: a feature's view only while it is on.
+pub const fn shows(view: &View, features: Features) -> bool {
+  match view {
+    View::Calendar => features.calendar,
+    View::Meet => features.meet,
+    View::Mail => features.mail,
+    View::Home | View::Shortcut(_) | View::Conversation(_) => true,
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use std::sync::Arc;
 
-  use super::{Calling, Conv, DAY_MICROS, ListRow, Listing, Section, conv, is_older};
-  use crate::settings::{ListWindow, Sort};
+  use super::{Calling, Conv, DAY_MICROS, ListRow, Listing, Section, View, conv, is_older, shows};
+  use crate::settings::{Features, ListWindow, Sort};
   use gchat_core::{Group, GroupId, GroupKind, Micros, Notify, Placement};
+
+  #[test]
+  fn a_feature_that_is_off_has_no_view_on_screen() {
+    let all = Features::default();
+    let none = Features {
+      calendar: false,
+      meet: false,
+      mail: false,
+    };
+    for view in [View::Calendar, View::Meet, View::Mail] {
+      assert!(shows(&view, all));
+      assert!(!shows(&view, none));
+    }
+    assert!(shows(&View::Home, none));
+    assert!(shows(&View::Shortcut(gchat_core::Shortcut::Mentions), none));
+    assert!(shows(&View::Conversation(GroupId::Dm("jpark".into())), none));
+    let meet_only = Features { calendar: false, meet: true, mail: false };
+    assert!(shows(&View::Meet, meet_only) && !shows(&View::Calendar, meet_only));
+  }
 
   fn group(kind: GroupKind, placement: Placement) -> Group {
     Group {

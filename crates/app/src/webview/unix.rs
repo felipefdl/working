@@ -23,3 +23,8 @@ pub fn build<V: 'static>(
     ready(this, WebView::build(builder, window, cx), window, cx);
   });
 }
+
+/// `WebKit` names a custom protocol's pages as they were given.
+pub fn is_under(url: &str, base: &str) -> bool {
+  url.starts_with(base)
+}

@@ -12,7 +12,7 @@
             lock is held while the session opens so two calls do not open it twice"
 )]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -80,6 +80,9 @@ pub struct Client {
   session: tokio::sync::Mutex<Option<Arc<Session>>>,
   /// The calendars last listed, which `events` reads.
   calendars: Mutex<Vec<Calendar>>,
+  /// Minutes before an event of each calendar its own popup notification comes, by calendar id, as last listed. A
+  /// calendar without one is absent.
+  default_reminders: Mutex<HashMap<String, u32>>,
 }
 
 impl Client {
@@ -88,6 +91,7 @@ impl Client {
       cookie_path,
       session: tokio::sync::Mutex::new(None),
       calendars: Mutex::new(Vec::new()),
+      default_reminders: Mutex::new(HashMap::new()),
     }
   }
 
@@ -119,7 +123,12 @@ impl Client {
 
   /// The account's calendars: the primary one first, then the user's own, then the shared ones, each by name.
   pub async fn calendars(&self) -> Result<Vec<Calendar>> {
-    let mut list = self.with_session(|session| async move { session.calendars().await }).await?;
+    let listed = self.with_session(|session| async move { session.calendars().await }).await?;
+    let defaults: HashMap<String, u32> = listed
+      .iter()
+      .filter_map(|(calendar, minutes)| Some((calendar.id.clone(), (*minutes)?)))
+      .collect();
+    let mut list: Vec<Calendar> = listed.into_iter().map(|(calendar, _)| calendar).collect();
     list.sort_by(|a, b| {
       let rank = |calendar: &Calendar| (!calendar.primary, !calendar.access.can_write());
       rank(a)
@@ -127,7 +136,17 @@ impl Client {
         .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     list.clone_into(&mut self.calendars.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    *self.default_reminders.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = defaults;
     Ok(list)
+  }
+
+  /// Each calendar's own popup notification, in minutes before an event, by calendar id, as last listed.
+  pub fn default_reminders(&self) -> HashMap<String, u32> {
+    self
+      .default_reminders
+      .lock()
+      .unwrap_or_else(std::sync::PoisonError::into_inner)
+      .clone()
   }
 
   /// Every calendar's events that overlap `start..end`, by start. A calendar that cannot be read is left out, unless
@@ -146,6 +165,24 @@ impl Client {
       .await?;
     sort_events(&mut events);
     Ok(events)
+  }
+
+  /// One event of a calendar the user has, by its id (an occurrence's own id reads that occurrence).
+  pub async fn event(&self, calendar_id: &str, event_id: &str) -> Result<CalendarEvent> {
+    let mut calendars = self.calendars.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    if calendars.is_empty() {
+      calendars = self.calendars().await?;
+    }
+    let calendar = calendars
+      .into_iter()
+      .find(|calendar| calendar.id == calendar_id)
+      .ok_or_else(|| anyhow!("the user has no calendar {calendar_id}"))?;
+    let item = self
+      .with_session(
+        |session| async move { session.call(Method::GET, &event_path(calendar_id, event_id), &[], None).await },
+      )
+      .await?;
+    event_from(&item, &calendar).ok_or_else(|| anyhow!("the event {event_id} was cancelled or cannot be read"))
   }
 
   /// Creates the event of `draft`, or changes the one it edits.
@@ -282,7 +319,8 @@ impl Session {
     serde_json::from_str(&text).context("Google Calendar answered something that is not JSON")
   }
 
-  async fn calendars(&self) -> Result<Vec<Calendar>> {
+  /// Every calendar the user has, each with its own popup notification in minutes when it has one.
+  async fn calendars(&self) -> Result<Vec<(Calendar, Option<u32>)>> {
     let mut list = Vec::new();
     let mut page: Option<String> = None;
     loop {
@@ -292,7 +330,11 @@ impl Session {
       }
       let answer = self.call(Method::GET, "users/me/calendarList", &query, None).await?;
       let items = answer["items"].as_array().map_or_default(Vec::as_slice);
-      list.extend(items.iter().filter_map(|entry| calendar_from(entry, &self.pastels)));
+      list.extend(
+        items
+          .iter()
+          .filter_map(|entry| Some((calendar_from(entry, &self.pastels)?, default_popup(entry)))),
+      );
       match answer["nextPageToken"].as_str() {
         Some(token) => page = Some(token.to_string()),
         None => return Ok(list),
@@ -404,6 +446,84 @@ impl Session {
     }
     Ok(())
   }
+}
+
+/// A calendar's own popup notification, in minutes before an event: the first `popup` of the calendar list entry's
+/// `defaultReminders` (`[{ "method": "popup", "minutes": 10 }]`). Email notifications are not shown here.
+fn default_popup(entry: &Value) -> Option<u32> {
+  entry["defaultReminders"]
+    .as_array()?
+    .iter()
+    .find(|reminder| reminder["method"].as_str() == Some("popup"))
+    .and_then(|reminder| u32::try_from(reminder["minutes"].as_u64()?).ok())
+}
+
+const MINUTE: Micros = 60_000_000;
+/// A reminder found this late (the computer slept through it) still comes until a minute after the start.
+const REMINDER_GRACE: Micros = MINUTE;
+
+/// An event gets a reminder: a regular event or focus time, at a time of day, not declined, and not already started
+/// when the watch began.
+fn remindable(event: &CalendarEvent, watch_start: Micros) -> bool {
+  matches!(event.kind, EventKind::Event | EventKind::FocusTime)
+    && !event.all_day
+    && event.my_rsvp != Some(Rsvp::Declined)
+    && event.start > watch_start
+}
+
+/// When an event's notification comes: its own minutes before the start, or its calendar's default popup. `None` when
+/// it has no notification.
+pub(crate) fn reminder_time(event: &CalendarEvent, defaults: &HashMap<String, u32>) -> Option<Micros> {
+  let minutes = match event.reminder {
+    Reminder::Minutes(minutes) => minutes,
+    Reminder::Default => *defaults.get(&event.calendar_id)?,
+    Reminder::None => return None,
+  };
+  Some(event.start.saturating_sub(i64::from(minutes).saturating_mul(MINUTE)))
+}
+
+/// The reminders due at `now`, each event occurrence and start once: `sent` holds what was told (a moved event, with
+/// a new start, reminds again). Answers each event with the whole minutes until it starts, 0 once it has.
+pub(crate) fn due_reminders(
+  events: &[CalendarEvent],
+  defaults: &HashMap<String, u32>,
+  sent: &mut HashSet<(String, Micros)>,
+  watch_start: Micros,
+  now: Micros,
+) -> Vec<(CalendarEvent, u32)> {
+  sent.retain(|(_, start)| start.saturating_add(REMINDER_GRACE) >= now);
+  let mut due = Vec::new();
+  for event in events.iter().filter(|event| remindable(event, watch_start)) {
+    let Some(at) = reminder_time(event, defaults) else {
+      continue;
+    };
+    if at > now || now > event.start.saturating_add(REMINDER_GRACE) {
+      continue;
+    }
+    if !sent.insert((event.id.clone(), event.start)) {
+      continue;
+    }
+    let left = u64::try_from(event.start.saturating_sub(now)).unwrap_or(0);
+    let minutes = u32::try_from(left.div_ceil(60_000_000)).unwrap_or(u32::MAX);
+    due.push((event.clone(), minutes));
+  }
+  due
+}
+
+/// The next time a reminder of `events` comes after `now`, if any.
+pub(crate) fn next_reminder(
+  events: &[CalendarEvent],
+  defaults: &HashMap<String, u32>,
+  sent: &HashSet<(String, Micros)>,
+  watch_start: Micros,
+  now: Micros,
+) -> Option<Micros> {
+  events
+    .iter()
+    .filter(|event| remindable(event, watch_start) && !sent.contains(&(event.id.clone(), event.start)))
+    .filter_map(|event| reminder_time(event, defaults))
+    .filter(|at| *at > now)
+    .min()
 }
 
 /// Orders events by start; on the same start, all-day ones first, then the longer ones.
@@ -1043,5 +1163,137 @@ mod tests {
     let (master_start, _) = when(&master["start"]).expect("start");
     assert_eq!(shifted.start, master_start + hour);
     assert_eq!(shifted.end - shifted.start, 3 * hour / 2);
+  }
+
+  /// A made-up event of the primary calendar starting at `start`.
+  fn event(id: &str, start: Micros, reminder: Reminder) -> CalendarEvent {
+    CalendarEvent {
+      id: id.into(),
+      calendar_id: "jpark@example.com".into(),
+      title: "Design review".into(),
+      start,
+      end: start + 30 * MINUTE,
+      all_day: false,
+      location: String::new(),
+      description: String::new(),
+      meet_url: None,
+      link: String::new(),
+      color: None,
+      color_id: None,
+      guests: Vec::new(),
+      organizer: "Jordan Park".into(),
+      series: None,
+      kind: EventKind::Event,
+      busy: true,
+      visibility: Visibility::Default,
+      reminder,
+      can_edit: true,
+      can_delete: true,
+      my_rsvp: None,
+    }
+  }
+
+  fn told(due: &[(CalendarEvent, u32)]) -> Vec<(&str, u32)> {
+    due.iter().map(|(event, minutes)| (event.id.as_str(), *minutes)).collect()
+  }
+
+  #[test]
+  fn calendars_default_popup_is_their_first_popup() {
+    let entry =
+      json!({ "defaultReminders": [{ "method": "email", "minutes": 30 }, { "method": "popup", "minutes": 10 }] });
+    assert_eq!(default_popup(&entry), Some(10));
+    assert_eq!(default_popup(&json!({ "defaultReminders": [] })), None);
+    assert_eq!(default_popup(&json!({})), None);
+  }
+
+  #[test]
+  fn reminders_come_at_their_time_once_per_start() {
+    let watch = 0;
+    let defaults = HashMap::from([("jpark@example.com".to_string(), 10)]);
+    let events = vec![
+      event("own", 60 * MINUTE, Reminder::Minutes(15)),
+      event("default", 60 * MINUTE, Reminder::Default),
+      event("silent", 60 * MINUTE, Reminder::None),
+    ];
+    let mut sent = HashSet::new();
+    assert_eq!(next_reminder(&events, &defaults, &sent, watch, MINUTE), Some(45 * MINUTE));
+    assert_eq!(
+      told(&due_reminders(&events, &defaults, &mut sent, watch, 44 * MINUTE)),
+      Vec::<(&str, u32)>::new()
+    );
+    assert_eq!(
+      told(&due_reminders(&events, &defaults, &mut sent, watch, 45 * MINUTE)),
+      [("own", 15)]
+    );
+    assert_eq!(next_reminder(&events, &defaults, &sent, watch, 45 * MINUTE), Some(50 * MINUTE));
+    assert_eq!(
+      told(&due_reminders(&events, &defaults, &mut sent, watch, 50 * MINUTE + 1)),
+      [("default", 10)]
+    );
+    assert!(
+      due_reminders(&events, &defaults, &mut sent, watch, 55 * MINUTE).is_empty(),
+      "never twice"
+    );
+    assert_eq!(next_reminder(&events, &defaults, &sent, watch, 55 * MINUTE), None);
+
+    // Moved half an hour later, it reminds again.
+    let moved = vec![event("own", 90 * MINUTE, Reminder::Minutes(15))];
+    assert_eq!(
+      told(&due_reminders(&moved, &defaults, &mut sent, watch, 75 * MINUTE)),
+      [("own", 15)]
+    );
+
+    // A calendar without a default popup gives no reminder.
+    let other = CalendarEvent {
+      calendar_id: "team@example.com".into(),
+      ..event("team", 60 * MINUTE, Reminder::Default)
+    };
+    assert_eq!(reminder_time(&other, &defaults), None);
+  }
+
+  #[test]
+  fn reminders_skip_declined_all_day_other_kinds_and_started_events() {
+    let defaults = HashMap::new();
+    let declined = CalendarEvent {
+      my_rsvp: Some(Rsvp::Declined),
+      ..event("declined", 60 * MINUTE, Reminder::Minutes(10))
+    };
+    let all_day = CalendarEvent {
+      all_day: true,
+      ..event("all day", 60 * MINUTE, Reminder::Minutes(10))
+    };
+    let away = CalendarEvent {
+      kind: EventKind::OutOfOffice,
+      ..event("away", 60 * MINUTE, Reminder::Minutes(10))
+    };
+    let focus = CalendarEvent {
+      kind: EventKind::FocusTime,
+      ..event("focus", 60 * MINUTE, Reminder::Minutes(10))
+    };
+    let started = event("started", 5 * MINUTE, Reminder::Minutes(10));
+    let events = vec![declined, all_day, away, focus, started];
+    let mut sent = HashSet::new();
+    let due = due_reminders(&events, &defaults, &mut sent, 10 * MINUTE, 50 * MINUTE);
+    assert_eq!(told(&due), [("focus", 10)]);
+  }
+
+  #[test]
+  fn a_reminder_found_late_says_how_long_is_left() {
+    let defaults = HashMap::new();
+    let events = vec![event("soon", 60 * MINUTE, Reminder::Minutes(30))];
+    let mut sent = HashSet::new();
+    // The watch began 5 minutes before the start, after the notification time.
+    let due = due_reminders(&events, &defaults, &mut sent, 55 * MINUTE, 55 * MINUTE + 30_000_000);
+    assert_eq!(told(&due), [("soon", 5)]);
+    let mut asleep = HashSet::new();
+    assert!(
+      due_reminders(&events, &defaults, &mut asleep, 0, 62 * MINUTE).is_empty(),
+      "too late once it started over a minute ago"
+    );
+    let mut now = HashSet::new();
+    assert_eq!(
+      told(&due_reminders(&events, &defaults, &mut now, 0, 60 * MINUTE)),
+      [("soon", 0)]
+    );
   }
 }

@@ -67,6 +67,14 @@ mod format_logic;
 mod home;
 mod images;
 mod keys;
+mod mail;
+mod mail_body;
+mod mail_compose;
+mod mail_labels;
+mod mail_lists;
+mod mail_logic;
+mod mail_page;
+mod mail_write;
 mod meet;
 mod meet_body;
 mod meet_logic;
@@ -154,8 +162,9 @@ fn main() {
     console::attach();
     notify::set_app_id();
   }
+  // Only the app's own crates trace: the HTTP stack's debug lines print `Set-Cookie` values.
   let filter = if std::env::var("WORKING_TRACE").is_ok_and(|value| value == "1") {
-    "debug"
+    "warn,working=debug,gchat_core=debug"
   } else {
     "warn"
   };
@@ -218,12 +227,14 @@ fn main() {
       bind_menu_commands(cx, on_main);
       // Only macOS has a menu bar of its own: elsewhere the main window's top bar has a button with these menus.
       cx.set_menus(menus(cx));
-      // The menu bar shows each view's number key: it is written again when the keys change hands.
-      let mut shown = cx.global::<Settings>().hotkeys.clone();
+      // The menu bar shows each view's number key, and Calendar, Meet, and Mail only while each is on: it is written
+      // again when the keys change hands or a feature goes on or off.
+      let shown = |settings: &Settings| (settings.hotkeys.clone(), settings.features());
+      let mut written = shown(cx.global::<Settings>());
       cx.observe_global::<Settings>(move |cx| {
-        let hotkeys = &cx.global::<Settings>().hotkeys;
-        if *hotkeys != shown {
-          shown = hotkeys.clone();
+        let now = shown(cx.global::<Settings>());
+        if now != written {
+          written = now;
           cx.set_menus(menus(cx));
         }
       })

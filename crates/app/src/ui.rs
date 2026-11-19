@@ -74,6 +74,13 @@ pub enum Icon {
   AtSign,
   Star,
   Calendar,
+  Mail,
+  Paperclip,
+  Tag,
+  Archive,
+  /// A circle half filled: the other background for an email.
+  Contrast,
+  ReplyAll,
   ChevronLeft,
   Clock,
   MapPin,
@@ -89,6 +96,8 @@ pub enum Icon {
   SquareCode,
   /// An A with a line under it: the formatting toggle of the composer.
   Baseline,
+  /// Settings, Features.
+  LayoutGrid,
 }
 
 macro_rules! lucide {
@@ -233,6 +242,22 @@ impl Icon {
       Self::Calendar => lucide!(
         r#"<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/>"#
       ),
+      Self::Mail => lucide!(
+        r#"<path d="m22 7-8.991 5.727a2 2 0 0 1-2.009 0L2 7"/><rect x="2" y="4" width="20" height="16" rx="2"/>"#
+      ),
+      Self::Paperclip => lucide!(
+        r#"<path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551"/>"#
+      ),
+      Self::Tag => lucide!(
+        r#"<path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z"/><circle cx="7.5" cy="7.5" r="1.5"/>"#
+      ),
+      Self::Archive => lucide!(
+        r#"<rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/><path d="M10 12h4"/>"#
+      ),
+      Self::Contrast => lucide!(r#"<circle cx="12" cy="12" r="10"/><path d="M12 18a6 6 0 0 0 0-12v12z"/>"#),
+      Self::ReplyAll => {
+        lucide!(r#"<path d="m12 17-5-5 5-5"/><path d="M22 18v-2a4 4 0 0 0-4-4H7"/><path d="m7 17-5-5 5-5"/>"#)
+      },
       Self::ChevronLeft => lucide!(r#"<path d="m15 18-6-6 6-6"/>"#),
       Self::Clock => lucide!(r#"<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>"#),
       Self::MapPin => lucide!(
@@ -268,6 +293,9 @@ impl Icon {
         r#"<path d="m10 9-3 3 3 3"/><path d="m14 15 3-3-3-3"/><rect x="3" y="3" width="18" height="18" rx="2"/>"#
       ),
       Self::Baseline => lucide!(r#"<path d="M4 20h16"/><path d="m6 16 6-12 6 12"/><path d="M8 12h8"/>"#),
+      Self::LayoutGrid => lucide!(
+        r#"<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/>"#
+      ),
     }
   }
 }
@@ -290,6 +318,29 @@ pub fn switch(on: bool, height: f32) -> Div {
     .rounded_full()
     .bg(if on { rgb(ACCENT) } else { switch_off() })
     .child(div().size(px(height * 0.75)).rounded_full().bg(rgb(WHITE)))
+}
+
+/// An unread count on an accent pill, `99+` past 99, as the Rail's buttons carry it over their glyph. The caller
+/// places it.
+pub fn count_badge(count: usize) -> Div {
+  let text = if count > 99 {
+    "99+".to_string()
+  } else {
+    count.to_string()
+  };
+  div()
+    .min_w(px(16.))
+    .h(px(16.))
+    .px_1()
+    .flex()
+    .items_center()
+    .justify_center()
+    .rounded_full()
+    .bg(rgb(ACCENT))
+    .text_size(px(10.))
+    .font_weight(FontWeight::SEMIBOLD)
+    .text_color(rgb(BG))
+    .child(text)
 }
 
 /// Round avatar: the emoji when there is one, else the image when it is ready, else initials on a colored circle.

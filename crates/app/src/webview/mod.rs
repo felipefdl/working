@@ -34,3 +34,10 @@ pub fn build<V: 'static>(
 ) {
   os::build(configure, scripts, url, window, cx, ready);
 }
+
+/// Whether `url`, as a navigation handler hears it, is under `base`, an address of a custom protocol such as
+/// `media://localhost/`: the name this OS's webview gives it (`WebView2` serves `media://localhost/` at
+/// `http://media.localhost/`).
+pub fn is_under(url: &str, base: &str) -> bool {
+  os::is_under(url, base)
+}

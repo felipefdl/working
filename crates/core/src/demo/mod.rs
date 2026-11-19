@@ -5,6 +5,7 @@
 mod calendar;
 mod data;
 mod image;
+mod mail;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -16,8 +17,8 @@ use tokio::time::Instant;
 use crate::engine::{FetchReply, Fetcher};
 use crate::model::{
   Attachment, AttachmentKind, CardAction, Chip, ChipKind, Command, Connection, DndFor, DndSchedule, DndSchedules,
-  Event, Group, GroupId, GroupKind, McpConfig, McpStatus, Message, Micros, MyStatus, Notify, PersonStatus, Placement,
-  Quote, Reaction, ReadReceipt, SearchHit, Shortcut, Snippet, User,
+  Event, Group, GroupId, GroupKind, MailCompose, MailReply, Mailbox, McpConfig, McpStatus, Message, Micros, MyStatus,
+  Notify, PersonStatus, Placement, Quote, Reaction, ReadReceipt, SearchHit, Shortcut, Snippet, User,
 };
 use data::{APPROVE, BUILD_BOT, CANCEL, ME, World};
 
@@ -29,6 +30,14 @@ const SEARCH_LIMIT: usize = 50;
 /// First unprompted message after start, then the gap between them.
 const FIRST_AMBIENT: Duration = Duration::from_secs(12);
 const AMBIENT_EVERY: Duration = Duration::from_secs(75);
+/// When the one new email arrives, after the first inbox load.
+const MAIL_ARRIVES: Duration = Duration::from_secs(20);
+/// When a person answers the user's reply back.
+const MAIL_ANSWERS: Duration = Duration::from_secs(15);
+/// What a mail command about a thread the demo does not have answers.
+const MAIL_GONE: &str = "This email is no longer there.";
+/// When the reminder for the event about to start comes, after `Command::WatchEvents(true)`.
+const REMINDER_COMES: Duration = Duration::from_secs(30);
 
 /// Starts the demo core thread and returns a handle for image fetches.
 pub fn spawn(commands: flume::Receiver<Command>, events: flume::Sender<Event>) -> Arc<Fetcher> {
@@ -93,7 +102,7 @@ fn fetch_bytes(url: &str) -> Result<Vec<u8>, String> {
       .ok_or_else(|| "The demo has no such photo.".into());
   }
   if let Some(name) = url.strip_prefix("demo:file/") {
-    return Ok(data::file_body(name).into_bytes());
+    return Ok(mail::file(name).map_or_else(|| data::file_body(name).into_bytes(), <[u8]>::to_vec));
   }
   if let Some(path) = url.strip_prefix("demo:upload/").or_else(|| url.strip_prefix("file://")) {
     return std::fs::read(path).map_err(|error| error.to_string());
@@ -116,6 +125,12 @@ enum Action {
   Arrive(Message),
   /// A message from someone, unprompted, then the next one scheduled.
   Ambient,
+  /// The demo's one new email reaches the inbox.
+  MailArrives,
+  /// The reminder for the calendar event about to start.
+  Remind,
+  /// Someone answers the user's reply in a thread.
+  MailAnswer { thread: String, from: String },
 }
 
 /// Which slice of a conversation's messages the UI holds.
@@ -144,6 +159,9 @@ struct Demo {
   serial: usize,
   ambient: usize,
   calendar: calendar::DemoCalendar,
+  mail: mail::DemoMail,
+  /// The event reminder was delivered: it comes once per run.
+  reminded: bool,
 }
 
 impl Demo {
@@ -160,6 +178,7 @@ impl Demo {
     Self {
       events,
       calendar: calendar::DemoCalendar::new(now, &users, &me),
+      mail: mail::DemoMail::new(now, &users, &me),
       me,
       users: users.into_iter().map(|user| (user.id.clone(), user)).collect(),
       groups: groups.into_iter().map(|group| (group.id.clone(), group)).collect(),
@@ -182,6 +201,7 @@ impl Demo {
       },
       serial: 0,
       ambient: 0,
+      reminded: false,
     }
   }
 
@@ -242,6 +262,9 @@ impl Demo {
           self.upsert(&Arc::new(message), None);
         },
         Action::Ambient => self.ambient(),
+        Action::MailArrives => self.mail_arrives(),
+        Action::Remind => self.remind(),
+        Action::MailAnswer { thread, from } => self.mail_answer(&thread, &from),
       }
     }
   }
@@ -291,15 +314,7 @@ impl Demo {
         self.change_message(&group, &message_id, |message| react(&mut message.reactions, &emoji, add));
       },
       Command::LoadMembers(group) => self.load_members(group),
-      Command::LoadSlashCommands(group) => {
-        let has_bot = self.members.get(&group).is_some_and(|ids| ids.iter().any(|id| id == BUILD_BOT));
-        let commands = if has_bot {
-          data::commands()
-        } else {
-          Vec::new()
-        };
-        self.emit(Event::SlashCommands { group, commands: Arc::new(commands) });
-      },
+      Command::LoadSlashCommands(group) => self.load_slash_commands(group),
       Command::CreateChat { user_ids } => self.create_chat(user_ids),
       Command::SetMcp(config) => self.emit(Event::Mcp(mcp_status(config.as_ref()))),
       Command::LoadDnd => self.emit(Event::Dnd(self.dnd.clone())),
@@ -307,20 +322,8 @@ impl Demo {
         self.dnd = schedules;
         self.emit(Event::Dnd(self.dnd.clone()));
       },
-      Command::SetDnd(choice) => {
-        self.mine.dnd = matches!(choice, DndFor::For(_));
-        self.mine.dnd_until = match choice {
-          DndFor::Off => None,
-          DndFor::For(span) => Some(now_micros() + span),
-        };
-        self.emit(Event::Mine(self.mine.clone()));
-      },
-      Command::SetStatus { emoji, text, until } => {
-        self.mine.emoji = emoji;
-        self.mine.text = text;
-        self.mine.status_until = until;
-        self.emit(Event::Mine(self.mine.clone()));
-      },
+      Command::SetDnd(choice) => self.set_dnd(choice),
+      Command::SetStatus { emoji, text, until } => self.set_status(emoji, text, until),
       Command::RefreshWorld => self.emit(Event::World(Arc::new(self.groups.values().cloned().collect()))),
       Command::Connect => self.greet(),
       Command::LoadCalendars => self.emit(Event::Calendars(Arc::new(self.calendar.calendars.clone()))),
@@ -340,8 +343,43 @@ impl Demo {
         let result = self.calendar.respond(&event_id, scope, rsvp);
         self.calendar_written(result);
       },
+      Command::LoadMail { mailbox, more } => self.load_mail(&mailbox, more),
+      Command::OpenMail(thread) => self.open_mail(thread),
+      Command::StopMail => self.stop_mail(),
+      Command::WatchEvents(on) => self.watch_events(on),
+      Command::MarkMail { thread, read } => self.write_mail(|mail| mail.mark(&thread, read)),
+      Command::ArchiveMail { thread, archive } => self.write_mail(|mail| mail.archive(&thread, archive)),
+      Command::ReplyMail(reply) => self.reply_mail(&reply),
+      Command::ComposeMail(compose) => self.compose_mail(&compose),
       Command::SetTyping { .. } | Command::SetPresence(_) => {},
     }
+  }
+
+  /// The build bot's slash commands, in a conversation it is a member of.
+  fn load_slash_commands(&self, group: GroupId) {
+    let has_bot = self.members.get(&group).is_some_and(|ids| ids.iter().any(|id| id == BUILD_BOT));
+    let commands = if has_bot {
+      data::commands()
+    } else {
+      Vec::new()
+    };
+    self.emit(Event::SlashCommands { group, commands: Arc::new(commands) });
+  }
+
+  fn set_dnd(&mut self, choice: DndFor) {
+    self.mine.dnd = matches!(choice, DndFor::For(_));
+    self.mine.dnd_until = match choice {
+      DndFor::Off => None,
+      DndFor::For(span) => Some(now_micros() + span),
+    };
+    self.emit(Event::Mine(self.mine.clone()));
+  }
+
+  fn set_status(&mut self, emoji: String, text: String, until: Option<Micros>) {
+    self.mine.emoji = emoji;
+    self.mine.text = text;
+    self.mine.status_until = until;
+    self.emit(Event::Mine(self.mine.clone()));
   }
 
   // ---- History windows ----
@@ -359,6 +397,154 @@ impl Demo {
     self.emit(Event::CalendarWritten(result));
     if written {
       self.emit_calendar_events();
+    }
+  }
+
+  /// Answers `Command::LoadMail`. The first inbox load also says how many threads are unread, sends the labels, and
+  /// schedules the demo's one new email, as the engine starts watching the inbox.
+  fn load_mail(&mut self, mailbox: &Mailbox, more: bool) {
+    let (threads, more) = self.mail.load(mailbox, more);
+    self.emit(Event::MailThreads {
+      mailbox: mailbox.clone(),
+      threads: Arc::new(threads),
+      more,
+    });
+    if *mailbox == Mailbox::Inbox && self.mail.watch() {
+      self.emit(Event::MailUnread(self.mail.unread()));
+      self.emit(Event::MailLabels(Arc::new(self.mail.labels())));
+      let (new, reply) = self.mail.signatures();
+      self.emit(Event::MailSignatures { new, reply });
+      self.schedule(MAIL_ARRIVES, Action::MailArrives);
+    }
+  }
+
+  /// Answers `Command::OpenMail`.
+  fn open_mail(&self, thread: String) {
+    match self.mail.open(&thread) {
+      Some(messages) => self.emit(Event::MailMessages { thread, messages: Arc::new(messages) }),
+      None => self.emit(Event::MailFailed(MAIL_GONE.into())),
+    }
+  }
+
+  /// `Command::StopMail`: the new email no longer comes, and the mail held is forgotten.
+  fn stop_mail(&mut self) {
+    self.timeline.retain(|(_, action)| !matches!(action, Action::MailArrives));
+    self.mail.stop();
+  }
+
+  /// The new email: a notification, then what it changed.
+  fn mail_arrives(&mut self) {
+    let before = self.mail.snapshot();
+    let Some(thread) = self.mail.arrive(now_micros()) else {
+      return;
+    };
+    self.emit(Event::MailIncoming(thread));
+    self.mail_changed(&before);
+  }
+
+  /// Sends again what the app holds of the mailbox and a change touched: the lists, the unread count, the labels.
+  fn mail_changed(&self, before: &mail::Snapshot) {
+    let after = self.mail.snapshot();
+    for (mailbox, (threads, more)) in after.pages {
+      let same = before
+        .pages
+        .get(&mailbox)
+        .is_some_and(|(old, old_more)| *old == threads && *old_more == more);
+      if !same {
+        self.emit(Event::MailThreads {
+          mailbox,
+          threads: Arc::new(threads),
+          more,
+        });
+      }
+    }
+    if after.unread != before.unread
+      && let Some(unread) = after.unread
+    {
+      self.emit(Event::MailUnread(unread));
+    }
+    if after.labels != before.labels
+      && let Some(labels) = after.labels
+    {
+      self.emit(Event::MailLabels(Arc::new(labels)));
+    }
+  }
+
+  /// `Command::MarkMail` and `ArchiveMail`: the change, what it touched, then `MailWritten`.
+  fn write_mail(&mut self, write: impl FnOnce(&mut mail::DemoMail) -> bool) {
+    let before = self.mail.snapshot();
+    if write(&mut self.mail) {
+      self.mail_changed(&before);
+      self.emit(Event::MailWritten(Ok(())));
+    } else {
+      self.emit(Event::MailWritten(Err(MAIL_GONE.into())));
+    }
+  }
+
+  /// `Command::ReplyMail`: the reply, what it touched, the thread, then `MailWritten`. When the person it answers is
+  /// one of the workspace's, they answer back a little later, once per thread.
+  fn reply_mail(&mut self, reply: &MailReply) {
+    let before = self.mail.snapshot();
+    let Some((messages, answers)) = self.mail.reply(reply, now_micros()) else {
+      self.emit(Event::MailWritten(Err(MAIL_GONE.into())));
+      return;
+    };
+    self.mail_changed(&before);
+    self.emit(Event::MailMessages {
+      thread: reply.thread.clone(),
+      messages: Arc::new(messages),
+    });
+    self.emit(Event::MailWritten(Ok(())));
+    if let Some(from) = answers {
+      let thread = reply.thread.clone();
+      self.schedule(MAIL_ANSWERS, Action::MailAnswer { thread, from });
+    }
+  }
+
+  /// `Command::ComposeMail`: the new thread in the lists it belongs in, then `MailWritten`, or the error the real
+  /// client gives before sending when nobody, or no address, is named. When its first recipient is one of the
+  /// workspace's people, they answer back a little later, once.
+  fn compose_mail(&mut self, compose: &MailCompose) {
+    if let Err(error) = crate::mail::check_recipients(&compose.to, &compose.cc) {
+      self.emit(Event::MailWritten(Err(error.to_string())));
+      return;
+    }
+    let before = self.mail.snapshot();
+    let (thread, answers) = self.mail.compose(compose, now_micros());
+    self.mail_changed(&before);
+    self.emit(Event::MailWritten(Ok(())));
+    if let Some(from) = answers {
+      self.schedule(MAIL_ANSWERS, Action::MailAnswer { thread, from });
+    }
+  }
+
+  /// Someone's answer to the user's reply: a notification while the inbox is watched, then what it changed.
+  fn mail_answer(&mut self, thread: &str, from: &str) {
+    let before = self.mail.snapshot();
+    let Some(summary) = self.mail.answer(thread, from, now_micros()) else {
+      return;
+    };
+    if before.unread.is_some() {
+      self.emit(Event::MailIncoming(summary));
+    }
+    self.mail_changed(&before);
+  }
+
+  /// `Command::WatchEvents`: on schedules the one reminder the demo delivers, unless it came already; off cancels it.
+  fn watch_events(&mut self, on: bool) {
+    let scheduled = self.timeline.iter().any(|(_, action)| matches!(action, Action::Remind));
+    if on && !scheduled && !self.reminded {
+      self.schedule(REMINDER_COMES, Action::Remind);
+    } else if !on {
+      self.timeline.retain(|(_, action)| !matches!(action, Action::Remind));
+    }
+  }
+
+  /// The reminder for the meeting that starts soon after the demo does.
+  fn remind(&mut self) {
+    self.reminded = true;
+    if let Some(event) = self.calendar.event(calendar::SOON) {
+      self.emit(Event::EventReminder { event, minutes: calendar::SOON_MINUTES });
     }
   }
 
@@ -1005,8 +1191,10 @@ impl Demo {
 
 fn mcp_status(config: Option<&McpConfig>) -> McpStatus {
   match config {
-    None => McpStatus::Off,
-    Some(_) => McpStatus::Failed("Agents are off in demo mode.".into()),
+    Some(config) if config.chat || config.mail || config.calendar || config.meet => {
+      McpStatus::Failed("Agents are off in demo mode.".into())
+    },
+    _ => McpStatus::Off,
   }
 }
 

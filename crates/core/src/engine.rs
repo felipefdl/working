@@ -29,7 +29,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{Notify as Wake, Semaphore};
 
-use crate::cache::{Cache, HistoryCache, WorldCache};
+use crate::cache::{Cache, HistoryCache, MailCache, WorldCache};
 use crate::channel::{Channel, ChannelEvent};
 use crate::convert::{self, Users};
 use crate::http::{Http, SignedOut, request_header};
@@ -37,8 +37,9 @@ use crate::markup;
 use crate::mcp;
 use crate::model::{
   Attachment, AttachmentKind, CardAction, Command, Connection, DndFor, DndSchedule, DndSchedules, EditScope, Event,
-  EventDraft, Group, GroupId, GroupKind, McpConfig, McpStatus, Message, Micros, MyStatus, Notify, PersonStatus,
-  Placement, Presence, Quote, Reaction, ReadReceipt, Rsvp, SearchHit, Shortcut, Snippet, User,
+  EventDraft, Group, GroupId, GroupKind, MailAddress, MailCompose, MailLabel, MailMessage, MailReply, MailSignature,
+  MailThread, Mailbox, McpConfig, McpStatus, Message, Micros, MyStatus, Notify, PersonStatus, Placement, Presence,
+  Quote, Reaction, ReadReceipt, Rsvp, SearchHit, Shortcut, Snippet, User,
 };
 use crate::proto;
 
@@ -372,6 +373,16 @@ pub(crate) struct Engine {
   calendar: crate::calendar::Client,
   /// The range `Command::LoadEvents` last asked for, read again after a calendar write.
   calendar_range: Mutex<Option<(Micros, Micros)>>,
+  /// The event reminder watch while `Command::WatchEvents` has it on.
+  event_watch: Mutex<Option<tokio::task::AbortHandle>>,
+  /// Wakes the event watch to read the events again after a calendar write.
+  events_written: Wake,
+  /// Mail writes in the order their commands came, for `mail_writer`, which runs them one at a time.
+  mail_writes: tokio::sync::mpsc::UnboundedSender<MailJob>,
+  /// Gmail, read only, on the same session.
+  mail: crate::mail::Client,
+  /// The mail lists held and the inbox watch.
+  mail_held: Mutex<MailHeld>,
   /// Conversations waiting for `history_writer`, each as it was last changed.
   unsaved: Mutex<HashMap<GroupId, HistoryCache>>,
   /// Wakes `history_writer` when a history is queued.
@@ -431,6 +442,16 @@ async fn wait_for_session(
           Command::SetPresence(presence) => pending.presence = Some(presence),
           Command::CreateMeeting => {
             let _ = events.send(Event::MeetingCreated(Err("Sign in to start.".into())));
+          },
+          // Every mail command gets its answer, signed out too.
+          Command::LoadMail { .. } | Command::OpenMail(_) => {
+            let _ = events.send(Event::MailFailed("Sign in to start.".into()));
+          },
+          Command::MarkMail { .. }
+          | Command::ArchiveMail { .. }
+          | Command::ReplyMail { .. }
+          | Command::ComposeMail { .. } => {
+            let _ = events.send(Event::MailWritten(Err("Sign in to start.".into())));
           },
           _ => {},
         }
@@ -499,6 +520,7 @@ async fn run(
     groups: world.groups.into_iter().map(|group| (group.id.clone(), group)).collect(),
     ..Default::default()
   };
+  let (mail_writes, mail_jobs) = tokio::sync::mpsc::unbounded_channel();
   let engine = Arc::new(Engine {
     http,
     channel: Channel::new(),
@@ -510,6 +532,11 @@ async fn run(
     presence: Mutex::new(None),
     calendar: crate::calendar::Client::new(crate::config_dir().join("cookies.json")),
     calendar_range: Mutex::new(None),
+    event_watch: Mutex::new(None),
+    events_written: Wake::new(),
+    mail_writes,
+    mail: crate::mail::Client::new(crate::config_dir().join("cookies.json")),
+    mail_held: Mutex::new(MailHeld::default()),
     unsaved: Mutex::new(HashMap::new()),
     history_queued: Wake::new(),
     writing: tokio::sync::Mutex::new(()),
@@ -529,6 +556,7 @@ async fn run(
   tokio::spawn(engine.clone().statuses_loop());
   tokio::spawn(engine.clone().session_loop());
   tokio::spawn(engine.clone().history_writer());
+  tokio::spawn(engine.clone().mail_writer(mail_jobs));
   tokio::spawn({
     let engine = engine.clone();
     async move {
@@ -555,8 +583,10 @@ async fn run(
       },
     }
   }
-  // The app stopped the core or let go of it: what is still queued for the disk cache is written before the runtime
-  // stops.
+  // The app stopped the core or let go of it: the inbox watch stops, and what is still queued for the disk cache is
+  // written before the runtime stops.
+  engine.stop_mail_watch();
+  engine.watch_events(false);
   engine.write_histories().await;
 }
 
@@ -575,12 +605,22 @@ async fn serve_fetches(engine: Arc<Engine>, fetches: flume::Receiver<(String, Fe
         Ok(Arc::new(bytes))
       } else {
         let _permit = network.acquire().await;
-        match engine.http.get_bytes(&url).await {
+        // Gmail's attachments and the images inside emails open only with Gmail's own cookies.
+        let mail = crate::mail::is_mail_url(&url);
+        let downloaded = if mail {
+          engine.mail.fetch(&url).await
+        } else {
+          engine.http.get_bytes(&url).await
+        };
+        match downloaded {
           Ok(bytes) => {
             let bytes = Arc::new(bytes);
-            let cache = engine.cache.clone();
-            let stored = bytes.clone();
-            tokio::task::spawn_blocking(move || cache.save_image(&url, &stored));
+            // An attachment that is not a picture stays out of the image cache.
+            if !mail || crate::mail::looks_like_image(&bytes) {
+              let cache = engine.cache.clone();
+              let stored = bytes.clone();
+              tokio::task::spawn_blocking(move || cache.save_image(&url, &stored));
+            }
             Ok(bytes)
           },
           Err(error) => Err(error.to_string()),
@@ -1959,6 +1999,22 @@ impl Engine {
         }
         tokio::spawn(async move { engine.respond_event(calendar_id, event_id, scope, rsvp).await });
       },
+      Command::LoadMail { mailbox, more } => self.load_mail(mailbox, more),
+      Command::OpenMail(thread) => {
+        tokio::spawn(async move { engine.open_mail(thread).await });
+      },
+      Command::StopMail => {
+        self.stop_mail();
+        tokio::spawn(async move { engine.mail.close().await });
+      },
+      Command::WatchEvents(on) => self.watch_events(on),
+      Command::MarkMail { thread, read } => self.write_mail(MailChange::Mark { thread, read }),
+      Command::ArchiveMail { thread, archive } => self.write_mail(MailChange::Archive { thread, archive }),
+      Command::ReplyMail(reply) => self.write_mail(MailChange::Reply(reply)),
+      Command::ComposeMail(compose) => self.write_mail(MailChange::Compose {
+        compose,
+        thread: crate::mail::new_thread_id(),
+      }),
       Command::CreateChat { user_ids } => {
         if self.readonly {
           return self.emit(Event::Error("Read-only mode: the chat was not created.".into()));
@@ -2829,7 +2885,8 @@ impl Engine {
     if let Some(previous) = running.take() {
       previous.stop().await;
     }
-    let Some(config) = config else {
+    // Nothing to serve when every server is off: the port stays free.
+    let Some(config) = config.filter(|config| config.chat || config.mail || config.calendar || config.meet) else {
       return self.emit(Event::Mcp(McpStatus::Off));
     };
     let port = config.port;
@@ -3190,6 +3247,9 @@ impl Engine {
     let written = result.is_ok();
     self.emit(Event::CalendarWritten(result.map_err(|error| format!("{error:#}"))));
     let range = *self.calendar_range.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if written {
+      self.events_written.notify_one();
+    }
     if let Some((start, end)) = range.filter(|_| written) {
       self.load_events(start, end).await;
     }
@@ -3208,6 +3268,870 @@ impl Engine {
   async fn respond_event(&self, calendar_id: String, event_id: String, scope: EditScope, rsvp: Rsvp) {
     let result = self.calendar.respond(&calendar_id, &event_id, scope, rsvp).await;
     self.calendar_written(result).await;
+  }
+
+  /// `Command::WatchEvents`: on starts the reminder watch unless it runs; off stops it, and what it told is forgotten
+  /// with it.
+  fn watch_events(self: &Arc<Self>, on: bool) {
+    let mut watch = self.event_watch.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match (on, watch.take()) {
+      (true, Some(running)) => *watch = Some(running),
+      (true, None) => *watch = Some(tokio::spawn(self.clone().event_watch()).abort_handle()),
+      (false, Some(running)) => running.abort(),
+      (false, None) => {},
+    }
+  }
+
+  /// Reads the next `EVENT_WINDOW` of events every `EVENT_REFRESH` (and after each calendar write) and tells
+  /// `Event::EventReminder` when an event's notification time comes, each occurrence and start once.
+  async fn event_watch(self: Arc<Self>) {
+    let started = now_micros();
+    let mut sent = HashSet::new();
+    let mut events = Vec::new();
+    let mut read_at: Option<tokio::time::Instant> = None;
+    loop {
+      if read_at.is_none_or(|at| at.elapsed() >= EVENT_REFRESH) {
+        let now = now_micros();
+        match self.calendar.events(now, now.saturating_add(EVENT_WINDOW)).await {
+          Ok(list) => events = list,
+          Err(error) => tracing::warn!("the event reminders could not read the calendars: {error:#}"),
+        }
+        read_at = Some(tokio::time::Instant::now());
+      }
+      let defaults = self.calendar.default_reminders();
+      let now = now_micros();
+      for (event, minutes) in crate::calendar::due_reminders(&events, &defaults, &mut sent, started, now) {
+        self.emit(Event::EventReminder { event, minutes });
+      }
+      let refresh_in = EVENT_REFRESH.saturating_sub(read_at.map_or(Duration::ZERO, |at| at.elapsed()));
+      let wait = crate::calendar::next_reminder(&events, &defaults, &sent, started, now).map_or(refresh_in, |at| {
+        refresh_in.min(Duration::from_micros(u64::try_from(at.saturating_sub(now)).unwrap_or(0)))
+      });
+      tokio::select! {
+        () = tokio::time::sleep(wait) => {},
+        () = self.events_written.notified() => read_at = None,
+      }
+    }
+  }
+}
+
+/// How often the event reminder watch reads the events again.
+const EVENT_REFRESH: Duration = Duration::from_secs(300);
+/// How far ahead the event reminder watch reads.
+const EVENT_WINDOW: Micros = 24 * 3600 * 1_000_000;
+
+/// How often the watched inbox is read again.
+const MAIL_POLL: Duration = Duration::from_secs(60);
+/// Inbox threads the disk cache keeps: about the first page.
+const SAVED_MAIL: usize = 50;
+
+/// Gmail as the engine holds it.
+#[derive(Default)]
+struct MailHeld {
+  /// Bumped by `Command::StopMail`: an answer to a call made before it is dropped.
+  generation: u64,
+  /// Each mailbox's threads as last told.
+  lists: HashMap<Mailbox, MailList>,
+  /// The inbox watch while it runs.
+  watch: Option<tokio::task::AbortHandle>,
+  /// The cached inbox was shown since the start or the last `StopMail`.
+  cache_shown: bool,
+  /// Unread inbox threads as last told.
+  unread: Option<u32>,
+  /// The user's labels as last told.
+  labels: Option<Vec<MailLabel>>,
+  /// What counts as new mail.
+  arrivals: crate::mail::Arrivals,
+  /// The watch's last read failed: a failure is told once until a read works again.
+  watch_failed: bool,
+  /// The thread last opened, with its emails as last told, so a change shows in it at once.
+  open: Option<(String, Vec<MailMessage>)>,
+  /// The user's changes, laid over list answers that may predate them.
+  changes: crate::mail::Changes,
+  /// Threads the user archived, as they were in the inbox, to put back at once when they are moved back.
+  archived: HashMap<String, MailThread>,
+  /// The signatures last told with `Event::MailSignatures` (for new emails, for replies), once the inbox was read.
+  signatures: Option<(Option<MailSignature>, Option<MailSignature>)>,
+}
+
+/// A change to Gmail the user asked for.
+enum MailChange {
+  Mark {
+    thread: String,
+    read: bool,
+  },
+  Archive {
+    thread: String,
+    archive: bool,
+  },
+  Reply(Box<MailReply>),
+  /// A new email, in the thread `thread` the engine minted for it.
+  Compose {
+    compose: Box<MailCompose>,
+    thread: String,
+  },
+}
+
+/// One entry of the mail write queue: a change to write, or a command already refused (read-only, Mail off) whose
+/// answer keeps its place in line.
+enum MailJob {
+  Write {
+    change: MailChange,
+    /// `MailHeld::generation` when it was shown.
+    generation: u64,
+    undo: Box<MailUndo>,
+    /// An agent's write (MCP) is answered here, not with `Event::MailWritten`, which the app matches to its own
+    /// commands in order.
+    answer: Option<MailAnswer>,
+  },
+  Refused(&'static str),
+}
+
+/// Where an agent's mail write learns how it went.
+type MailAnswer = flume::Sender<Result<(), String>>;
+
+/// What a mail change altered at once, to put back when Gmail does not take it.
+#[derive(Default)]
+struct MailUndo {
+  /// Threads as they were, by mailbox.
+  threads: Vec<(Mailbox, MailThread)>,
+  /// A thread taken out of the inbox list, with its place there.
+  inbox_removed: Option<(usize, MailThread)>,
+  /// A thread put into the inbox list.
+  inbox_added: Option<String>,
+  /// The open thread's emails as they were.
+  open: Option<(String, Vec<MailMessage>)>,
+  unread: Option<u32>,
+  labels: Option<Vec<MailLabel>>,
+}
+
+/// What a mail write answers under `WORKING_READONLY=1`.
+const MAIL_READONLY: &str = "Working runs in read-only mode";
+/// What a mail write answers while Mail is off.
+const MAIL_OFF: &str = "Mail is turned off in Working.";
+/// How long after a reply its thread does not count as new mail (Gmail's clock may run ahead of this one).
+const OWN_REPLY_MARGIN: Micros = 60_000_000;
+
+/// Until when a thread the user just wrote into is theirs, not new mail.
+fn own_until() -> Micros {
+  now_micros().saturating_add(OWN_REPLY_MARGIN)
+}
+
+/// One more or one fewer unread thread on the label `id`.
+fn shift_label(labels: &mut Option<Vec<MailLabel>>, id: &str, more: bool) {
+  if let Some(label) = labels.iter_mut().flatten().find(|label| label.id == id) {
+    label.unread = if more {
+      label.unread.saturating_add(1)
+    } else {
+      label.unread.saturating_sub(1)
+    };
+  }
+}
+
+/// One mailbox's threads as held.
+#[derive(Default)]
+struct MailList {
+  /// Newest first.
+  threads: Vec<MailThread>,
+  /// Pages read: the index of the next older page.
+  pages: u32,
+  /// Gmail has older threads than these.
+  more: bool,
+  /// An older page is on its way.
+  loading_more: bool,
+}
+
+/// Who asked for a page of threads.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MailRead {
+  /// `Command::LoadMail`: always answered.
+  Asked,
+  /// The inbox watch: told only when something changed.
+  Watched,
+}
+
+impl MailList {
+  /// The page a `LoadMail` reads: the newest, or with `more` the next older one. `None` when it reads none and what
+  /// is held is its answer: nothing older is there, or the next page is already on its way. Every `LoadMail` gets
+  /// one answer, so a request is never left without one.
+  const fn next_read(&mut self, more: bool) -> Option<u32> {
+    if !more || self.pages == 0 {
+      return Some(0);
+    }
+    if self.loading_more || !self.more {
+      return None;
+    }
+    self.loading_more = true;
+    Some(self.pages)
+  }
+
+  /// Puts page `page` into the list. True when the threads or `more` changed.
+  fn take(&mut self, page: u32, threads: Vec<MailThread>, more: bool, read: MailRead) -> bool {
+    let before = (self.threads.len(), self.more);
+    let changed = if page == 0 {
+      let threads = match read {
+        MailRead::Asked => threads,
+        MailRead::Watched => crate::mail::merge_newest(&self.threads, threads, !more),
+      };
+      // Older pages held keep their own `more`, unless the newest page is the whole mailbox.
+      if read == MailRead::Asked || self.pages <= 1 || !more {
+        self.more = more;
+      }
+      self.pages = if read == MailRead::Asked {
+        1
+      } else {
+        self.pages.max(1)
+      };
+      let changed = threads != self.threads;
+      self.threads = threads;
+      changed
+    } else {
+      crate::mail::append_older(&mut self.threads, threads);
+      self.pages = page.saturating_add(1);
+      self.more = more;
+      self.loading_more = false;
+      self.threads.len() != before.0
+    };
+    changed || self.more != before.1
+  }
+}
+
+/// Gmail, read only: lists answer with `Event::MailThreads`, threads with `Event::MailMessages`, and every failure
+/// with `Event::MailFailed` (a signed-out Gmail too: Chat may still work).
+impl Engine {
+  fn mail_lock(&self) -> std::sync::MutexGuard<'_, MailHeld> {
+    self.mail_held.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+  }
+
+  fn load_mail(self: &Arc<Self>, mailbox: Mailbox, more: bool) {
+    let mut guard = self.mail_lock();
+    let held = &mut *guard;
+    let generation = held.generation;
+    let inbox = mailbox == Mailbox::Inbox;
+    if inbox && held.watch.is_none() {
+      held.watch = Some(tokio::spawn(self.clone().mail_watch(generation)).abort_handle());
+    }
+    let show_cache = inbox && !std::mem::replace(&mut held.cache_shown, true);
+    let list = held.lists.entry(mailbox.clone()).or_default();
+    let Some(page) = list.next_read(more) else {
+      self.emit(Event::MailThreads {
+        mailbox,
+        threads: Arc::new(list.threads.clone()),
+        more: list.more,
+      });
+      return;
+    };
+    drop(guard);
+    let engine = self.clone();
+    tokio::spawn(async move {
+      if show_cache {
+        engine.show_cached_mail(generation).await;
+      }
+      engine.read_mail_page(&mailbox, page, generation, MailRead::Asked).await;
+    });
+  }
+
+  /// Shows the inbox as last saved, unless Gmail answered first.
+  async fn show_cached_mail(&self, generation: u64) {
+    let cache = self.cache.clone();
+    let Some(cached) = tokio::task::spawn_blocking(move || cache.mail()).await.ok().flatten() else {
+      return;
+    };
+    let held = self.mail_lock();
+    let loaded = held.lists.get(&Mailbox::Inbox).is_some_and(|list| list.pages > 0);
+    if held.generation == generation && !loaded {
+      // Told under the lock, so Gmail's answer cannot overtake it.
+      self.emit(Event::MailThreads {
+        mailbox: Mailbox::Inbox,
+        threads: Arc::new(cached.threads),
+        more: cached.more,
+      });
+    }
+  }
+
+  /// Reads the inbox again every `MAIL_POLL` until `Command::StopMail` or the core stops.
+  async fn mail_watch(self: Arc<Self>, generation: u64) {
+    loop {
+      tokio::time::sleep(MAIL_POLL).await;
+      self.read_mail_page(&Mailbox::Inbox, 0, generation, MailRead::Watched).await;
+    }
+  }
+
+  /// Reads page `page` of a mailbox and takes it in, the user's changes Gmail may not have had yet laid over it.
+  async fn read_mail_page(&self, mailbox: &Mailbox, page: u32, generation: u64, read: MailRead) {
+    let requested = self.mail_lock().changes.request();
+    let result = self.mail.threads(mailbox, page).await;
+    let read_well = result.is_ok();
+    self.mail_read(mailbox, page, result, generation, read, requested);
+    if read_well && *mailbox == Mailbox::Inbox && page == 0 {
+      // The session that answered holds the page's settings, so this asks Gmail for nothing more.
+      if let Ok(signatures) = self.mail.signatures().await {
+        self.take_signatures(generation, signatures);
+      }
+    }
+  }
+
+  /// Tells the signatures after the first inbox answer, and again when a new session's page gave others.
+  fn take_signatures(&self, generation: u64, signatures: crate::mail::Signatures) {
+    let mut held = self.mail_lock();
+    let pair = (signatures.new, signatures.reply);
+    if held.generation != generation || held.signatures.as_ref() == Some(&pair) {
+      return;
+    }
+    self.emit(Event::MailSignatures {
+      new: pair.0.clone(),
+      reply: pair.1.clone(),
+    });
+    held.signatures = Some(pair);
+  }
+
+  /// Takes page `page` of a mailbox into what is held and tells the UI: the list, the unread count when it changed,
+  /// and new inbox mail. Events go out under the lock, so two answers are told in the order they were taken.
+  fn mail_read(
+    &self,
+    mailbox: &Mailbox,
+    page: u32,
+    result: Result<crate::mail::ThreadPage>,
+    generation: u64,
+    read: MailRead,
+    requested: u64,
+  ) {
+    let mut guard = self.mail_lock();
+    let held = &mut *guard;
+    if held.generation != generation {
+      return;
+    }
+    let mut fresh = match result {
+      Ok(fresh) => fresh,
+      Err(error) => return self.mail_failed(held, mailbox, page, read, &error),
+    };
+    if read == MailRead::Watched {
+      held.watch_failed = false;
+    }
+    held.changes.apply(&mut fresh, *mailbox == Mailbox::Inbox, requested);
+    let crate::mail::ThreadPage { threads, more, inbox_unread, labels } = fresh;
+    if let Some(labels) = labels {
+      self.take_mail_labels(held, labels);
+    }
+    let list = held.lists.entry(mailbox.clone()).or_default();
+    let changed = list.take(page, threads, more, read);
+    if read == MailRead::Asked || changed {
+      self.emit(Event::MailThreads {
+        mailbox: mailbox.clone(),
+        threads: Arc::new(list.threads.clone()),
+        more: list.more,
+      });
+    }
+    let inbox = *mailbox == Mailbox::Inbox;
+    if inbox && changed {
+      let saved = MailCache {
+        threads: list.threads.iter().take(SAVED_MAIL).cloned().collect(),
+        more: list.more || list.threads.len() > SAVED_MAIL,
+      };
+      let cache = self.cache.clone();
+      tokio::task::spawn_blocking(move || cache.save_mail(&saved));
+    }
+    if let Some(unread) = inbox_unread.filter(|unread| held.unread != Some(*unread)) {
+      held.unread = Some(unread);
+      self.emit(Event::MailUnread(unread));
+    }
+    if inbox && page == 0 {
+      for thread in held.arrivals.arrived(&list.threads, now_micros()) {
+        self.emit(Event::MailIncoming(thread));
+      }
+    }
+  }
+
+  /// Tells the labels when they or a count changed. Under the lock, as `mail_read`.
+  fn take_mail_labels(&self, held: &mut MailHeld, labels: Vec<MailLabel>) {
+    if held.labels.as_ref() == Some(&labels) {
+      return;
+    }
+    self.emit(Event::MailLabels(Arc::new(labels.clone())));
+    held.labels = Some(labels);
+  }
+
+  /// Tells of a failed read, once in a row for the watch, which also goes to the log.
+  fn mail_failed(&self, held: &mut MailHeld, mailbox: &Mailbox, page: u32, read: MailRead, error: &anyhow::Error) {
+    if let Some(list) = held.lists.get_mut(mailbox).filter(|_| page > 0) {
+      list.loading_more = false;
+    }
+    if read == MailRead::Watched {
+      tracing::warn!("Gmail: the inbox watch could not read the inbox: {error:#}");
+      if std::mem::replace(&mut held.watch_failed, true) {
+        return;
+      }
+    }
+    self.emit(Event::MailFailed(format!("{error:#}")));
+  }
+
+  async fn open_mail(&self, thread: String) {
+    let generation = self.mail_lock().generation;
+    let result = self.mail.messages(&thread).await;
+    let mut held = self.mail_lock();
+    if held.generation != generation {
+      return;
+    }
+    match result {
+      Ok(messages) => {
+        held.open = Some((thread.clone(), messages.clone()));
+        self.emit(Event::MailMessages { thread, messages: Arc::new(messages) });
+      },
+      Err(error) => self.emit(Event::MailFailed(format!("{error:#}"))),
+    }
+  }
+
+  /// `MarkMail`, `ArchiveMail`, `ReplyMail`, `ComposeMail`: shows the change at once and queues it for
+  /// `mail_writer`. A refusal is queued too, so every `MailWritten` comes in the order of its command.
+  fn write_mail(self: &Arc<Self>, change: MailChange) {
+    let job = self.mail_job(change, None).unwrap_or_else(MailJob::Refused);
+    let _ = self.mail_writes.send(job);
+  }
+
+  /// The queue entry of `change`, its change shown at once in what is held; the refusal while read-only or with Mail
+  /// off, before anything is shown.
+  fn mail_job(&self, change: MailChange, answer: Option<MailAnswer>) -> Result<MailJob, &'static str> {
+    if self.readonly {
+      return Err(MAIL_READONLY);
+    }
+    let mut guard = self.mail_lock();
+    let held = &mut *guard;
+    if held.watch.is_none() {
+      return Err(MAIL_OFF);
+    }
+    let undo = self.apply_mail_change(held, &change);
+    Ok(MailJob::Write {
+      change,
+      generation: held.generation,
+      undo: Box::new(undo),
+      answer,
+    })
+  }
+
+  /// An agent's write (MCP): the same queue, changes shown, and follow-up reads as the app's commands, answered
+  /// to the agent once Gmail took it or not, with a text safe to show. No `MailWritten` goes to the app for it.
+  async fn agent_mail_write(&self, change: MailChange) -> Result<(), String> {
+    let (answer, answered) = flume::bounded(1);
+    let job = self.mail_job(change, Some(answer))?;
+    self
+      .mail_writes
+      .send(job)
+      .map_err(|_| "Working is shutting down: nothing was changed.".to_string())?;
+    answered
+      .recv_async()
+      .await
+      .unwrap_or_else(|_| Err("Working stopped before Gmail answered.".into()))
+  }
+
+  /// An agent's new email. Answers the new thread's id.
+  pub(crate) async fn agent_compose(&self, compose: MailCompose) -> Result<String, String> {
+    let thread = crate::mail::new_thread_id();
+    self
+      .agent_mail_write(MailChange::Compose {
+        compose: Box::new(compose),
+        thread: thread.clone(),
+      })
+      .await?;
+    Ok(thread)
+  }
+
+  /// An agent's reply, its recipients already chosen.
+  pub(crate) async fn agent_reply(&self, reply: MailReply) -> Result<(), String> {
+    self.agent_mail_write(MailChange::Reply(Box::new(reply))).await
+  }
+
+  /// An agent archives a thread, or moves it back to the inbox.
+  pub(crate) async fn agent_archive(&self, thread: String, archive: bool) -> Result<(), String> {
+    self.agent_mail_write(MailChange::Archive { thread, archive }).await
+  }
+
+  /// An agent marks a thread read or unread.
+  pub(crate) async fn agent_mark(&self, thread: String, read: bool) -> Result<(), String> {
+    self.agent_mail_write(MailChange::Mark { thread, read }).await
+  }
+
+  /// The address mail goes from, as the Gmail page said. Callers check `mail_on` first.
+  pub(crate) async fn mail_me(&self) -> Result<Option<MailAddress>> {
+    self.mail.me().await
+  }
+
+  /// Runs the mail writes one at a time, in the order they came: each writes to Gmail, answers `MailWritten` (or the
+  /// agent that asked) and does its follow-up reads before the next starts, so an answer is never taken for another
+  /// write's. A change Gmail does not take is put back and shown again.
+  async fn mail_writer(self: Arc<Self>, mut jobs: tokio::sync::mpsc::UnboundedReceiver<MailJob>) {
+    while let Some(job) = jobs.recv().await {
+      match job {
+        MailJob::Refused(reason) => self.emit(Event::MailWritten(Err(reason.into()))),
+        MailJob::Write { change, generation, undo, answer } => {
+          self.run_mail_write(change, generation, *undo, answer).await;
+        },
+      }
+    }
+  }
+
+  /// Tells how a write went: to the agent that asked, else to the app.
+  fn mail_written(&self, answer: Option<MailAnswer>, result: Result<(), String>) {
+    match answer {
+      Some(answer) => {
+        let _ = answer.send(result);
+      },
+      None => self.emit(Event::MailWritten(result)),
+    }
+  }
+
+  async fn run_mail_write(&self, change: MailChange, generation: u64, undo: MailUndo, answer: Option<MailAnswer>) {
+    let mut to_me = false;
+    let result = match &change {
+      MailChange::Mark { thread, read } => self.mail.mark(thread, *read).await,
+      MailChange::Archive { thread, archive } => self.mail.archive(thread, *archive).await,
+      MailChange::Reply(reply) => self.mail.reply(reply).await,
+      MailChange::Compose { compose, thread } => self.mail.compose(compose, thread).await.map(|mine| to_me = mine),
+    };
+    let thread = match &change {
+      MailChange::Mark { thread, .. } | MailChange::Archive { thread, .. } | MailChange::Compose { thread, .. } => {
+        thread.clone()
+      },
+      MailChange::Reply(reply) => reply.thread.clone(),
+    };
+    match result {
+      Ok(()) => {
+        self.mail_lock().changes.written(&thread);
+        self.mail_written(answer, Ok(()));
+        match change {
+          MailChange::Reply(_) => self.open_mail(thread).await,
+          // A thread moved back that the engine did not hold shows once the inbox is read again, now.
+          MailChange::Archive { archive: false, .. } if undo.inbox_added.is_none() => {
+            self.read_mail_page(&Mailbox::Inbox, 0, generation, MailRead::Watched).await;
+          },
+          MailChange::Compose { .. } => self.show_composed(generation, to_me).await,
+          _ => {},
+        }
+      },
+      Err(error) => {
+        tracing::warn!("Gmail: a change was not written: {error:#}");
+        self.mail_lock().changes.forget(&thread);
+        self.undo_mail_change(generation, undo);
+        self.mail_written(answer, Err(format!("{error:#}")));
+      },
+    }
+  }
+
+  /// A new email went: the held lists it belongs in are read again, so it shows in them (Sent and All Mail, and the
+  /// inbox when the user is a recipient). Lists never asked for stay unread.
+  async fn show_composed(&self, generation: u64, to_me: bool) {
+    let held: Vec<Mailbox> = {
+      let held = self.mail_lock();
+      [Mailbox::Sent, Mailbox::All, Mailbox::Inbox]
+        .into_iter()
+        .filter(|mailbox| to_me || *mailbox != Mailbox::Inbox)
+        .filter(|mailbox| held.lists.get(mailbox).is_some_and(|list| list.pages > 0))
+        .collect()
+    };
+    for mailbox in held {
+      self.read_mail_page(&mailbox, 0, generation, MailRead::Watched).await;
+    }
+  }
+
+  /// Shows `change` in what is held and answers how to put it back. Under the mail lock.
+  fn apply_mail_change(&self, held: &mut MailHeld, change: &MailChange) -> MailUndo {
+    let mut undo = MailUndo {
+      unread: held.unread,
+      labels: held.labels.clone(),
+      ..MailUndo::default()
+    };
+    match change {
+      MailChange::Mark { thread, read } => {
+        held.changes.note(thread, Some(!read), None);
+        self.mark_held(held, &mut undo, thread, *read);
+      },
+      MailChange::Archive { thread, archive } => {
+        held.changes.note(thread, None, Some(!archive));
+        self.archive_held(held, &mut undo, thread, *archive);
+      },
+      // A reply or a new email shows once Gmail has it; its thread must not come back as new mail.
+      MailChange::Reply(reply) => held.arrivals.note_own(&reply.thread, own_until()),
+      MailChange::Compose { thread, .. } => held.arrivals.note_own(thread, own_until()),
+    }
+    undo
+  }
+
+  fn mark_held(&self, held: &mut MailHeld, undo: &mut MailUndo, thread_id: &str, read: bool) {
+    let unread = !read;
+    let mut inbox_changed = false;
+    for (mailbox, list) in &mut held.lists {
+      let Some(thread) = list
+        .threads
+        .iter_mut()
+        .find(|thread| thread.id == thread_id && thread.unread != unread)
+      else {
+        continue;
+      };
+      undo.threads.push((mailbox.clone(), thread.clone()));
+      thread.unread = unread;
+      match mailbox {
+        Mailbox::Inbox => inbox_changed = true,
+        Mailbox::Label(id) => shift_label(&mut held.labels, id, unread),
+        _ => {},
+      }
+      self.emit_mail_list(mailbox, list);
+    }
+    if inbox_changed {
+      self.shift_unread(held, unread);
+    }
+    if held.labels != undo.labels
+      && let Some(labels) = &held.labels
+    {
+      self.emit(Event::MailLabels(Arc::new(labels.clone())));
+    }
+    if let Some((open, messages)) = held.open.as_mut().filter(|(open, _)| open == thread_id) {
+      undo.open = Some((open.clone(), messages.clone()));
+      if read {
+        for message in messages.iter_mut() {
+          message.unread = false;
+        }
+      } else if let Some(newest) = messages.last_mut() {
+        newest.unread = true;
+      }
+      self.emit(Event::MailMessages {
+        thread: open.clone(),
+        messages: Arc::new(messages.clone()),
+      });
+    }
+  }
+
+  fn archive_held(&self, held: &mut MailHeld, undo: &mut MailUndo, thread_id: &str, archive: bool) {
+    let known = held
+      .lists
+      .values()
+      .flat_map(|list| &list.threads)
+      .find(|thread| thread.id == thread_id)
+      .cloned();
+    let kept = held.archived.remove(thread_id);
+    let Some(inbox) = held.lists.get_mut(&Mailbox::Inbox) else {
+      return;
+    };
+    let place = inbox.threads.iter().position(|thread| thread.id == thread_id);
+    let unread = match (archive, place, kept.or(known)) {
+      (true, Some(place), _) => {
+        let thread = inbox.threads.remove(place);
+        let unread = thread.unread;
+        held.archived.insert(thread_id.to_string(), thread.clone());
+        undo.inbox_removed = Some((place, thread));
+        unread
+      },
+      (false, None, Some(thread)) => {
+        let newer = inbox.threads.iter().take_while(|other| other.time >= thread.time).count();
+        let unread = thread.unread;
+        inbox.threads.insert(newer, thread);
+        undo.inbox_added = Some(thread_id.to_string());
+        unread
+      },
+      _ => return,
+    };
+    self.emit_mail_list(&Mailbox::Inbox, inbox);
+    if unread {
+      self.shift_unread(held, !archive);
+    }
+  }
+
+  /// One more or one fewer unread inbox thread, told.
+  fn shift_unread(&self, held: &mut MailHeld, more: bool) {
+    if let Some(count) = held.unread.as_mut() {
+      *count = if more {
+        count.saturating_add(1)
+      } else {
+        count.saturating_sub(1)
+      };
+      self.emit(Event::MailUnread(*count));
+    }
+  }
+
+  fn emit_mail_list(&self, mailbox: &Mailbox, list: &MailList) {
+    self.emit(Event::MailThreads {
+      mailbox: mailbox.clone(),
+      threads: Arc::new(list.threads.clone()),
+      more: list.more,
+    });
+  }
+
+  /// Puts back what a change Gmail did not take altered, and tells it again.
+  fn undo_mail_change(&self, generation: u64, undo: MailUndo) {
+    let mut guard = self.mail_lock();
+    let held = &mut *guard;
+    if held.generation != generation {
+      return;
+    }
+    let mut touched: Vec<Mailbox> = Vec::new();
+    for (mailbox, old) in undo.threads {
+      if let Some(thread) = held
+        .lists
+        .get_mut(&mailbox)
+        .and_then(|list| list.threads.iter_mut().find(|thread| thread.id == old.id))
+      {
+        *thread = old;
+        touched.push(mailbox);
+      }
+    }
+    if let Some(inbox) = held.lists.get_mut(&Mailbox::Inbox) {
+      let before = inbox.threads.len();
+      if let Some((place, thread)) = undo.inbox_removed
+        && !inbox.threads.iter().any(|other| other.id == thread.id)
+      {
+        inbox.threads.insert(place.min(inbox.threads.len()), thread);
+      }
+      if let Some(id) = undo.inbox_added {
+        inbox.threads.retain(|thread| thread.id != id);
+      }
+      if inbox.threads.len() != before && !touched.contains(&Mailbox::Inbox) {
+        touched.push(Mailbox::Inbox);
+      }
+    }
+    for mailbox in touched {
+      if let Some(list) = held.lists.get(&mailbox) {
+        self.emit_mail_list(&mailbox, list);
+      }
+    }
+    if let Some((thread, messages)) = undo.open
+      && held.open.as_ref().is_some_and(|(open, _)| *open == thread)
+    {
+      self.emit(Event::MailMessages {
+        thread: thread.clone(),
+        messages: Arc::new(messages.clone()),
+      });
+      held.open = Some((thread, messages));
+    }
+    if held.unread != undo.unread {
+      held.unread = undo.unread;
+      if let Some(count) = held.unread {
+        self.emit(Event::MailUnread(count));
+      }
+    }
+    if held.labels != undo.labels {
+      held.labels = undo.labels;
+      if let Some(labels) = &held.labels {
+        self.emit(Event::MailLabels(Arc::new(labels.clone())));
+      }
+    }
+  }
+
+  /// `Command::StopMail`: the watch stops and the mail held is forgotten; the disk cache stays.
+  fn stop_mail(&self) {
+    let mut held = self.mail_lock();
+    if let Some(watch) = held.watch.take() {
+      watch.abort();
+    }
+    *held = MailHeld {
+      generation: held.generation.wrapping_add(1),
+      ..MailHeld::default()
+    };
+  }
+
+  fn stop_mail_watch(&self) {
+    let watch = self.mail_lock().watch.take();
+    if let Some(watch) = watch {
+      watch.abort();
+    }
+  }
+
+  /// Mail is on in the app: an inbox `LoadMail` started the watch and no `StopMail` came since. Agents read Gmail
+  /// only then.
+  pub(crate) fn mail_on(&self) -> bool {
+    self.mail_lock().watch.is_some()
+  }
+
+  /// Page `page` of a mailbox read now, for agents, leaving what the app holds alone. Callers check `mail_on`
+  /// first.
+  pub(crate) async fn mail_threads(&self, mailbox: &Mailbox, page: u32) -> Result<crate::mail::ThreadPage> {
+    self.mail.threads(mailbox, page).await
+  }
+
+  /// A thread's emails read now, for agents. Leaves them unread. Callers check `mail_on` first.
+  pub(crate) async fn mail_messages(&self, thread: &str) -> Result<Vec<crate::model::MailMessage>> {
+    self.mail.messages(thread).await
+  }
+
+  /// The user's labels for agents: as last told, or read now from the inbox's first page when none were. Callers
+  /// check `mail_on` first.
+  pub(crate) async fn mail_labels(&self) -> Result<Vec<MailLabel>> {
+    let held = self.mail_lock().labels.clone();
+    if let Some(labels) = held {
+      return Ok(labels);
+    }
+    Ok(self.mail.threads(&Mailbox::Inbox, 0).await?.labels.unwrap_or_default())
+  }
+}
+
+/// Google Calendar and Meet for agents: reads straight from Google, writes that leave the app's calendar range and the
+/// reminder watch up to date.
+impl Engine {
+  /// `WORKING_READONLY=1`: agents' changes are refused.
+  pub(crate) const fn readonly(&self) -> bool {
+    self.readonly
+  }
+
+  /// The user's calendars, as `Client::calendars` orders them.
+  pub(crate) async fn calendar_list(&self) -> Result<Vec<crate::model::Calendar>> {
+    self.calendar.calendars().await
+  }
+
+  /// Every calendar's events that overlap `start..end`, by start.
+  pub(crate) async fn calendar_events(&self, start: Micros, end: Micros) -> Result<Vec<crate::model::CalendarEvent>> {
+    self.calendar.events(start, end).await
+  }
+
+  /// One event by its calendar and id.
+  pub(crate) async fn calendar_event(&self, calendar_id: &str, event_id: &str) -> Result<crate::model::CalendarEvent> {
+    self.calendar.event(calendar_id, event_id).await
+  }
+
+  /// Creates or changes an event for an agent.
+  pub(crate) async fn calendar_save(&self, draft: &EventDraft) -> Result<()> {
+    let result = self.calendar.save(draft).await;
+    self.calendar_changed(result.is_ok()).await;
+    result
+  }
+
+  /// Deletes an event (or its series with `EditScope::All`) for an agent.
+  pub(crate) async fn calendar_delete(
+    &self,
+    calendar_id: &str,
+    event_id: &str,
+    scope: EditScope,
+    notify: bool,
+  ) -> Result<()> {
+    let result = self.calendar.delete(calendar_id, event_id, scope, notify).await;
+    self.calendar_changed(result.is_ok()).await;
+    result
+  }
+
+  /// Answers an invitation for an agent.
+  pub(crate) async fn calendar_respond(
+    &self,
+    calendar_id: &str,
+    event_id: &str,
+    scope: EditScope,
+    rsvp: Rsvp,
+  ) -> Result<()> {
+    let result = self.calendar.respond(calendar_id, event_id, scope, rsvp).await;
+    self.calendar_changed(result.is_ok()).await;
+    result
+  }
+
+  /// After an agent's change: the reminder watch and the range the app shows read the events again.
+  async fn calendar_changed(&self, changed: bool) {
+    if !changed {
+      return;
+    }
+    self.events_written.notify_one();
+    let range = *self.calendar_range.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((start, end)) = range {
+      self.load_events(start, end).await;
+    }
+  }
+
+  /// A new Meet meeting of its own for an agent, as `Command::CreateMeeting` makes one: its link, or a short reason.
+  pub(crate) async fn create_meeting_link(&self) -> Result<String, String> {
+    self.request_meeting().await.map_err(|error| self.meeting_failure(&error))
   }
 }
 
@@ -3772,7 +4696,7 @@ fn delete_arguments(group: &GroupId) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
   use super::{
-    Receipts, block_arguments, click_card_request, delete_arguments, file_name, meeting_link, page_group_id,
+    MailList, Receipts, block_arguments, click_card_request, delete_arguments, file_name, meeting_link, page_group_id,
     people_list, starred_hit,
   };
   use crate::convert::Users;
@@ -3780,6 +4704,27 @@ mod tests {
   use crate::model::{CardAction, User};
   use crate::proto;
   use std::path::Path;
+
+  /// Every `LoadMail` reads a page or is answered at once with what is held, a second `more` while one is on its way
+  /// too (it used to get no answer at all).
+  #[test]
+  fn every_load_of_a_list_reads_a_page_or_answers_what_is_held() {
+    let mut list = MailList::default();
+    assert_eq!(list.next_read(true), Some(0), "nothing held: the newest page");
+    list.pages = 1;
+    list.more = true;
+    assert_eq!(list.next_read(false), Some(0));
+    assert_eq!(list.next_read(true), Some(1));
+    assert!(list.loading_more);
+    assert_eq!(
+      list.next_read(true),
+      None,
+      "the next page is on its way: answered with what is held"
+    );
+    list.loading_more = false;
+    list.more = false;
+    assert_eq!(list.next_read(true), None, "nothing older: answered with what is held");
+  }
 
   /// The id triple the web app's pin and hide page RPCs carry, captured with the ids replaced.
   #[test]
