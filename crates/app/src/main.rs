@@ -172,7 +172,7 @@ fn main() {
     .with_env_filter(filter)
     .with_writer(std::io::stderr)
     .try_init();
-  let _ = std::fs::remove_dir_all(conversation::pasted_dir());
+  let _ = std::fs::remove_dir_all(gchat_core::scratch_dir());
   clock::warm();
   let core = Core::start();
   // The webviews (sign-in and Meet) are WebKitGTK, which runs on X11 only: a Wayland session runs the app through

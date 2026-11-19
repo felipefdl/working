@@ -2340,9 +2340,10 @@ fn is_image(path: &Path) -> bool {
   matches!(extension.as_deref(), Some("png" | "jpg" | "jpeg" | "gif" | "webp"))
 }
 
-/// Where pictures pasted from the clipboard are kept until they are sent. Emptied when the app starts.
-pub fn pasted_dir() -> PathBuf {
-  std::env::temp_dir().join("working-pasted")
+/// Where pictures pasted from the clipboard are kept until they are sent: in the scratch folder, which is emptied
+/// when the app starts.
+fn pasted_dir() -> PathBuf {
+  gchat_core::scratch_dir().join("pasted")
 }
 
 /// Writes a picture from the clipboard to a file, so it attaches like any other. Formats Google Chat does not
@@ -2362,13 +2363,11 @@ fn save_pasted(picture: &Image) -> Option<PathBuf> {
       (png.into_inner(), "png")
     },
   };
-  let dir = pasted_dir();
-  std::fs::create_dir_all(&dir).ok()?;
-  let path = dir.join(format!(
+  let path = pasted_dir().join(format!(
     "Pasted image {}.{extension}",
     chrono::Local::now().format("%Y-%m-%d at %H.%M.%S%.3f")
   ));
-  std::fs::write(&path, bytes).ok()?;
+  gchat_core::write_private(&path, &bytes).ok()?;
   Some(path)
 }
 

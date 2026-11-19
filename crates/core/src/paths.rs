@@ -1,7 +1,7 @@
 //! Where the app keeps its files on each OS: one place, which the app reuses.
 
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 /// Directory holding `cookies.json`, `settings.json`, and `mcp-token`: `~/.config/working` on macOS,
@@ -29,6 +29,18 @@ pub fn cache_dir() -> PathBuf {
   #[cfg(target_os = "windows")]
   let (base, dir) = (local_dir(), "cache");
   base.join(dir)
+}
+
+/// Where the app keeps a file for a short while: `scratch` under `cache_dir()`.
+///
+/// An attachment open in the viewer and a picture pasted and not yet sent wait there, in the user's own folders
+/// rather than the temp dir, which on Linux every user of the machine shares. The app empties it when it starts.
+/// In demo mode it is under the demo's own config directory, as the demo has no disk cache.
+pub fn scratch_dir() -> PathBuf {
+  if crate::demo_mode() {
+    return config_dir().join("scratch");
+  }
+  cache_dir().join("scratch")
 }
 
 /// The app's machine-local data on Windows, `%LOCALAPPDATA%\dev.felipefdl.working`: apart from the per-user install
@@ -77,6 +89,28 @@ pub(crate) fn create_private(path: &Path) -> io::Result<File> {
   Ok(file)
 }
 
+/// Writes `bytes` to `path` for the user alone: the file as `create_private` makes it, in a folder (made when
+/// missing) that only the user opens where the OS has file modes (0700 on macOS and Linux).
+pub fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+  if let Some(dir) = path.parent() {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::DirBuilderExt;
+      builder.mode(0o700);
+    }
+    builder.create(dir)?;
+    // `mode` only applies to a folder this call creates.
+    #[cfg(unix)]
+    {
+      use std::os::unix::fs::PermissionsExt;
+      std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+  }
+  create_private(path)?.write_all(bytes)
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -112,5 +146,21 @@ mod tests {
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     std::fs::remove_file(&path).unwrap();
     assert_eq!(mode, 0o600);
+  }
+
+  #[cfg(unix)]
+  #[test]
+  fn private_writes_close_the_folder_and_the_file() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let dir = std::env::temp_dir().join(format!("working-private-dir-{}", std::process::id()));
+    // A folder that was open to others is closed too.
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = dir.join("file");
+    write_private(&path, b"text").unwrap();
+    let found = (mode(&dir), mode(&path), std::fs::read(&path).unwrap());
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(found, (0o700, 0o600, b"text".to_vec()));
   }
 }

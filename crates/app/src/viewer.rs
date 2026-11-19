@@ -1,5 +1,5 @@
 //! In-app media viewer: a full-window modal for images (zoom, pan, context menu) and for files, which are
-//! downloaded to the temp dir and shown in an embedded web view (video, audio, PDF, text) or as an info card.
+//! downloaded to the scratch folder and shown in an embedded web view (video, audio, PDF, text) or as an info card.
 
 use std::borrow::Cow;
 use std::collections::hash_map::DefaultHasher;
@@ -261,11 +261,9 @@ fn temp_file(att: &Attachment, bytes: &[u8]) -> std::io::Result<PathBuf> {
       }
     })
     .collect();
-  let dir = std::env::temp_dir().join("working-media");
-  std::fs::create_dir_all(&dir)?;
-  let path = dir.join(format!("{:016x}-{name}", hasher.finish()));
+  let path = gchat_core::scratch_dir().join(format!("{:016x}-{name}", hasher.finish()));
   if std::fs::metadata(&path).ok().map(|meta| meta.len()) != Some(bytes.len() as u64) {
-    std::fs::write(&path, bytes)?;
+    gchat_core::write_private(&path, bytes)?;
   }
   Ok(path)
 }

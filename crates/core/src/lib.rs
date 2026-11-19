@@ -28,7 +28,7 @@ pub use engine::device_time_zone;
 pub use http::SessionCookie;
 pub use mail::reply_recipients;
 pub use model::*;
-pub use paths::{cache_dir, config_dir};
+pub use paths::{cache_dir, config_dir, scratch_dir, write_private};
 #[cfg(target_os = "windows")]
 pub use paths::{updates_dir, webview_dir};
 
