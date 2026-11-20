@@ -35,8 +35,10 @@ fn main() {
   // `WORKING_MCP_PORT=<port>` also serves every MCP server for the run, at `/mcp/chat`, `/mcp/mail`, `/mcp/calendar`,
   // and `/mcp/meet` (sending, mail changes, and calendar changes are offered, and still refused under
   // `WORKING_READONLY=1`).
+  let mut mcp: Option<(u16, String)> = None;
   if let Some(port) = std::env::var("WORKING_MCP_PORT").ok().and_then(|port| port.parse().ok()) {
     let token = gchat_core::mcp::token().expect("the MCP token can be stored");
+    mcp = Some((port, token.clone()));
     core.send(Command::SetMcp(Some(gchat_core::McpConfig {
       port,
       token,
@@ -84,7 +86,12 @@ fn main() {
   let mut mail_opened = false;
   let mut label_listed = false;
   // `WORKING_PROBE_MAIL_WRITE=1` (without `WORKING_READONLY`): on the test thread only, found by its exact subject,
-  // mark unread, mark read, archive, and move back to the inbox. Prints step names and results only.
+  // mark unread, mark read, archive, and move back to the inbox. With `WORKING_MCP_PORT` too, then through the mail
+  // MCP server's tools: star and unstar the test thread, save a reply draft in it and send it (only when it goes to
+  // the signed-in address alone), and save a new email to the signed-in address as a draft and send it (subject
+  // `MCP_SUBJECT`). Prints step names and results only.
+  const MCP_SUBJECT: &str = "Working MCP mail check";
+  let mut me_email = String::new();
   const WRITE_SUBJECT: &str = "Working write capture";
   let mail_write = std::env::var("WORKING_PROBE_MAIL_WRITE").is_ok_and(|value| value == "1");
   let mut write_searched = false;
@@ -108,6 +115,7 @@ fn main() {
     match event {
       Event::Me(me) => {
         println!("[{at}ms] me: name={} avatar={}", !me.name.is_empty(), me.avatar_url.is_some());
+        me_email.clone_from(&me.email);
         if !me.id.is_empty() {
           for shortcut in [gchat_core::Shortcut::Mentions, gchat_core::Shortcut::Starred] {
             core.send(Command::LoadShortcut { shortcut, cursor: None });
@@ -437,10 +445,15 @@ fn main() {
           core.send(write_steps[write_done].1(thread));
         } else {
           write_thread = None;
+          if result.is_ok()
+            && let Some((port, token)) = &mcp
+          {
+            mcp_mail_checks(*port, token, &thread, &me_email, MCP_SUBJECT);
+          }
         }
       },
       Event::MailMessages { messages, .. } => println!(
-        "[{at}ms] mail messages: {}, html bytes {}, text bytes {}, {} recipients, {} files, {} unread",
+        "[{at}ms] mail messages: {}, html bytes {}, text bytes {}, {} recipients, {} files, {} unread, {} drafts",
         messages.len(),
         messages.iter().map(|message| message.html.len()).sum::<usize>(),
         messages.iter().map(|message| message.text.len()).sum::<usize>(),
@@ -450,6 +463,7 @@ fn main() {
           .sum::<usize>(),
         messages.iter().map(|message| message.attachments.len()).sum::<usize>(),
         messages.iter().filter(|message| message.unread).count(),
+        messages.iter().filter(|message| message.draft).count(),
       ),
       Event::MailUnread(count) => println!("[{at}ms] mail unread: {count}"),
       Event::MailIncoming(_) => println!("[{at}ms] mail incoming"),
@@ -507,4 +521,99 @@ fn main() {
     read_times.len(),
     read_times.values().map(Vec::len).sum::<usize>()
   );
+}
+
+/// The mail MCP server's write tools on the test thread `thread` and the signed-in address `me`: star, unstar, a reply
+/// draft sent, and a new email's draft sent. Prints each step's name and whether it worked, never an answer's text.
+fn mcp_mail_checks(port: u16, token: &str, thread: &str, me: &str, subject: &str) {
+  if me.is_empty() {
+    println!("mail mcp: the signed-in address is not known, skipped");
+    return;
+  }
+  let step = |name: &str, tool: &str, arguments: serde_json::Value| {
+    let (ok, text) = call_mail_tool(port, token, tool, &arguments);
+    println!("mail mcp: {name}: {}", if ok { "ok" } else { "failed" });
+    ok.then_some(text)
+  };
+  step("star", "mail_star", serde_json::json!({ "thread": thread, "starred": true }));
+  step("unstar", "mail_star", serde_json::json!({ "thread": thread, "starred": false }));
+  let reply = step(
+    "reply draft",
+    "mail_draft",
+    serde_json::json!({ "thread": thread, "text": "Working MCP mail check: a reply saved as a draft, then sent." }),
+  );
+  match reply {
+    Some(text) if !only_to(&text, me) => println!("mail mcp: the reply draft goes to others: left unsent in Drafts"),
+    Some(text) => {
+      if let Some(id) = draft_id(&text) {
+        step("reply draft sent", "mail_send_draft", serde_json::json!({ "draft": id }));
+      }
+    },
+    None => {},
+  }
+  let new = step(
+    "new email draft",
+    "mail_draft",
+    serde_json::json!({ "to": me, "subject": subject, "text": "A new email saved as a draft, then sent." }),
+  );
+  if let Some(id) = new.as_deref().and_then(draft_id) {
+    step("new email draft sent", "mail_send_draft", serde_json::json!({ "draft": id }));
+  }
+}
+
+/// The draft id in `mail_draft`'s answer (its `Draft: ` line).
+fn draft_id(text: &str) -> Option<String> {
+  text
+    .lines()
+    .find_map(|line| line.strip_prefix("Draft: "))
+    .map(|id| id.trim().to_string())
+}
+
+/// Every address in `mail_draft`'s `To:` and `Cc:` lines is `me`, and there is one.
+fn only_to(text: &str, me: &str) -> bool {
+  let me = me.to_lowercase();
+  let lines: Vec<String> = text
+    .lines()
+    .filter(|line| line.starts_with("To: ") || line.starts_with("Cc: "))
+    .map(str::to_lowercase)
+    .collect();
+  !lines.is_empty()
+    && lines
+      .iter()
+      .all(|line| line.matches('@').count() == line.matches(me.as_str()).count())
+}
+
+/// One `tools/call` on the probe's own mail MCP server (revision 2025-11-25, which needs no handshake), over plain
+/// HTTP/1.1 on loopback: whether it worked, and its answer's text.
+fn call_mail_tool(port: u16, token: &str, name: &str, arguments: &serde_json::Value) -> (bool, String) {
+  use std::io::{Read, Write};
+  let body = serde_json::json!({
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": { "name": name, "arguments": arguments }
+  })
+  .to_string();
+  let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) else {
+    return (false, String::new());
+  };
+  let _ = stream.set_read_timeout(Some(Duration::from_secs(90)));
+  let request = format!(
+    "POST /mcp/mail HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: \
+     application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+    body.len()
+  );
+  if stream.write_all(request.as_bytes()).is_err() {
+    return (false, String::new());
+  }
+  let mut answer = String::new();
+  let _ = stream.read_to_string(&mut answer);
+  let message = answer
+    .split_once("\r\n\r\n")
+    .and_then(|(_, body)| serde_json::from_str::<serde_json::Value>(body).ok());
+  let Some(result) = message.as_ref().map(|message| &message["result"]) else {
+    return (false, String::new());
+  };
+  let text = result["content"][0]["text"].as_str().unwrap_or_default().to_string();
+  (result["isError"] == false, text)
 }

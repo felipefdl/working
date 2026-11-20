@@ -37,9 +37,9 @@ use crate::markup;
 use crate::mcp;
 use crate::model::{
   Attachment, AttachmentKind, CardAction, Command, Connection, DndFor, DndSchedule, DndSchedules, EditScope, Event,
-  EventDraft, Group, GroupId, GroupKind, MailAddress, MailCompose, MailLabel, MailMessage, MailReply, MailSignature,
-  MailThread, Mailbox, McpConfig, McpStatus, Message, Micros, MyStatus, Notify, PersonStatus, Placement, Presence,
-  Quote, Reaction, ReadReceipt, Rsvp, SearchHit, Shortcut, Snippet, User,
+  EventDraft, Group, GroupId, GroupKind, MailAddress, MailCompose, MailDraft, MailDraftSent, MailForward, MailLabel,
+  MailMessage, MailReply, MailSignature, MailThread, Mailbox, McpConfig, McpStatus, Message, Micros, MyStatus, Notify,
+  PersonStatus, Placement, Presence, Quote, Reaction, ReadReceipt, Rsvp, SearchHit, Shortcut, Snippet, User,
 };
 use crate::proto;
 
@@ -3352,6 +3352,9 @@ struct MailHeld {
   archived: HashMap<String, MailThread>,
   /// The signatures last told with `Event::MailSignatures` (for new emails, for replies), once the inbox was read.
   signatures: Option<(Option<MailSignature>, Option<MailSignature>)>,
+  /// Drafts an agent saved and has not sent, by message id: what each send needs. Kept through `StopMail` (the
+  /// drafts stay in Gmail); gone when Working stops, leaving them in Gmail's Drafts.
+  drafts: HashMap<String, crate::mail::Draft>,
 }
 
 /// A change to Gmail the user asked for.
@@ -3368,6 +3371,33 @@ enum MailChange {
   /// A new email, in the thread `thread` the engine minted for it.
   Compose {
     compose: Box<MailCompose>,
+    thread: String,
+  },
+  /// A forward, a new email in the thread `thread` the engine minted for it.
+  Forward {
+    forward: Box<MailForward>,
+    thread: String,
+  },
+  /// Star or unstar a thread.
+  Star {
+    thread: String,
+    starred: bool,
+  },
+  /// The user's labels (ids `^x_…`) put on every email of a thread and taken off.
+  Label {
+    thread: String,
+    add: Vec<String>,
+    remove: Vec<String>,
+  },
+  /// A new draft saved as the email `id` in `thread` (a reply's own, a new email's minted one) and held for its send.
+  Draft {
+    draft: Box<MailDraft>,
+    thread: String,
+    id: String,
+  },
+  /// The held draft `id`, in `thread`, sent.
+  SendDraft {
+    id: String,
     thread: String,
   },
 }
@@ -3399,6 +3429,10 @@ struct MailUndo {
   inbox_removed: Option<(usize, MailThread)>,
   /// A thread put into the inbox list.
   inbox_added: Option<String>,
+  /// Threads taken out of another list (Starred, a label's), with their place there.
+  removed: Vec<(Mailbox, usize, MailThread)>,
+  /// Threads put into another list (Starred, a label's).
+  added: Vec<(Mailbox, String)>,
   /// The open thread's emails as they were.
   open: Option<(String, Vec<MailMessage>)>,
   unread: Option<u32>,
@@ -3426,6 +3460,25 @@ fn shift_label(labels: &mut Option<Vec<MailLabel>>, id: &str, more: bool) {
       label.unread.saturating_sub(1)
     };
   }
+}
+
+/// What sending or saving over a draft Working does not hold answers.
+fn draft_gone(id: &str) -> String {
+  format!(
+    "Working does not hold the draft {id}: it was sent, or Working restarted since it was saved. A draft not sent is \
+     still in Gmail's Drafts, for the user to send there."
+  )
+}
+
+/// Puts `thread` into `list` in time order. False when it is older than every thread held while Gmail has older ones
+/// still to read: its place may be on a page not read yet.
+fn insert_by_time(list: &mut MailList, thread: MailThread) -> bool {
+  let newer = list.threads.iter().take_while(|other| other.time >= thread.time).count();
+  if newer == list.threads.len() && list.more {
+    return false;
+  }
+  list.threads.insert(newer, thread);
+  true
 }
 
 /// One mailbox's threads as held.
@@ -3735,6 +3788,18 @@ impl Engine {
     Ok(thread)
   }
 
+  /// An agent forwards an email: a new email that quotes it, without its files. Answers the new thread's id.
+  pub(crate) async fn agent_forward(&self, forward: MailForward) -> Result<String, String> {
+    let thread = crate::mail::new_thread_id();
+    self
+      .agent_mail_write(MailChange::Forward {
+        forward: Box::new(forward),
+        thread: thread.clone(),
+      })
+      .await?;
+    Ok(thread)
+  }
+
   /// An agent's reply, its recipients already chosen.
   pub(crate) async fn agent_reply(&self, reply: MailReply) -> Result<(), String> {
     self.agent_mail_write(MailChange::Reply(Box::new(reply))).await
@@ -3748,6 +3813,97 @@ impl Engine {
   /// An agent marks a thread read or unread.
   pub(crate) async fn agent_mark(&self, thread: String, read: bool) -> Result<(), String> {
     self.agent_mail_write(MailChange::Mark { thread, read }).await
+  }
+
+  /// An agent stars a thread (`^t` on its newest email), or unstars it (off every email).
+  pub(crate) async fn agent_star(&self, thread: String, starred: bool) -> Result<(), String> {
+    self.agent_mail_write(MailChange::Star { thread, starred }).await
+  }
+
+  /// An agent puts the user's labels (ids `^x_…`) on every email of a thread and takes others off. Any other id is
+  /// refused before anything is shown or sent.
+  pub(crate) async fn agent_label(&self, thread: String, add: Vec<String>, remove: Vec<String>) -> Result<(), String> {
+    if let Some(refused) = self.mail_refused() {
+      return Err(refused.into());
+    }
+    crate::mail::check_user_labels(&add, &remove).map_err(|error| format!("{error:#}"))?;
+    self.agent_mail_write(MailChange::Label { thread, add, remove }).await
+  }
+
+  /// An agent saves a new draft in Gmail (a new email in a thread of its own, or a reply in its thread) and Working
+  /// holds it for `agent_send_draft`. Answers the draft's id: its message id (`msg-a:r…`).
+  pub(crate) async fn agent_draft(&self, draft: MailDraft) -> Result<String, String> {
+    let thread = match &draft {
+      MailDraft::New(_) => crate::mail::new_thread_id(),
+      MailDraft::Reply(reply) => reply.thread.clone(),
+    };
+    let id = crate::mail::new_message_id();
+    self
+      .agent_mail_write(MailChange::Draft {
+        draft: Box::new(draft),
+        thread,
+        id: id.clone(),
+      })
+      .await?;
+    Ok(id)
+  }
+
+  /// An agent sends a held draft exactly as saved; Working forgets it once sent. An id not held (sent, or Working
+  /// restarted since) is refused with where the draft still is.
+  pub(crate) async fn agent_send_draft(&self, id: &str) -> Result<MailDraftSent, String> {
+    if let Some(refused) = self.mail_refused() {
+      return Err(refused.into());
+    }
+    let sent = self
+      .mail_lock()
+      .drafts
+      .get(id)
+      .map(|draft| MailDraftSent {
+        thread: draft.thread.clone(),
+        to: draft.to.clone(),
+        cc: draft.cc.clone(),
+        bcc: draft.bcc.clone(),
+      })
+      .ok_or_else(|| draft_gone(id))?;
+    self
+      .agent_mail_write(MailChange::SendDraft {
+        id: id.to_string(),
+        thread: sent.thread.clone(),
+      })
+      .await?;
+    Ok(sent)
+  }
+
+  /// Why a mail write is refused now, in `mail_job`'s order: read-only, then Mail off. For an agent's write that
+  /// checks more before it is queued.
+  fn mail_refused(&self) -> Option<&'static str> {
+    if self.readonly {
+      Some(MAIL_READONLY)
+    } else if self.mail_on() {
+      None
+    } else {
+      Some(MAIL_OFF)
+    }
+  }
+
+  /// Saves a new draft and holds what its send needs.
+  async fn save_draft(&self, draft: &MailDraft, thread: &str, id: &str) -> Result<()> {
+    let saved = self.mail.save_draft(draft, thread, id).await?;
+    self.mail_lock().drafts.insert(id.to_string(), saved);
+    Ok(())
+  }
+
+  /// Sends the held draft `id` and forgets it; one Gmail did not take stays held, to send again.
+  async fn send_draft(&self, id: &str) -> Result<crate::mail::Draft> {
+    let draft = self
+      .mail_lock()
+      .drafts
+      .get(id)
+      .cloned()
+      .ok_or_else(|| anyhow!(draft_gone(id)))?;
+    self.mail.send_draft(&draft).await?;
+    self.mail_lock().drafts.remove(id);
+    Ok(draft)
   }
 
   /// The address mail goes from, as the Gmail page said. Callers check `mail_on` first.
@@ -3781,16 +3937,30 @@ impl Engine {
 
   async fn run_mail_write(&self, change: MailChange, generation: u64, undo: MailUndo, answer: Option<MailAnswer>) {
     let mut to_me = false;
+    let mut sent_reply = false;
     let result = match &change {
       MailChange::Mark { thread, read } => self.mail.mark(thread, *read).await,
       MailChange::Archive { thread, archive } => self.mail.archive(thread, *archive).await,
       MailChange::Reply(reply) => self.mail.reply(reply).await,
       MailChange::Compose { compose, thread } => self.mail.compose(compose, thread).await.map(|mine| to_me = mine),
+      MailChange::Forward { forward, thread } => self.mail.forward(forward, thread).await.map(|mine| to_me = mine),
+      MailChange::Star { thread, starred } => self.mail.star(thread, *starred).await,
+      MailChange::Label { thread, add, remove } => self.mail.label(thread, add, remove).await,
+      MailChange::Draft { draft, thread, id } => self.save_draft(draft, thread, id).await,
+      MailChange::SendDraft { id, .. } => self.send_draft(id).await.map(|draft| {
+        to_me = draft.to_me;
+        sent_reply = draft.is_reply();
+      }),
     };
     let thread = match &change {
-      MailChange::Mark { thread, .. } | MailChange::Archive { thread, .. } | MailChange::Compose { thread, .. } => {
-        thread.clone()
-      },
+      MailChange::Mark { thread, .. }
+      | MailChange::Archive { thread, .. }
+      | MailChange::Compose { thread, .. }
+      | MailChange::Forward { thread, .. }
+      | MailChange::Star { thread, .. }
+      | MailChange::Label { thread, .. }
+      | MailChange::Draft { thread, .. }
+      | MailChange::SendDraft { thread, .. } => thread.clone(),
       MailChange::Reply(reply) => reply.thread.clone(),
     };
     match result {
@@ -3799,11 +3969,34 @@ impl Engine {
         self.mail_written(answer, Ok(()));
         match change {
           MailChange::Reply(_) => self.open_mail(thread).await,
+          MailChange::SendDraft { .. } if sent_reply => self.open_mail(thread).await,
+          // A reply's draft shows in its thread when that thread is open.
+          MailChange::Draft { draft, .. } if matches!(*draft, MailDraft::Reply(_)) => {
+            let open = self.mail_lock().open.as_ref().is_some_and(|(open, _)| *open == thread);
+            if open {
+              self.open_mail(thread).await;
+            }
+          },
           // A thread moved back that the engine did not hold shows once the inbox is read again, now.
           MailChange::Archive { archive: false, .. } if undo.inbox_added.is_none() => {
             self.read_mail_page(&Mailbox::Inbox, 0, generation, MailRead::Watched).await;
           },
-          MailChange::Compose { .. } => self.show_composed(generation, to_me).await,
+          MailChange::Compose { .. } | MailChange::Forward { .. } | MailChange::SendDraft { .. } => {
+            self.show_composed(generation, to_me).await;
+          },
+          MailChange::Star { .. } => self.read_held_lists(generation, vec![Mailbox::Starred]).await,
+          // The label lists held read again, with every label's count; the inbox, for the counts, when none is held.
+          MailChange::Label { add, remove, .. } => {
+            let lists: Vec<Mailbox> = add.into_iter().chain(remove).map(Mailbox::Label).collect();
+            let held = {
+              let held = self.mail_lock();
+              lists
+                .iter()
+                .any(|mailbox| held.lists.get(mailbox).is_some_and(|list| list.pages > 0))
+            };
+            let lists = if held { lists } else { vec![Mailbox::Inbox] };
+            self.read_held_lists(generation, lists).await;
+          },
           _ => {},
         }
       },
@@ -3819,11 +4012,20 @@ impl Engine {
   /// A new email went: the held lists it belongs in are read again, so it shows in them (Sent and All Mail, and the
   /// inbox when the user is a recipient). Lists never asked for stay unread.
   async fn show_composed(&self, generation: u64, to_me: bool) {
+    let lists = [Mailbox::Sent, Mailbox::All, Mailbox::Inbox]
+      .into_iter()
+      .filter(|mailbox| to_me || *mailbox != Mailbox::Inbox)
+      .collect();
+    self.read_held_lists(generation, lists).await;
+  }
+
+  /// Reads again the first page of each of `lists` the engine holds (asked for since Mail started), told when it
+  /// changed. Lists never asked for stay unread.
+  async fn read_held_lists(&self, generation: u64, lists: Vec<Mailbox>) {
     let held: Vec<Mailbox> = {
       let held = self.mail_lock();
-      [Mailbox::Sent, Mailbox::All, Mailbox::Inbox]
+      lists
         .into_iter()
-        .filter(|mailbox| to_me || *mailbox != Mailbox::Inbox)
         .filter(|mailbox| held.lists.get(mailbox).is_some_and(|list| list.pages > 0))
         .collect()
     };
@@ -3848,11 +4050,111 @@ impl Engine {
         held.changes.note(thread, None, Some(!archive));
         self.archive_held(held, &mut undo, thread, *archive);
       },
-      // A reply or a new email shows once Gmail has it; its thread must not come back as new mail.
+      MailChange::Star { thread, starred } => {
+        held.changes.note_starred(thread, *starred);
+        self.star_held(held, &mut undo, thread, *starred);
+      },
+      MailChange::Label { thread, add, remove } => self.label_held(held, &mut undo, thread, add, remove),
+      // A reply, a new email, a forward, or a draft shows once Gmail has it; its thread must not come back as new
+      // mail.
       MailChange::Reply(reply) => held.arrivals.note_own(&reply.thread, own_until()),
-      MailChange::Compose { thread, .. } => held.arrivals.note_own(thread, own_until()),
+      MailChange::Compose { thread, .. }
+      | MailChange::Forward { thread, .. }
+      | MailChange::Draft { thread, .. }
+      | MailChange::SendDraft { thread, .. } => held.arrivals.note_own(thread, own_until()),
     }
     undo
+  }
+
+  /// Shows a thread starred or not in every held list that has it, and puts it in or takes it out of the Starred list
+  /// when that is held.
+  fn star_held(&self, held: &mut MailHeld, undo: &mut MailUndo, thread_id: &str, starred: bool) {
+    let known = held
+      .lists
+      .values()
+      .flat_map(|list| &list.threads)
+      .find(|thread| thread.id == thread_id)
+      .cloned();
+    for (mailbox, list) in &mut held.lists {
+      if *mailbox == Mailbox::Starred {
+        continue;
+      }
+      let Some(thread) = list
+        .threads
+        .iter_mut()
+        .find(|thread| thread.id == thread_id && thread.starred != starred)
+      else {
+        continue;
+      };
+      undo.threads.push((mailbox.clone(), thread.clone()));
+      thread.starred = starred;
+      self.emit_mail_list(mailbox, list);
+    }
+    let Some(list) = held.lists.get_mut(&Mailbox::Starred) else {
+      return;
+    };
+    let place = list.threads.iter().position(|thread| thread.id == thread_id);
+    match (starred, place, known) {
+      (false, Some(place), _) => {
+        let thread = list.threads.remove(place);
+        undo.removed.push((Mailbox::Starred, place, thread));
+      },
+      (true, None, Some(mut thread)) => {
+        thread.starred = true;
+        if !insert_by_time(list, thread) {
+          return;
+        }
+        undo.added.push((Mailbox::Starred, thread_id.to_string()));
+      },
+      _ => return,
+    }
+    self.emit_mail_list(&Mailbox::Starred, list);
+  }
+
+  /// Shows a thread in the held lists of the labels put on it and out of those of the labels taken off. A label's
+  /// unread count moves only where the held list says the thread was on it (taken off), or that it was not (put on,
+  /// a list held whole); the read after the write brings the rest.
+  fn label_held(&self, held: &mut MailHeld, undo: &mut MailUndo, thread_id: &str, add: &[String], remove: &[String]) {
+    let known = held
+      .lists
+      .values()
+      .flat_map(|list| &list.threads)
+      .find(|thread| thread.id == thread_id)
+      .cloned();
+    let changes = add.iter().map(|id| (id, true)).chain(remove.iter().map(|id| (id, false)));
+    for (id, put) in changes {
+      let mailbox = Mailbox::Label(id.clone());
+      let Some(list) = held.lists.get_mut(&mailbox) else {
+        continue;
+      };
+      let place = list.threads.iter().position(|thread| thread.id == thread_id);
+      let shift = match (put, place, &known) {
+        (false, Some(place), _) => {
+          let thread = list.threads.remove(place);
+          let unread = thread.unread;
+          undo.removed.push((mailbox.clone(), place, thread));
+          unread
+        },
+        (true, None, Some(thread)) => {
+          let whole = !list.more;
+          if !insert_by_time(list, thread.clone()) {
+            continue;
+          }
+          undo.added.push((mailbox.clone(), thread_id.to_string()));
+          whole && thread.unread
+        },
+        _ => continue,
+      };
+      self.emit_mail_list(&mailbox, list);
+      if shift {
+        shift_label(&mut held.labels, id, put);
+      }
+    }
+    if held.labels != undo.labels
+      && let Some(labels) = &held.labels
+    {
+      self.emit(Event::MailLabels(Arc::new(labels.clone())));
+    }
   }
 
   fn mark_held(&self, held: &mut MailHeld, undo: &mut MailUndo, thread_id: &str, read: bool) {
@@ -3986,6 +4288,24 @@ impl Engine {
         touched.push(Mailbox::Inbox);
       }
     }
+    for (mailbox, place, thread) in undo.removed {
+      if let Some(list) = held.lists.get_mut(&mailbox)
+        && !list.threads.iter().any(|other| other.id == thread.id)
+      {
+        list.threads.insert(place.min(list.threads.len()), thread);
+        if !touched.contains(&mailbox) {
+          touched.push(mailbox);
+        }
+      }
+    }
+    for (mailbox, id) in undo.added {
+      if let Some(list) = held.lists.get_mut(&mailbox) {
+        list.threads.retain(|thread| thread.id != id);
+        if !touched.contains(&mailbox) {
+          touched.push(mailbox);
+        }
+      }
+    }
     for mailbox in touched {
       if let Some(list) = held.lists.get(&mailbox) {
         self.emit_mail_list(&mailbox, list);
@@ -4014,14 +4334,17 @@ impl Engine {
     }
   }
 
-  /// `Command::StopMail`: the watch stops and the mail held is forgotten; the disk cache stays.
+  /// `Command::StopMail`: the watch stops and the mail held is forgotten, but for the drafts an agent saved (still in
+  /// Gmail, to send later); the disk cache stays.
   fn stop_mail(&self) {
     let mut held = self.mail_lock();
     if let Some(watch) = held.watch.take() {
       watch.abort();
     }
+    let drafts = std::mem::take(&mut held.drafts);
     *held = MailHeld {
       generation: held.generation.wrapping_add(1),
+      drafts,
       ..MailHeld::default()
     };
   }
@@ -4048,6 +4371,12 @@ impl Engine {
   /// A thread's emails read now, for agents. Leaves them unread. Callers check `mail_on` first.
   pub(crate) async fn mail_messages(&self, thread: &str) -> Result<Vec<crate::model::MailMessage>> {
     self.mail.messages(thread).await
+  }
+
+  /// An email's file (`MailAttachment::url`) downloaded now with Gmail's cookies, for agents, kept out of the image
+  /// cache. Callers check `mail_on` first.
+  pub(crate) async fn mail_file(&self, url: &str) -> Result<Vec<u8>> {
+    self.mail.fetch(url).await
   }
 
   /// The user's labels for agents: as last told, or read now from the inbox's first page when none were. Callers

@@ -166,9 +166,25 @@ pub(super) fn keep_end(text: String) -> String {
   format!("(the oldest part was left out to keep this short)\n{}", &text[start..])
 }
 
+/// At most `max` bytes of a long text from its start, cut at a line's end when there is one, saying the rest was left
+/// out.
+pub(super) fn keep_start(mut text: String, max: usize) -> String {
+  if text.len() <= max {
+    return text;
+  }
+  let mut end = max;
+  while !text.is_char_boundary(end) {
+    end -= 1;
+  }
+  let end = text[..end].rfind('\n').unwrap_or(end);
+  text.truncate(end);
+  text.push_str("\n(the rest was left out to keep this short)");
+  text
+}
+
 #[cfg(test)]
 mod tests {
-  use super::{answer, clip, cursor, no_arguments, parse};
+  use super::{answer, clip, cursor, keep_start, no_arguments, parse};
   use serde::Deserialize;
   use serde_json::json;
 
@@ -183,6 +199,16 @@ mod tests {
   fn clip_collapses_space_and_cuts_on_a_char() {
     assert_eq!(clip("a  b\n c", 10), "a b c");
     assert_eq!(clip("ééééé", 3), "ééé…");
+  }
+
+  #[test]
+  fn keep_start_cuts_at_a_line_end() {
+    assert_eq!(keep_start("short".into(), 10), "short");
+    assert_eq!(
+      keep_start("one\ntwo\nthree".into(), 9),
+      "one\ntwo\n(the rest was left out to keep this short)"
+    );
+    assert_eq!(keep_start("éé".into(), 3), "é\n(the rest was left out to keep this short)");
   }
 
   #[test]

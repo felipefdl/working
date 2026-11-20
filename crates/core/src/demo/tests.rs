@@ -1225,6 +1225,7 @@ fn compose(to: &[&str], cc: &[&str], subject: &str) -> Command {
   Command::ComposeMail(Box::new(MailCompose {
     to: addresses(to),
     cc: addresses(cc),
+    bcc: Vec::new(),
     subject: subject.into(),
     text: "Shall we meet at noon?\n\nAvery".into(),
     signature: false,

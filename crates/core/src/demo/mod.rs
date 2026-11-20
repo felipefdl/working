@@ -505,7 +505,7 @@ impl Demo {
   /// client gives before sending when nobody, or no address, is named. When its first recipient is one of the
   /// workspace's people, they answer back a little later, once.
   fn compose_mail(&mut self, compose: &MailCompose) {
-    if let Err(error) = crate::mail::check_recipients(&compose.to, &compose.cc) {
+    if let Err(error) = crate::mail::check_recipients(&compose.to, &compose.cc, &compose.bcc) {
       self.emit(Event::MailWritten(Err(error.to_string())));
       return;
     }

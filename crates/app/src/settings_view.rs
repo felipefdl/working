@@ -1722,8 +1722,8 @@ impl SettingsView {
         "Agents list, search, and read your mail and labels. They change nothing unless you let them below.".into(),
         Some((
           "Let agents send and change mail",
-          "Adds tools that send new emails and replies from your address, archive, and mark read. What they send is \
-           real email. Without it agents only read.",
+          "Adds tools that send new emails, replies, and forwards from your address, save drafts, archive, mark read, \
+           star, and label. What they send is real email. Without it agents only read.",
         )),
         cx,
       ))

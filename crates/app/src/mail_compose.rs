@@ -351,6 +351,7 @@ impl MailView {
     let compose = MailCompose {
       to: form.to.iter().map(TypedAddress::mail).collect(),
       cc: form.cc.iter().map(TypedAddress::mail).collect(),
+      bcc: Vec::new(),
       subject: form.subject.read(cx).value().to_string(),
       text: form.body.read(cx).value().to_string(),
       signature,

@@ -994,6 +994,7 @@ impl DemoMail {
         from: self.who(msg.from),
         to: msg.to.iter().map(|email| self.who(email)).collect(),
         cc: msg.cc.iter().map(|email| self.who(email)).collect(),
+        bcc: Vec::new(),
         reply_to: msg.reply_to.iter().map(|email| self.who(email)).collect(),
         time: now - msg.ago * 60_000_000,
         html: match msg.layout {
@@ -1003,6 +1004,7 @@ impl DemoMail {
         },
         text: msg.text.into(),
         unread: msg.unread,
+        draft: false,
         attachments: msg.attached.iter().filter_map(attachment).collect(),
       })
       .collect();
@@ -1230,11 +1232,13 @@ impl DemoMail {
       from: self.me.clone(),
       to: reply.to.clone(),
       cc: reply.cc.clone(),
+      bcc: Vec::new(),
       reply_to: Vec::new(),
       time: now,
       html,
       text,
       unread: false,
+      draft: false,
       attachments: Vec::new(),
     });
     let messages = thread.messages.clone();
@@ -1281,11 +1285,13 @@ impl DemoMail {
           from: self.me.clone(),
           to: compose.to.clone(),
           cc: compose.cc.clone(),
+          bcc: compose.bcc.clone(),
           reply_to: Vec::new(),
           time: now,
           html,
           text,
           unread: false,
+          draft: false,
           attachments: Vec::new(),
         }],
       },
@@ -1319,11 +1325,13 @@ impl DemoMail {
       from: sender,
       to: vec![self.me.clone()],
       cc: Vec::new(),
+      bcc: Vec::new(),
       reply_to: Vec::new(),
       time: now,
       html: html_of(&text),
       text,
       unread: true,
+      draft: false,
       attachments: Vec::new(),
     });
     thread.labels.inbox = true;

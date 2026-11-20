@@ -36,28 +36,49 @@ const servers: Server[] = [
   {
     id: "mail",
     title: "Mail",
-    lede: "Gmail. Reading leaves threads unread. The four tools that send and change mail are listed only with Let agents send and change mail; without it they answer that writing mail is turned off.",
+    lede: "Gmail. Reading leaves threads unread. The nine tools that send and change mail are listed only with Let agents send and change mail; without it they answer that writing mail is turned off.",
     tools: [
       [
         "mail_inbox",
-        "The newest threads of the Inbox, Starred, Sent, All mail, or one of your labels.",
+        "The newest threads of the Inbox, Starred, Sent, All mail, or one of your labels, 50 a page.",
       ],
       ["mail_search", "The threads that match Gmail's own search words, as in its search box."],
       [
         "mail_read_thread",
-        "The emails of one thread, oldest first, as plain text: each email's id, who wrote it, to and copied whom, when, the names of its files, and its body.",
+        "The emails of one thread, oldest first, as plain text: each email's id, who wrote it, to, copied, and hidden copies on your own sent emails, when, its files numbered, and its body without the earlier emails it quotes. A draft not sent is marked as one.",
       ],
       ["mail_labels", "Your own labels, nested ones as Parent/Child, with their unread counts."],
       [
+        "mail_attachment",
+        "Saves one file of an email in Working's own folder, which Working empties when it starts, and gives a text file's text too. Files over 25 MB are refused.",
+      ],
+      [
         "mail_send",
-        "Sends a new email from your address to the people in to and cc, with a subject and text. Your Gmail signature is added unless the agent asks not to.",
+        "Sends a new email from your address to the people in to, cc, and bcc, with a subject and text. Your Gmail signature is added unless the agent asks not to.",
       ],
       [
         "mail_reply",
         "Answers in a thread, quoting the email as Gmail does: the newest one from someone else, or the one message names. reply_all answers everyone. The recipients are the ones Gmail's Reply and Reply all pick; the agent does not choose them.",
       ],
-      ["mail_archive", "Moves a thread out of the inbox, or back into it."],
-      ["mail_mark", "Marks a thread read or unread."],
+      [
+        "mail_forward",
+        "Sends an email on as a new email on a thread of its own, with Fwd: before the subject and the email quoted under what the agent writes. Its attached files are not sent with it.",
+      ],
+      [
+        "mail_draft",
+        "Saves a new email, with to, cc, and bcc, or a reply in your Gmail Drafts without sending it, for you to look over. Each call makes a new draft.",
+      ],
+      [
+        "mail_send_draft",
+        "Sends a draft the agent saved, exactly as saved. After Working restarts, you send it from Gmail's Drafts.",
+      ],
+      ["mail_archive", "Moves threads out of the inbox, or back into it."],
+      ["mail_mark", "Marks threads read or unread."],
+      ["mail_star", "Stars threads, or takes the star off."],
+      [
+        "mail_label",
+        "Puts your own labels on threads, or takes them off. Making a label is left to Gmail.",
+      ],
     ],
   },
   {
@@ -218,7 +239,8 @@ function Mcp(): VNode {
           </li>
           <li>
             Sending and changing mail has its own switch. An email an agent sends is real: it
-            reaches its recipients at once, from your address.
+            reaches its recipients at once, from your address. An agent can save it in your Gmail
+            Drafts instead, for you to look over before it goes.
           </li>
           <li>Changing events has its own switch.</li>
           <li>

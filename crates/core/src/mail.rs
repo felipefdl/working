@@ -4,7 +4,8 @@
 //! Opening a session loads the Gmail page once. On its way there through accounts.google.com, Google sets Gmail's
 //! own cookies; the page holds the XSRF token, the id key the sync calls carry, and the address mail is sent from.
 //! Reading changes nothing: a thread stays unread until `Client::mark` marks it read. The only changes are marking
-//! read or unread, archiving or moving back to the inbox, and sending a reply.
+//! read or unread, archiving or moving back to the inbox, starring, the user's own labels, saving a draft, and
+//! sending a reply, a new email (a forward is one), or a saved draft.
 //!
 //! Every index into an answer or a change is a named path below, so a change of Gmail's shapes is fixed in one place.
 //! The field map is in `AGENTS.md`.
@@ -28,8 +29,8 @@ use serde_json::{Value, json};
 
 use crate::http::{SessionCookie, USER_AGENT, read_cookies};
 use crate::model::{
-  MailAddress, MailAttachment, MailCompose, MailLabel, MailMessage, MailReply, MailSignature, MailThread, Mailbox,
-  Micros,
+  MailAddress, MailAttachment, MailCompose, MailDraft, MailForward, MailLabel, MailMessage, MailReply, MailSignature,
+  MailThread, Mailbox, Micros,
 };
 
 const ORIGIN: &str = "https://mail.google.com";
@@ -146,6 +147,9 @@ const SENT_ID: usize = 0;
 const SENT_FROM: usize = 1;
 const SENT_TO: usize = 2;
 const SENT_CC: usize = 3;
+/// Who gets a copy the other recipients do not see, after to and cc in the same address shape (as an `fd` detail
+/// lists to, cc, bcc); a live send confirmed it. Left out without anyone, as cc is.
+const SENT_BCC: usize = 4;
 const SENT_TIME: usize = 6;
 const SENT_SUBJECT: usize = 7;
 /// `[null, [[0, "<written html>"], [2, "<quoted html>"]], null, null, null, null, 1]`.
@@ -167,7 +171,8 @@ const SENT_KIND_REPLY: u8 = 2;
 const SENT_KIND_NEW: u8 = 1;
 /// What a sent email carries when it leaves: sent, pending until Gmail sends it, and the web client's own marks.
 const SENT_LABEL_SET: [&str; 7] = ["^all", "^pfg", "^f_bt", "^f_btns", "^f_cl", "^io_im", "^io_imc3"];
-/// What the draft a new thread is made with carries: a draft, and the web client's own marks.
+/// What a saved draft carries (a new thread's first email, a reply before it is sent): a draft, and the web client's
+/// own marks.
 const DRAFT_LABEL_SET: [&str; 5] = ["^all", "^r", "^r_bt", "^io_im", "^io_imc3"];
 /// Body part kinds of a send.
 const PART_WRITTEN: u8 = 0;
@@ -218,6 +223,8 @@ const DETAIL_ID: &[usize] = &[0];
 const DETAIL_FIELDS: &[usize] = &[1];
 const DETAIL_TO: &[usize] = &[0];
 const DETAIL_CC: &[usize] = &[1];
+/// Only the user's own sent emails carry it.
+const DETAIL_BCC: &[usize] = &[2];
 const DETAIL_REPLY_TO: &[usize] = &[3];
 /// The email's own Message-ID header (`[8]` is References, `[9]` In-Reply-To).
 const DETAIL_MESSAGE_ID: &[usize] = &[7];
@@ -243,6 +250,8 @@ const ADDRESS_NAME: usize = 2;
 const LABEL_INBOX: &str = "^i";
 const LABEL_UNREAD: &str = "^u";
 const LABEL_STARRED: &str = "^t";
+/// A draft Gmail holds, not sent (an `fd` summary's labels).
+const LABEL_DRAFT: &str = "^r";
 
 /// What a sync call answers when it fails: `["er", null, null, null, null, <http status>, ...]`.
 const ERROR_TAG: &str = "er";
@@ -365,8 +374,7 @@ impl Client {
   pub async fn mark(&self, thread: &str, read: bool) -> Result<()> {
     self
       .with_session(|session| async move {
-        let detail = thread_detail(&session.details(thread).await?, thread)?;
-        let ids: Vec<String> = detail.messages.iter().map(|message| message.id.clone()).collect();
+        let ids = session.message_ids(thread).await?;
         let op = if read {
           label_op(&[LABEL_OPENED], &[LABEL_UNREAD, LABEL_UNSEEN], &ids)
         } else {
@@ -381,8 +389,7 @@ impl Client {
   pub async fn archive(&self, thread: &str, archive: bool) -> Result<()> {
     self
       .with_session(|session| async move {
-        let detail = thread_detail(&session.details(thread).await?, thread)?;
-        let ids: Vec<String> = detail.messages.iter().map(|message| message.id.clone()).collect();
+        let ids = session.message_ids(thread).await?;
         let op = if archive {
           label_op(&[LABEL_ARCHIVED], &[LABEL_INBOX], &ids)
         } else {
@@ -393,38 +400,187 @@ impl Client {
       .await
   }
 
-  /// Sends `reply` into its thread from the signed-in address: the written text above Gmail's quote of the answered
-  /// email, subject `Re: ` and the thread's, In-Reply-To the answered email.
-  pub async fn reply(&self, reply: &MailReply) -> Result<()> {
-    check_recipients(&reply.to, &reply.cc)?;
-    self.with_session(|session| async move { session.reply(reply).await }).await
+  /// Stars a thread, as Gmail's star does (`^t` on its newest email), or unstars it (`^t` off every email).
+  pub async fn star(&self, thread: &str, starred: bool) -> Result<()> {
+    self
+      .with_session(|session| async move {
+        let ids = session.message_ids(thread).await?;
+        session.write(thread, vec![star_op(&ids, starred)], false).await
+      })
+      .await
   }
 
-  /// Sends `compose` as a new email from the signed-in address, in the new thread `thread` (`new_thread_id`). Who it
-  /// goes to is checked first: nothing is sent without a recipient or with one that is not an address. Answers
-  /// whether the user is among its recipients, which puts it in their inbox too.
-  pub async fn compose(&self, compose: &MailCompose, thread: &str) -> Result<bool> {
-    let trimmed = |addresses: &[MailAddress]| -> Vec<MailAddress> {
-      addresses
-        .iter()
-        .map(|address| MailAddress {
-          name: address.name.trim().to_string(),
-          email: address.email.trim().to_string(),
-        })
-        .collect()
-    };
-    let (to, cc) = (trimmed(&compose.to), trimmed(&compose.cc));
-    check_recipients(&to, &cc)?;
-    let (to, cc) = (&to, &cc);
+  /// Puts the user's labels `add` on every email of a thread and takes `remove` off. Only the user's own labels (ids
+  /// `^x_…`) change: any other id is refused before anything is sent.
+  pub async fn label(&self, thread: &str, add: &[String], remove: &[String]) -> Result<()> {
+    check_user_labels(add, remove)?;
     self
-      .with_session(|session| async move { session.compose(to, cc, compose, thread).await })
+      .with_session(|session| async move {
+        let ids = session.message_ids(thread).await?;
+        session.write(thread, vec![labels_op(add, remove, &ids)], false).await
+      })
       .await
+  }
+
+  /// Sends `reply` into its thread from the signed-in address: the written text above Gmail's quote of the answered
+  /// email, subject `Re: ` and the thread's, In-Reply-To the answered email. As Gmail's reply box: the reply saved
+  /// as a draft in the thread, then that same message sent. Sent without the draft, Gmail's server cut the signature
+  /// out into a part of its own that its reader shows gray.
+  pub async fn reply(&self, reply: &MailReply) -> Result<()> {
+    check_recipients(&reply.to, &reply.cc, &[])?;
+    let id = &new_message_id();
+    self
+      .with_session(|session| async move {
+        let draft = session.reply_email(reply, id).await?;
+        session.save(&draft).await?;
+        session.send(&draft).await
+      })
+      .await
+  }
+
+  /// Sends `compose` as a new email from the signed-in address, in the new thread `thread` (`new_thread_id`): the
+  /// thread is made with the email as a draft, then that same email is sent. Who it goes to is checked first:
+  /// nothing is sent without a recipient or with one that is not an address. Answers whether the user is among its
+  /// recipients, which puts it in their inbox too.
+  pub async fn compose(&self, compose: &MailCompose, thread: &str) -> Result<bool> {
+    let recipients = &Recipients::checked(&compose.to, &compose.cc, &compose.bcc)?;
+    let text = &NewText::of(compose);
+    let id = &new_message_id();
+    self
+      .with_session(|session| async move { session.send_new(recipients, text, thread, id).await })
+      .await
+  }
+
+  /// Forwards an email as Gmail's Forward does, as a new email in the new thread `thread` (`new_thread_id`), sent as
+  /// `compose` sends one: subject `Fwd: ` and the thread's, what the user wrote, then Gmail's forwarded block (who
+  /// wrote it, when, the subject, and who it went to, above its HTML). Its files are not carried. The email must be
+  /// in its thread as Gmail has it now, and not a draft. Answers whether the user is among its recipients.
+  pub async fn forward(&self, forward: &MailForward, thread: &str) -> Result<bool> {
+    let recipients = &Recipients::checked(&forward.to, &forward.cc, &forward.bcc)?;
+    let id = &new_message_id();
+    self
+      .with_session(|session| async move {
+        let detail = thread_detail(&session.details(&forward.thread).await?, &forward.thread)?;
+        let message = detail
+          .messages
+          .iter()
+          .find(|message| message.id == forward.message)
+          .context("The email to forward is not in that thread.")?;
+        if message.draft {
+          bail!("A draft cannot be forwarded.");
+        }
+        let subject = forward_subject(&detail.subject);
+        let text = NewText {
+          subject: &subject,
+          text: &forward.text,
+          signature: forward.signature,
+          forwarded: Some(forwarded_html(message, &detail.subject)),
+        };
+        session.send_new(recipients, &text, thread, id).await
+      })
+      .await
+  }
+
+  /// Saves `draft` in Gmail as the new email `id` (`new_message_id`) in `thread` (a reply's own thread, a new email's
+  /// new one from `new_thread_id`) and answers what its send needs (`send_draft`); nothing is sent. Who it goes to is
+  /// checked first. A new email's draft makes its thread (`OP_CREATE`), as `compose` does; a reply's is saved into
+  /// its thread (`OP_SAVE_DRAFT`), as `reply` does. A draft is saved once: Gmail took a second save of the same email
+  /// but kept showing the first.
+  pub(crate) async fn save_draft(&self, draft: &MailDraft, thread: &str, id: &str) -> Result<Draft> {
+    match draft {
+      MailDraft::New(compose) => {
+        let recipients = &Recipients::checked(&compose.to, &compose.cc, &compose.bcc)?;
+        let text = &NewText::of(compose);
+        self
+          .with_session(|session| async move {
+            let draft = session.new_email(recipients, text, thread, id)?;
+            session.save(&draft).await?;
+            Ok(draft)
+          })
+          .await
+      },
+      MailDraft::Reply(reply) => {
+        if reply.thread != thread {
+          bail!("A reply's draft stays in the thread it answers.");
+        }
+        check_recipients(&reply.to, &reply.cc, &[])?;
+        self
+          .with_session(|session| async move {
+            let draft = session.reply_email(reply, id).await?;
+            session.save(&draft).await?;
+            Ok(draft)
+          })
+          .await
+      },
+    }
+  }
+
+  /// Sends a draft `save_draft` saved, exactly as saved: the same email, with the sent labels and kind.
+  pub(crate) async fn send_draft(&self, draft: &Draft) -> Result<()> {
+    self.with_session(|session| async move { session.send(draft).await }).await
   }
 }
 
 /// A new thread's id, as the web client mints one for a new email.
 pub(crate) fn new_thread_id() -> String {
   format!("thread-a:r{}", rand::random::<i64>())
+}
+
+/// A new email's id, as the web client mints one for each email it writes; its draft and the sent email share it.
+pub(crate) fn new_message_id() -> String {
+  format!("msg-a:r{}", rand::random::<i64>())
+}
+
+/// Addresses as a send carries them: name and address trimmed.
+fn trimmed(addresses: &[MailAddress]) -> Vec<MailAddress> {
+  addresses
+    .iter()
+    .map(|address| MailAddress {
+      name: address.name.trim().to_string(),
+      email: address.email.trim().to_string(),
+    })
+    .collect()
+}
+
+/// A new email's recipients as a send carries them: trimmed, and checked before anything is sent.
+struct Recipients {
+  to: Vec<MailAddress>,
+  cc: Vec<MailAddress>,
+  bcc: Vec<MailAddress>,
+}
+
+impl Recipients {
+  /// `to`, `cc`, and `bcc` trimmed, with someone among them and each an address (`check_recipients`).
+  fn checked(to: &[MailAddress], cc: &[MailAddress], bcc: &[MailAddress]) -> Result<Self> {
+    let recipients = Self {
+      to: trimmed(to),
+      cc: trimmed(cc),
+      bcc: trimmed(bcc),
+    };
+    check_recipients(&recipients.to, &recipients.cc, &recipients.bcc)?;
+    Ok(recipients)
+  }
+}
+
+/// What a new email says: its subject, what the user wrote, whether the signature for new emails goes under it, and a
+/// forward's block (`forwarded_html`) after that.
+struct NewText<'a> {
+  subject: &'a str,
+  text: &'a str,
+  signature: bool,
+  forwarded: Option<String>,
+}
+
+impl<'a> NewText<'a> {
+  /// A new email's, as the user wrote it.
+  fn of(compose: &'a MailCompose) -> Self {
+    Self {
+      subject: compose.subject.trim(),
+      text: &compose.text,
+      signature: compose.signature,
+      forwarded: None,
+    }
+  }
 }
 
 struct Session {
@@ -530,8 +686,14 @@ impl Session {
     Ok(())
   }
 
-  async fn reply(&self, reply: &MailReply) -> Result<()> {
-    let me = self.me.clone().context("Gmail did not say which address sends mail")?;
+  /// The ids of a thread's emails, oldest first, as a label change needs them.
+  async fn message_ids(&self, thread: &str) -> Result<Vec<String>> {
+    message_ids_of(&self.details(thread).await?, thread)
+  }
+
+  /// `reply` as the email `id` from the signed-in address, read against its thread as Gmail has it now.
+  async fn reply_email(&self, reply: &MailReply, id: &str) -> Result<Draft> {
+    let me = self.me.as_ref().context("Gmail did not say which address sends mail")?;
     let detail = thread_detail(&self.details(&reply.thread).await?, &reply.thread)?;
     let (answered, header) = detail
       .messages
@@ -539,67 +701,70 @@ impl Session {
       .zip(&detail.message_ids)
       .find(|(message, _)| message.id == reply.message)
       .context("the email to answer is no longer in the thread")?;
-    let id = format!("msg-a:r{}", rand::random::<i64>());
-    let now = now_ms();
     let signature = self.signatures.reply.as_ref().filter(|_| reply.signature);
     let (written, quoted) = reply_body(&reply.text, quoted_html(answered), signature, self.signatures.before_quote);
-    let message = sent_message(&SentEmail {
-      id: &id,
+    let email = SentEmail {
+      id,
       client: &self.client,
-      me: &me,
+      me,
       to: &reply.to,
       cc: &reply.cc,
+      bcc: &[],
       subject: &reply_subject(&detail.subject),
       written,
       answering: Some(Answering { in_reply_to: header.as_deref(), quoted }),
-      now,
-    });
-    // As Gmail's reply box: the reply saved as a draft in the thread, then that same message sent. Sent without the
-    // draft, Gmail's server cut the signature out into a part of its own that its reader shows gray.
-    let draft = positional(OP_SAVE_DRAFT + 1, &[(OP_SAVE_DRAFT, json!([draft_of(&message)]))]);
-    self.write(&reply.thread, vec![draft], false).await?;
-    let op = positional(OP_SEND + 1, &[(OP_SEND, json!([message, answered.id, 1, null, [now_ms()]]))]);
-    self.write(&reply.thread, vec![op], true).await
+      now: now_ms(),
+    };
+    Ok(email_draft(&email, &reply.thread, Some(&answered.id), false))
   }
 
-  /// A new email goes as the web client sends one: its thread is made with the email as a draft (`OP_CREATE`), then
-  /// that same email is sent (`OP_SEND`). A send into a thread Gmail does not have yet is refused.
-  async fn compose(&self, to: &[MailAddress], cc: &[MailAddress], compose: &MailCompose, thread: &str) -> Result<bool> {
-    let me = self.me.clone().context("Gmail did not say which address sends mail")?;
-    let id = format!("msg-a:r{}", rand::random::<i64>());
-    let now = now_ms();
-    let subject = compose.subject.trim();
-    let signature = self.signatures.new.as_ref().filter(|_| compose.signature);
-    let mut message = sent_message(&SentEmail {
-      id: &id,
-      client: &self.client,
-      me: &me,
-      to,
-      cc,
-      subject,
-      written: written_html(
-        &compose.text,
-        signature
-          .map(|signature| signature_block(&signature.html, SignaturePlace::new_email(&compose.text)))
-          .as_deref(),
-      ),
-      answering: None,
-      now,
-    });
-    if signature.is_some()
-      && let Some(flags) = message.get_mut(SENT_FLAGS)
-    {
-      // Gmail's client sent its signed new email with these flags (its unsigned one with `[0, 0, 1, null, 0]`).
-      *flags = json!([0, 0, 0, null, 0]);
-    }
-    let create = positional(
-      OP_CREATE + 1,
-      &[(OP_CREATE, json!([[subject, null, now, thread, [draft_of(&message)]]]))],
+  /// A new email as the email `id` from the signed-in address, to `recipients`, in the new thread `thread`: `text`
+  /// written as Gmail's compose writes it, the signature for new emails under it when asked, then a forward's block.
+  fn new_email(&self, recipients: &Recipients, text: &NewText<'_>, thread: &str, id: &str) -> Result<Draft> {
+    let me = self.me.as_ref().context("Gmail did not say which address sends mail")?;
+    let signature = self.signatures.new.as_ref().filter(|_| text.signature);
+    let mut written = written_html(
+      text.text,
+      signature
+        .map(|signature| signature_block(&signature.html, SignaturePlace::new_email(text.text)))
+        .as_deref(),
     );
-    self.write(thread, vec![create], false).await?;
-    let send = positional(OP_SEND + 1, &[(OP_SEND, json!([message, null, 1]))]);
-    self.write(thread, vec![send], true).await?;
-    Ok(addressed_to(&me.email, to, cc))
+    if let Some(forwarded) = &text.forwarded {
+      written.push_str(forwarded);
+    }
+    let email = SentEmail {
+      id,
+      client: &self.client,
+      me,
+      to: &recipients.to,
+      cc: &recipients.cc,
+      bcc: &recipients.bcc,
+      subject: text.subject,
+      written,
+      answering: None,
+      now: now_ms(),
+    };
+    Ok(email_draft(&email, thread, None, signature.is_some()))
+  }
+
+  /// A new email, as the web client sends one: its thread is made with the email as a draft, then that same email is
+  /// sent. Answers whether the user is among its recipients.
+  async fn send_new(&self, recipients: &Recipients, text: &NewText<'_>, thread: &str, id: &str) -> Result<bool> {
+    let draft = self.new_email(recipients, text, thread, id)?;
+    self.save(&draft).await?;
+    self.send(&draft).await?;
+    Ok(draft.to_me)
+  }
+
+  /// Saves `draft` in Gmail: a new email's makes its new thread with it, a reply's goes into its thread.
+  async fn save(&self, draft: &Draft) -> Result<()> {
+    self.write(&draft.thread, vec![draft_op(draft)], false).await
+  }
+
+  /// Sends a saved draft, which turns it into the sent email. A send into a thread Gmail does not have yet is
+  /// refused.
+  async fn send(&self, draft: &Draft) -> Result<()> {
+    self.write(&draft.thread, vec![send_op(draft, now_ms())], true).await
   }
 
   /// Keeps the sync version a list answer gave.
@@ -1150,11 +1315,13 @@ fn thread_detail(answer: &Value, thread_id: &str) -> Result<ThreadDetail> {
         from: address(at(summary, SUMMARY_FROM))?,
         to: addresses(detail, DETAIL_TO),
         cc: addresses(detail, DETAIL_CC),
+        bcc: addresses(detail, DETAIL_BCC),
         reply_to: addresses(detail, DETAIL_REPLY_TO),
         time: micros(summary, SUMMARY_TIME),
         text: html_to_text(&html),
         html,
         unread: has_label(summary, SUMMARY_LABELS, LABEL_UNREAD),
+        draft: has_label(summary, SUMMARY_LABELS, LABEL_DRAFT),
         attachments: attachments(detail, DETAIL_ATTACHMENTS),
       };
       Some((message, at(detail, DETAIL_MESSAGE_ID).as_str().map(str::to_string)))
@@ -1189,6 +1356,42 @@ fn label_op(add: &[&str], remove: &[&str], ids: &[String]) -> Value {
   positional(OP_LABELS + 1, &[(OP_LABELS, json!([add, remove, ids]))])
 }
 
+/// Starring as Gmail's star does: `^t` on the newest of the emails `ids` (oldest first); unstarring takes it off
+/// every one.
+fn star_op(ids: &[String], starred: bool) -> Value {
+  if starred {
+    label_op(&[LABEL_STARRED], &[], ids.last().map_or_default(std::slice::from_ref))
+  } else {
+    label_op(&[], &[LABEL_STARRED], ids)
+  }
+}
+
+/// The user's labels `add` put on and `remove` taken off every one of the emails `ids`. `check_user_labels` first.
+fn labels_op(add: &[String], remove: &[String], ids: &[String]) -> Value {
+  let add: Vec<&str> = add.iter().map(String::as_str).collect();
+  let remove: Vec<&str> = remove.iter().map(String::as_str).collect();
+  label_op(&add, &remove, ids)
+}
+
+/// Checks a label change before anything is sent: something to change, and only the user's own labels (ids `^x_…`),
+/// never Gmail's (inbox, starred, read, and the rest). The error is short enough to show.
+pub(crate) fn check_user_labels(add: &[String], remove: &[String]) -> Result<()> {
+  if add.is_empty() && remove.is_empty() {
+    bail!("Name a label to put on or take off.");
+  }
+  if let Some(wrong) = add
+    .iter()
+    .chain(remove)
+    .find(|id| id.strip_prefix(USER_LABEL_PREFIX).is_none_or(str::is_empty))
+  {
+    bail!("“{wrong}” is not one of the user's labels: their ids start with {USER_LABEL_PREFIX}.");
+  }
+  if let Some(both) = add.iter().find(|id| remove.contains(*id)) {
+    bail!("“{both}” is both put on and taken off.");
+  }
+  Ok(())
+}
+
 /// What a send needs to fill a message.
 struct SentEmail<'a> {
   id: &'a str,
@@ -1196,6 +1399,7 @@ struct SentEmail<'a> {
   me: &'a MailAddress,
   to: &'a [MailAddress],
   cc: &'a [MailAddress],
+  bcc: &'a [MailAddress],
   subject: &'a str,
   written: String,
   /// The email answered, for a reply; `None` for a new email.
@@ -1219,9 +1423,12 @@ fn address_value(address: &MailAddress) -> Value {
   }
 }
 
-/// The user is among `to` and `cc`.
-fn addressed_to(me: &str, to: &[MailAddress], cc: &[MailAddress]) -> bool {
-  to.iter().chain(cc).any(|address| address.email.eq_ignore_ascii_case(me))
+/// The user is among `to`, `cc`, and `bcc`.
+fn addressed_to(me: &str, to: &[MailAddress], cc: &[MailAddress], bcc: &[MailAddress]) -> bool {
+  to.iter()
+    .chain(cc)
+    .chain(bcc)
+    .any(|address| address.email.eq_ignore_ascii_case(me))
 }
 
 /// The message of a send, a reply or a new email, as the send op carries it. Mail the user is a recipient of also
@@ -1230,7 +1437,7 @@ fn addressed_to(me: &str, to: &[MailAddress], cc: &[MailAddress]) -> bool {
 fn sent_message(email: &SentEmail) -> Value {
   let me = email.me;
   let mut labels: Vec<&str> = SENT_LABEL_SET.to_vec();
-  if addressed_to(&me.email, email.to, email.cc) {
+  if addressed_to(&me.email, email.to, email.cc, email.bcc) {
     labels.push(LABEL_INBOX);
   }
   let client_id = format!("{}|#{}|0", email.client, email.id);
@@ -1267,6 +1474,9 @@ fn sent_message(email: &SentEmail) -> Value {
   if !email.cc.is_empty() {
     fields.push((SENT_CC, list(email.cc)));
   }
+  if !email.bcc.is_empty() {
+    fields.push((SENT_BCC, list(email.bcc)));
+  }
   if let Some(header) = email.answering.as_ref().and_then(|answering| answering.in_reply_to) {
     fields.push((SENT_IN_REPLY_TO, json!(header)));
   }
@@ -1288,13 +1498,100 @@ fn draft_of(message: &Value) -> Value {
   draft
 }
 
-/// Checks who a send goes to before anything is sent: someone at all, and each a plausible `local@domain`. The
-/// error is short enough to show.
-pub(crate) fn check_recipients(to: &[MailAddress], cc: &[MailAddress]) -> Result<()> {
-  if to.is_empty() && cc.is_empty() {
+/// An email saved as a draft in Gmail, with what its send needs: the message as the send carries it, its thread, and
+/// the email a reply answers. The draft and the sent email are the same message id.
+#[derive(Clone, Debug)]
+pub(crate) struct Draft {
+  /// As `OP_SEND` carries it: the sent labels and kind (`draft_of` gives the saved draft).
+  message: Value,
+  /// Its thread: a reply's own, a new email's new one.
+  pub(crate) thread: String,
+  /// The email a reply answers; `None` for a new email.
+  answered: Option<String>,
+  /// Who it is addressed to.
+  pub(crate) to: Vec<MailAddress>,
+  /// Who gets a copy.
+  pub(crate) cc: Vec<MailAddress>,
+  /// Who gets a copy the other recipients do not see.
+  pub(crate) bcc: Vec<MailAddress>,
+  /// The user is among its recipients, which puts it in their inbox too once sent.
+  pub(crate) to_me: bool,
+}
+
+impl Draft {
+  /// It answers an email of its thread.
+  pub(crate) const fn is_reply(&self) -> bool {
+    self.answered.is_some()
+  }
+}
+
+/// `email` as a draft in `thread`, to save and later send. A reply answers the email `answered`. A `signed` new email
+/// carries the flags Gmail's client sent its signed one with (its unsigned one `[0, 0, 1, null, 0]`).
+fn email_draft(email: &SentEmail, thread: &str, answered: Option<&str>, signed: bool) -> Draft {
+  let mut message = sent_message(email);
+  if signed
+    && answered.is_none()
+    && let Some(flags) = message.get_mut(SENT_FLAGS)
+  {
+    *flags = json!([0, 0, 0, null, 0]);
+  }
+  Draft {
+    message,
+    thread: thread.to_string(),
+    answered: answered.map(str::to_string),
+    to: email.to.to_vec(),
+    cc: email.cc.to_vec(),
+    bcc: email.bcc.to_vec(),
+    to_me: addressed_to(&email.me.email, email.to, email.cc, email.bcc),
+  }
+}
+
+/// The op that saves `draft` in Gmail: a new email's makes its new thread with it (`OP_CREATE`), a reply's saves it
+/// into its thread (`OP_SAVE_DRAFT`).
+fn draft_op(draft: &Draft) -> Value {
+  let saved = draft_of(&draft.message);
+  if draft.is_reply() {
+    positional(OP_SAVE_DRAFT + 1, &[(OP_SAVE_DRAFT, json!([saved]))])
+  } else {
+    let subject = draft.message.get(SENT_SUBJECT).cloned().unwrap_or_default();
+    let time = draft.message.get(SENT_TIME).cloned().unwrap_or_default();
+    positional(
+      OP_CREATE + 1,
+      &[(OP_CREATE, json!([[subject, null, time, draft.thread, [saved]]]))],
+    )
+  }
+}
+
+/// The ids of the emails of `thread` in an `fd` answer, oldest first. A thread without emails (an id Gmail does not
+/// have) is refused: a label change without ids is answered 0 and changes nothing.
+fn message_ids_of(answer: &Value, thread: &str) -> Result<Vec<String>> {
+  let ids: Vec<String> = thread_detail(answer, thread)?
+    .messages
+    .into_iter()
+    .map(|message| message.id)
+    .collect();
+  if ids.is_empty() {
+    bail!("Gmail has no such thread");
+  }
+  Ok(ids)
+}
+
+/// The op that sends `draft` as saved: a reply with the email it answers and the time `now` (ms), a new email alone.
+fn send_op(draft: &Draft, now: u64) -> Value {
+  let payload = draft.answered.as_ref().map_or_else(
+    || json!([draft.message, null, 1]),
+    |answered| json!([draft.message, answered, 1, null, [now]]),
+  );
+  positional(OP_SEND + 1, &[(OP_SEND, payload)])
+}
+
+/// Checks who a send goes to before anything is sent: someone at all (in `to`, `cc`, or `bcc`), and each a plausible
+/// `local@domain`. The error is short enough to show.
+pub(crate) fn check_recipients(to: &[MailAddress], cc: &[MailAddress], bcc: &[MailAddress]) -> Result<()> {
+  if to.is_empty() && cc.is_empty() && bcc.is_empty() {
     bail!("Add someone to send the email to.");
   }
-  if let Some(wrong) = to.iter().chain(cc).find(|address| !plausible_email(&address.email)) {
+  if let Some(wrong) = to.iter().chain(cc).chain(bcc).find(|address| !plausible_email(&address.email)) {
     bail!("“{}” is not an email address.", wrong.email.trim());
   }
   Ok(())
@@ -1327,6 +1624,17 @@ fn reply_subject(subject: &str) -> String {
     subject.to_string()
   } else {
     format!("Re: {subject}")
+  }
+}
+
+/// A forward's subject: the thread's, with `Fwd: ` before it unless it has one.
+fn forward_subject(subject: &str) -> String {
+  let subject = subject.trim();
+  let forwarded = subject.get(..4).is_some_and(|start| start.eq_ignore_ascii_case("fwd:"));
+  if forwarded {
+    subject.to_string()
+  } else {
+    format!("Fwd: {subject}")
   }
 }
 
@@ -1433,12 +1741,19 @@ fn reply_body(text: &str, quoted: String, signature: Option<&MailSignature>, bef
   }
 }
 
-/// Gmail's quote of the answered email: `On <date> <sender> wrote:` and a blockquote of its HTML.
-fn quoted_html(answered: &MailMessage) -> String {
-  let when = chrono::DateTime::from_timestamp_micros(answered.time)
+/// When an email came, as Gmail writes it above a quote or in a forward (`Thu, Nov 19, 2026 at 3:28 PM`), in local
+/// time.
+fn gmail_date(time: Micros) -> String {
+  chrono::DateTime::from_timestamp_micros(time)
     .unwrap_or_default()
     .with_timezone(&chrono::Local)
-    .format("%a, %b %-d, %Y at %-I:%M %p");
+    .format("%a, %b %-d, %Y at %-I:%M %p")
+    .to_string()
+}
+
+/// Gmail's quote of the answered email: `On <date> <sender> wrote:` and a blockquote of its HTML.
+fn quoted_html(answered: &MailMessage) -> String {
+  let when = gmail_date(answered.time);
   let from = &answered.from;
   let sender = if from.name.is_empty() {
     format!("&lt;{}&gt;", escape_html(&from.email))
@@ -1451,6 +1766,53 @@ fn quoted_html(answered: &MailMessage) -> String {
      rgb(204,204,204);padding-left:1ex\">{}</blockquote></div>",
     answered.html
   )
+}
+
+/// Gmail's forwarded block, as the web client's compose writes it under a forward's text: the `Forwarded message`
+/// line, who wrote the email, when, `subject`, who it went to and (when anyone) who got a copy, then its HTML.
+fn forwarded_html(message: &MailMessage, subject: &str) -> String {
+  let from = &message.from;
+  let email = escape_html(&from.email);
+  let address = format!("<span dir=\"auto\">&lt;<a href=\"mailto:{email}\">{email}</a>&gt;</span>");
+  let sender = if from.name.is_empty() {
+    address
+  } else {
+    format!(
+      "<strong class=\"gmail_sendername\" dir=\"auto\">{}</strong> {address}",
+      escape_html(&from.name)
+    )
+  };
+  let cc = if message.cc.is_empty() {
+    String::new()
+  } else {
+    format!("Cc: {}<br>", forwarded_addresses(&message.cc))
+  };
+  format!(
+    "<div class=\"gmail_quote gmail_quote_container\"><div dir=\"ltr\" class=\"gmail_attr\">---------- Forwarded \
+     message ---------<br>From: {sender}<br>Date: {}<br>Subject: {}<br>To: {}<br>{cc}</div><br><br>{}</div>",
+    gmail_date(message.time),
+    escape_html(subject),
+    forwarded_addresses(&message.to),
+    message.html
+  )
+}
+
+/// Addresses in a forwarded block's To and Cc lines: `Name <address>` with the address a `mailto:` link, comma
+/// separated.
+fn forwarded_addresses(addresses: &[MailAddress]) -> String {
+  addresses
+    .iter()
+    .map(|address| {
+      let email = escape_html(&address.email);
+      let link = format!("&lt;<a href=\"mailto:{email}\">{email}</a>&gt;");
+      if address.name.is_empty() {
+        link
+      } else {
+        format!("{} {link}", escape_html(&address.name))
+      }
+    })
+    .collect::<Vec<_>>()
+    .join(", ")
 }
 
 /// Who a reply to `message` goes to, as Gmail's Reply (`all` false) and Reply all do.
@@ -1559,6 +1921,55 @@ pub(crate) fn html_to_text(html: &str) -> String {
   out.trim_end().to_string()
 }
 
+/// An email's text without the earlier emails it quotes (Gmail's `gmail_quote` blocks, and `<blockquote type="cite">`
+/// as other mail clients write them), the rest read by `html_to_text`. `None` when it quotes nothing, or when the
+/// quote is all it has: the caller keeps the whole text then.
+pub(crate) fn html_to_text_unquoted(html: &str) -> Option<String> {
+  static TAG: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)<(/?)(div|blockquote)\b([^>]*)>").expect("valid pattern"));
+  static QUOTE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?i)\bclass\s*=\s*["'][^"']*\bgmail_quote|\btype\s*=\s*["']?cite\b"#).expect("valid pattern")
+  });
+  let mut kept = String::with_capacity(html.len());
+  let mut from = 0;
+  // The quote being skipped: its tag's name and how many tags of that name are open in it.
+  let mut open: Option<(String, usize)> = None;
+  let mut quoted = false;
+  for tag in TAG.captures_iter(html) {
+    let (Some(whole), Some(name)) = (tag.get(0), tag.get(2)) else {
+      continue;
+    };
+    let closing = tag.get(1).is_some_and(|slash| !slash.as_str().is_empty());
+    let name = name.as_str().to_ascii_lowercase();
+    if let Some((quote, depth)) = open.as_mut() {
+      if *quote != name {
+        continue;
+      }
+      if closing {
+        *depth = depth.saturating_sub(1);
+      } else {
+        *depth += 1;
+      }
+      if *depth == 0 {
+        open = None;
+        from = whole.end();
+      }
+    } else if !closing && QUOTE.is_match(tag.get(3).map_or("", |attributes| attributes.as_str())) {
+      kept.push_str(html.get(from..whole.start()).unwrap_or_default());
+      open = Some((name, 1));
+      quoted = true;
+    }
+  }
+  if !quoted {
+    return None;
+  }
+  if open.is_none() {
+    kept.push_str(html.get(from..).unwrap_or_default());
+  }
+  let text = html_to_text(&kept);
+  (!text.is_empty()).then_some(text)
+}
+
 /// `text` with HTML character references replaced; an unknown one stays as written.
 fn decode_entities(text: &str) -> String {
   let mut parts = text.split('&');
@@ -1640,16 +2051,18 @@ pub(crate) fn append_older(held: &mut Vec<MailThread>, older: Vec<MailThread>) {
 const CHANGE_KEPT: Duration = Duration::from_secs(120);
 
 /// One thread's change the user made: what it is now, and when Gmail had it.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Change {
   unread: Option<bool>,
   in_inbox: Option<bool>,
+  starred: Option<bool>,
   /// The tick and time it was written; `None` while it is on its way.
   written: Option<(u64, std::time::Instant)>,
 }
 
-/// The user's changes to threads (read, unread, archived), laid over list answers Gmail may have made before it had
-/// them: an answer asked for before a change was written still shows the thread as it was, and its counts too.
+/// The user's changes to threads (read, unread, archived, starred), laid over list answers Gmail may have made before
+/// it had them: an answer asked for before a change was written still shows the thread as it was, and its counts
+/// too.
 #[derive(Debug, Default)]
 pub(crate) struct Changes {
   /// Counts list requests and written changes, in the order they happen.
@@ -1666,13 +2079,16 @@ impl Changes {
 
   /// The user changed `thread`: read or unread, in or out of the inbox.
   pub(crate) fn note(&mut self, thread: &str, unread: Option<bool>, in_inbox: Option<bool>) {
-    let change = self.held.entry(thread.to_string()).or_insert(Change {
-      unread: None,
-      in_inbox: None,
-      written: None,
-    });
+    let change = self.held.entry(thread.to_string()).or_default();
     change.unread = unread.or(change.unread);
     change.in_inbox = in_inbox.or(change.in_inbox);
+    change.written = None;
+  }
+
+  /// The user starred or unstarred `thread`.
+  pub(crate) fn note_starred(&mut self, thread: &str, starred: bool) {
+    let change = self.held.entry(thread.to_string()).or_default();
+    change.starred = Some(starred);
     change.written = None;
   }
 
@@ -1717,6 +2133,9 @@ impl Changes {
       if let Some(unread) = change.unread {
         thread.unread = unread;
         more += i64::from(unread) - i64::from(was_unread);
+      }
+      if let Some(starred) = change.starred {
+        thread.starred = starred;
       }
       true
     });
@@ -2197,6 +2616,42 @@ mod tests {
   }
 
   #[test]
+  fn a_change_needs_a_thread_with_emails() {
+    let ids = message_ids_of(&details_answer(), "thread-f:1").expect("two emails");
+    assert_eq!(ids, ["msg-f:1", "msg-f:2"]);
+    // Gmail answers a thread it does not have without emails; a label change without ids would answer 0.
+    let none = message_ids_of(&details_answer(), "thread-f:9").map_err(|error| error.to_string());
+    assert_eq!(none, Err("Gmail has no such thread".into()));
+    assert!(message_ids_of(&details_answer(), "thread-f:404").is_err());
+  }
+
+  #[test]
+  fn an_email_with_the_draft_label_is_a_draft() {
+    let mut answer = details_answer();
+    let labels = answer.pointer_mut("/1/1/1/1/1/3").expect("the second email's labels");
+    *labels = json!(["^all", "^r", "^r_bt"]);
+    let messages = messages_from(&answer, "thread-f:1").expect("parses");
+    let [first, second] = messages.as_slice() else {
+      panic!("two emails");
+    };
+    assert!(!first.draft);
+    assert!(second.draft && !second.unread);
+  }
+
+  #[test]
+  fn the_users_own_email_carries_its_bcc() {
+    let mut answer = details_answer();
+    let bcc = answer.pointer_mut("/1/1/2/0/1/2").expect("the first email's bcc");
+    *bcc = json!([[1, "rbrooks@example.com", "Riley Brooks"]]);
+    let messages = messages_from(&answer, "thread-f:1").expect("parses");
+    let [first, second] = messages.as_slice() else {
+      panic!("two emails");
+    };
+    assert_eq!(first.bcc, vec![person("Riley Brooks", "rbrooks@example.com")]);
+    assert_eq!(second.bcc, Vec::new());
+  }
+
+  #[test]
   fn html_becomes_readable_text() {
     let html = "<html><head><style>p { color: red }</style><title>T</title></head><body>\
                 <p>Hi Riley,</p>\n<p>The   plan:<br>one &amp; two &lt;three&gt; &#x2014; &euro;5 &bogus; a&b</p>\
@@ -2207,6 +2662,26 @@ mod tests {
       "Hi Riley,\n\nThe plan:\none & two <three> — €5 &bogus; a&b\n\nfirst\nsecond\n\nquoted"
     );
     assert_eq!(html_to_text("Plain text mail"), "Plain text mail");
+  }
+
+  #[test]
+  fn quoted_emails_are_left_out() {
+    let gmail = "<div dir=\"ltr\">Sounds good.</div><br><div class=\"gmail_quote gmail_quote_container\">\
+                 <div dir=\"ltr\" class=\"gmail_attr\">On Tue, Jordan Park &lt;jpark@example.com&gt; wrote:<br></div>\
+                 <blockquote class=\"gmail_quote\" style=\"margin:0\"><div dir=\"ltr\"><div>Noon?</div></div>\
+                 </blockquote></div>";
+    assert_eq!(html_to_text_unquoted(gmail).as_deref(), Some("Sounds good."));
+    let cited = "<div>Yes.</div><BLOCKQUOTE type=cite><div>Earlier</div><blockquote type=\"cite\">Older</blockquote>\
+                 <div>still quoted</div></BLOCKQUOTE><div>After</div>";
+    assert_eq!(html_to_text_unquoted(cited).as_deref(), Some("Yes.\nAfter"));
+    let unclosed = "<div>Top</div><div class=\"gmail_quote\"><div>cut off";
+    assert_eq!(html_to_text_unquoted(unclosed).as_deref(), Some("Top"));
+    // Nothing quoted, or nothing but the quote: the caller keeps the whole text.
+    assert_eq!(html_to_text_unquoted("<div>Plain</div><blockquote>said</blockquote>"), None);
+    assert_eq!(
+      html_to_text_unquoted("<blockquote type=\"cite\"><div>Only this</div></blockquote>"),
+      None
+    );
   }
 
   #[test]
@@ -2378,11 +2853,13 @@ mod tests {
       from,
       to,
       cc,
+      bcc: Vec::new(),
       reply_to,
       time: 1_794_896_454_636_000,
       html: "<div dir=\"ltr\">Noon works.</div>".into(),
       text: "Noon works.".into(),
       unread: false,
+      draft: false,
       attachments: Vec::new(),
     }
   }
@@ -2492,6 +2969,7 @@ mod tests {
       me: &me,
       to: &reply.to,
       cc: &reply.cc,
+      bcc: &[],
       subject: "Re: Lunch on Friday",
       written: "<p>Noon works.</p>".into(),
       answering: Some(Answering {
@@ -2533,6 +3011,7 @@ mod tests {
       me: &me,
       to: &to,
       cc: &[],
+      bcc: &[],
       subject: "Lunch on Friday",
       written: written_html("Noon?\n\nAt the usual place.", None),
       answering: None,
@@ -2570,6 +3049,7 @@ mod tests {
       me: &me,
       to: &[],
       cc: &mine,
+      bcc: &[],
       subject: "",
       written: written_html("Note to self.", None),
       answering: None,
@@ -2596,10 +3076,18 @@ mod tests {
   #[test]
   fn a_send_needs_someone_with_an_address() {
     let riley = person("Riley Brooks", "rbrooks@example.com");
-    assert!(check_recipients(std::slice::from_ref(&riley), &[]).is_ok());
-    assert!(check_recipients(&[], std::slice::from_ref(&riley)).is_ok());
-    let none = check_recipients(&[], &[]).map_err(|error| error.to_string());
+    assert!(check_recipients(std::slice::from_ref(&riley), &[], &[]).is_ok());
+    assert!(check_recipients(&[], std::slice::from_ref(&riley), &[]).is_ok());
+    assert!(
+      check_recipients(&[], &[], std::slice::from_ref(&riley)).is_ok(),
+      "bcc alone is someone"
+    );
+    let none = check_recipients(&[], &[], &[]).map_err(|error| error.to_string());
     assert_eq!(none, Err("Add someone to send the email to.".into()));
+    assert!(
+      check_recipients(&[], &[], &[person("", "rbrooks")]).is_err(),
+      "bcc is checked too"
+    );
     for wrong in [
       "rbrooks",
       "rbrooks@",
@@ -2611,7 +3099,7 @@ mod tests {
       "rbrooks@example.com.",
       "<rbrooks@example.com>",
     ] {
-      let result = check_recipients(&[riley.clone(), person("", wrong)], &[]);
+      let result = check_recipients(&[riley.clone(), person("", wrong)], &[], &[]);
       assert!(result.is_err(), "{wrong} passed");
     }
     for right in ["r.brooks+lunch@mail.example.co.uk", "jpark@example.com"] {
@@ -2671,6 +3159,210 @@ mod tests {
     changes.apply(&mut page, true, early);
     assert!(!page.threads[0].unread);
     assert_eq!(page.inbox_unread, Some(4));
+  }
+
+  #[test]
+  fn a_star_on_its_way_shows_in_answers_asked_before_it() {
+    let mut changes = Changes::default();
+    let early = changes.request();
+    changes.note_starred("a", true);
+    let mut page = inbox_page(vec![thread("a", 30, true), thread("b", 20, false)], 1);
+    changes.apply(&mut page, true, early);
+    assert!(page.threads[0].starred && !page.threads[1].starred);
+    assert_eq!(page.inbox_unread, Some(1), "a star moves no count");
+    changes.written("a");
+    let late = changes.request();
+    let mut fresh = inbox_page(vec![thread("a", 30, true)], 1);
+    changes.apply(&mut fresh, true, late);
+    assert!(!fresh.threads[0].starred, "an answer asked for after the write is Gmail's own");
+  }
+
+  #[test]
+  fn stars_and_labels_change_labels_on_the_emails() {
+    let ids = vec!["msg-f:1".to_string(), "msg-f:2".to_string()];
+    assert_eq!(star_op(&ids, true).pointer("/6"), Some(&json!([["^t"], null, ["msg-f:2"]])));
+    assert_eq!(
+      star_op(&ids, false).pointer("/6"),
+      Some(&json!([[], ["^t"], ["msg-f:1", "msg-f:2"]]))
+    );
+    let add = vec!["^x_lunch".to_string()];
+    let remove = vec!["^x_old".to_string()];
+    assert_eq!(
+      labels_op(&add, &remove, &ids).pointer("/6"),
+      Some(&json!([["^x_lunch"], ["^x_old"], ["msg-f:1", "msg-f:2"]]))
+    );
+    assert_eq!(
+      labels_op(&add, &[], &ids).pointer("/6"),
+      Some(&json!([["^x_lunch"], null, ["msg-f:1", "msg-f:2"]]))
+    );
+    assert_eq!(
+      labels_op(&[], &remove, &ids).pointer("/6"),
+      Some(&json!([[], ["^x_old"], ["msg-f:1", "msg-f:2"]]))
+    );
+    assert!(check_user_labels(&add, &remove).is_ok());
+    assert!(check_user_labels(&[], &[]).is_err(), "nothing to change");
+    assert!(check_user_labels(&add, &add).is_err(), "on and off at once");
+    for wrong in ["^t", "^i", "^u", "^x_", "Lunch", ""] {
+      assert!(check_user_labels(&[wrong.to_string()], &[]).is_err(), "{wrong} passed");
+      assert!(check_user_labels(&[], &[wrong.to_string()]).is_err(), "{wrong} passed");
+    }
+  }
+
+  /// A draft is saved, then sent as the same email: one message id, the draft labels and no kind while saved, the
+  /// sent labels and the send kind when sent.
+  #[test]
+  fn a_draft_is_sent_as_saved() {
+    let me = person("Jordan Park", ME);
+    let to = vec![person("Riley Brooks", "rbrooks@example.com")];
+    let new = SentEmail {
+      id: "msg-a:r7",
+      client: "s:00000000000000ab",
+      me: &me,
+      to: &to,
+      cc: &[],
+      bcc: &[],
+      subject: "Lunch on Friday",
+      written: written_html("Noon?", None),
+      answering: None,
+      now: 1_794_896_454_636,
+    };
+    let draft = email_draft(&new, "thread-a:r5", None, false);
+    assert!(!draft.is_reply() && !draft.to_me);
+    assert_eq!((draft.thread.as_str(), draft.to.clone()), ("thread-a:r5", to.clone()));
+    // A new email's draft makes its thread with it.
+    let create = draft_op(&draft);
+    assert_eq!(create.as_array().map(Vec::len), Some(OP_CREATE + 1));
+    assert_eq!(create.pointer("/2/0/0"), Some(&json!("Lunch on Friday")));
+    assert_eq!(create.pointer("/2/0/2"), Some(&json!(1_794_896_454_636_u64)));
+    assert_eq!(create.pointer("/2/0/3"), Some(&json!("thread-a:r5")));
+    let saved = create.pointer("/2/0/4/0").cloned().unwrap_or_default();
+    let op = send_op(&draft, 1_794_896_460_000);
+    assert_eq!(op.as_array().map(Vec::len), Some(OP_SEND + 1));
+    assert_eq!(op.pointer("/13/1"), Some(&Value::Null));
+    assert_eq!(op.pointer("/13/2"), Some(&json!(1)));
+    let sent = op.pointer("/13/0").cloned().unwrap_or_default();
+    assert_eq!(saved.get(SENT_ID), Some(&json!("msg-a:r7")));
+    assert_eq!(sent.get(SENT_ID), saved.get(SENT_ID));
+    assert_eq!(sent.get(SENT_BODY), saved.get(SENT_BODY));
+    assert_eq!(saved.get(SENT_LABELS), Some(&json!(DRAFT_LABEL_SET)));
+    assert_eq!(sent.get(SENT_LABELS), Some(&json!(SENT_LABEL_SET)));
+    assert_eq!(saved.get(SENT_KIND), Some(&Value::Null));
+    assert_eq!(sent.get(SENT_KIND), Some(&json!(SENT_KIND_NEW)));
+    assert_eq!(sent.get(SENT_FLAGS), Some(&json!([0, 0, 1, null, 0])));
+    let signed = email_draft(&new, "thread-a:r5", None, true);
+    assert_eq!(signed.message.get(SENT_FLAGS), Some(&json!([0, 0, 0, null, 0])));
+
+    // A reply's draft is saved into its thread and sent answering its email, the user among its recipients.
+    let mine = vec![person("", ME)];
+    let reply = SentEmail {
+      id: "msg-a:r8",
+      client: "s:00000000000000ab",
+      me: &me,
+      to: &to,
+      cc: &mine,
+      bcc: &[],
+      subject: "Re: Lunch on Friday",
+      written: written_html("Noon works.", None),
+      answering: Some(Answering {
+        in_reply_to: Some("<lunch-1@mail.example.com>"),
+        quoted: "<br><div>quote</div>".into(),
+      }),
+      now: 1_794_896_454_636,
+    };
+    let draft = email_draft(&reply, "thread-f:1", Some("msg-f:1"), false);
+    assert!(draft.is_reply() && draft.to_me);
+    let saved = draft_op(&draft);
+    assert_eq!(saved.as_array().map(Vec::len), Some(OP_SAVE_DRAFT + 1));
+    let saved = saved.pointer("/1/0").cloned().unwrap_or_default();
+    let op = send_op(&draft, 1_794_896_460_000);
+    assert_eq!(op.pointer("/13/1"), Some(&json!("msg-f:1")));
+    assert_eq!(op.pointer("/13/4"), Some(&json!([1_794_896_460_000_u64])));
+    let sent = op.pointer("/13/0").cloned().unwrap_or_default();
+    assert_eq!(sent.get(SENT_ID), Some(&json!("msg-a:r8")));
+    assert_eq!(saved.get(SENT_ID), sent.get(SENT_ID));
+    assert_eq!(saved.get(SENT_IN_REPLY_TO), sent.get(SENT_IN_REPLY_TO));
+    assert_eq!(saved.get(SENT_LABELS), Some(&json!(DRAFT_LABEL_SET)));
+    assert_eq!(saved.get(SENT_KIND), Some(&Value::Null));
+    assert_eq!(sent.get(SENT_KIND), Some(&json!(SENT_KIND_REPLY)));
+    assert!(new_message_id().starts_with("msg-a:r"));
+  }
+
+  #[test]
+  fn bcc_goes_in_its_own_slot_of_the_draft_and_the_send() {
+    let me = person("Jordan Park", ME);
+    let to = vec![person("Riley Brooks", "rbrooks@example.com")];
+    let hidden = vec![person("", "team@example.com"), person("Jordan Park", ME)];
+    let email = SentEmail {
+      id: "msg-a:r9",
+      client: "s:00000000000000ab",
+      me: &me,
+      to: &to,
+      cc: &[],
+      bcc: &hidden,
+      subject: "Lunch on Friday",
+      written: written_html("Noon?", None),
+      answering: None,
+      now: 1_794_896_454_636,
+    };
+    let draft = email_draft(&email, "thread-a:r5", None, false);
+    assert_eq!(draft.bcc, hidden);
+    assert!(draft.to_me, "bcc to oneself puts it in the inbox too");
+    let bcc = json!([[1, "team@example.com"], [1, ME, "Jordan Park"]]);
+    let saved = draft_op(&draft).pointer("/2/0/4/0").cloned().unwrap_or_default();
+    let sent = send_op(&draft, 1_794_896_460_000).pointer("/13/0").cloned().unwrap_or_default();
+    for message in [&saved, &sent] {
+      assert_eq!(message.get(SENT_BCC), Some(&bcc));
+      assert_eq!(message.get(SENT_CC), Some(&Value::Null));
+      assert!(message.get(SENT_LABELS).and_then(Value::as_array).is_some());
+    }
+    assert!(
+      sent
+        .get(SENT_LABELS)
+        .and_then(Value::as_array)
+        .is_some_and(|labels| labels.contains(&json!("^i")))
+    );
+    let unseen = SentEmail { bcc: &[], ..email };
+    assert_eq!(sent_message(&unseen).get(SENT_BCC), Some(&Value::Null), "no bcc, no slot");
+  }
+
+  #[test]
+  fn a_forward_quotes_the_email_under_gmails_header() {
+    assert_eq!(forward_subject("Lunch on Friday"), "Fwd: Lunch on Friday");
+    assert_eq!(forward_subject(" FWD: Lunch "), "FWD: Lunch");
+    assert_eq!(forward_subject("fwd:Lunch"), "fwd:Lunch");
+    assert_eq!(forward_subject("Re: Lunch"), "Fwd: Re: Lunch");
+    let message = email(
+      person("Jordan Park", "jpark@example.com"),
+      vec![person("Riley <R&B>", "rbrooks@example.com"), person("", "team@example.com")],
+      Vec::new(),
+      Vec::new(),
+    );
+    let date = gmail_date(message.time);
+    let block = forwarded_html(&message, "Lunch & \"more\"");
+    assert_eq!(
+      block,
+      format!(
+        "<div class=\"gmail_quote gmail_quote_container\"><div dir=\"ltr\" class=\"gmail_attr\">---------- \
+         Forwarded message ---------<br>From: <strong class=\"gmail_sendername\" dir=\"auto\">Jordan Park</strong> \
+         <span dir=\"auto\">&lt;<a href=\"mailto:jpark@example.com\">jpark@example.com</a>&gt;</span><br>Date: \
+         {date}<br>Subject: Lunch &amp; &quot;more&quot;<br>To: Riley &lt;R&amp;B&gt; &lt;<a \
+         href=\"mailto:rbrooks@example.com\">rbrooks@example.com</a>&gt;, &lt;<a \
+         href=\"mailto:team@example.com\">team@example.com</a>&gt;<br></div><br><br><div dir=\"ltr\">Noon \
+         works.</div></div>"
+      )
+    );
+    assert!(!block.contains("Cc: "), "no Cc line without copies");
+    let copied = email(
+      person("", "jpark@example.com"),
+      Vec::new(),
+      vec![person("Team", "team@example.com")],
+      Vec::new(),
+    );
+    let block = forwarded_html(&copied, "Lunch");
+    assert!(block.contains("From: <span dir=\"auto\">&lt;<a href=\"mailto:jpark@example.com\">"));
+    assert!(block.contains("<br>Cc: Team &lt;<a href=\"mailto:team@example.com\">team@example.com</a>&gt;<br></div>"));
+    let english = Regex::new(r"^[A-Z][a-z]{2}, [A-Z][a-z]{2} \d{1,2}, \d{4} at \d{1,2}:\d{2} [AP]M$").expect("valid");
+    assert!(english.is_match(&date), "{date}");
   }
 
   fn signature(html: &str) -> MailSignature {

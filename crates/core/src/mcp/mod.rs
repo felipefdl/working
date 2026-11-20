@@ -553,7 +553,13 @@ mod tests {
     assert!(!names(Server::Calendar, &all).contains(&"calendar_create_event".to_string()));
     assert_eq!(
       names(Server::Mail, &all),
-      ["mail_inbox", "mail_search", "mail_read_thread", "mail_labels"]
+      [
+        "mail_inbox",
+        "mail_search",
+        "mail_read_thread",
+        "mail_labels",
+        "mail_attachment"
+      ]
     );
     all.allow_send = true;
     all.calendar_write = true;
@@ -567,10 +573,16 @@ mod tests {
         "mail_search",
         "mail_read_thread",
         "mail_labels",
+        "mail_attachment",
         "mail_send",
         "mail_reply",
+        "mail_forward",
+        "mail_draft",
+        "mail_send_draft",
         "mail_archive",
-        "mail_mark"
+        "mail_mark",
+        "mail_star",
+        "mail_label"
       ]
     );
     assert_eq!(names(Server::Meet, &all), ["meet_create_meeting", "meet_upcoming"]);

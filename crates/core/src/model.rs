@@ -512,7 +512,8 @@ pub struct McpConfig {
   pub allow_send: bool,
   /// Serve the mail tools. They answer only while Mail is on.
   pub mail: bool,
-  /// Offer the mail tools that send a new email, reply, archive, and mark read. Without it agents can only read mail.
+  /// Offer the mail tools that send a new email, reply, forward, save and send a draft, archive, mark read, star, and
+  /// label. Without it agents can only read mail.
   pub mail_write: bool,
   /// Serve the calendar tools.
   pub calendar: bool,
@@ -975,6 +976,8 @@ pub struct MailMessage {
   pub to: Vec<MailAddress>,
   /// Who got a copy.
   pub cc: Vec<MailAddress>,
+  /// Who got a copy the other recipients did not see. Only the user's own sent emails carry it.
+  pub bcc: Vec<MailAddress>,
   /// Where an answer goes instead of `from`, when the email names somewhere else.
   pub reply_to: Vec<MailAddress>,
   /// When it arrived.
@@ -985,6 +988,8 @@ pub struct MailMessage {
   pub text: String,
   /// It is not read yet.
   pub unread: bool,
+  /// It is a draft Gmail holds (label `^r`), not sent.
+  pub draft: bool,
   /// Its files.
   pub attachments: Vec<MailAttachment>,
 }
@@ -1010,16 +1015,59 @@ pub struct MailReply {
 /// A new email, as plain text.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MailCompose {
-  /// Who it is addressed to. At least one of `to` and `cc` has someone.
+  /// Who it is addressed to. At least one of `to`, `cc`, and `bcc` has someone.
   pub to: Vec<MailAddress>,
   /// Who gets a copy.
   pub cc: Vec<MailAddress>,
+  /// Who gets a copy the other recipients do not see.
+  pub bcc: Vec<MailAddress>,
   /// Subject; may be empty.
   pub subject: String,
   /// What the user wrote; a blank line starts a paragraph.
   pub text: String,
   /// Add the signature Gmail sets for new emails (`Event::MailSignatures`).
   pub signature: bool,
+}
+
+/// An email sent on to other people: a new email that quotes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MailForward {
+  /// Thread of the email forwarded.
+  pub thread: String,
+  /// The email forwarded: its id.
+  pub message: String,
+  /// Who it is addressed to. At least one of `to`, `cc`, and `bcc` has someone.
+  pub to: Vec<MailAddress>,
+  /// Who gets a copy.
+  pub cc: Vec<MailAddress>,
+  /// Who gets a copy the other recipients do not see.
+  pub bcc: Vec<MailAddress>,
+  /// What the user wrote above it; may be empty.
+  pub text: String,
+  /// Add the signature Gmail sets for new emails.
+  pub signature: bool,
+}
+
+/// An email an agent stages in Gmail's Drafts before it is sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MailDraft {
+  /// A new email, in a thread of its own.
+  New(MailCompose),
+  /// An answer in an existing thread.
+  Reply(MailReply),
+}
+
+/// A staged draft that was sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MailDraftSent {
+  /// The thread it went into (a new email's new thread).
+  pub thread: String,
+  /// Who it was addressed to.
+  pub to: Vec<MailAddress>,
+  /// Who got a copy.
+  pub cc: Vec<MailAddress>,
+  /// Who got a copy the other recipients did not see.
+  pub bcc: Vec<MailAddress>,
 }
 
 /// A signature the user set in Gmail's settings.

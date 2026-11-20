@@ -470,7 +470,8 @@ pub struct Settings {
   pub mcp_send: bool,
   /// Serve the mail tools, at `/mcp/mail`. They are served only while `mail` is on.
   pub mcp_mail: bool,
-  /// Agents may send new emails and replies, archive, and mark read, not only read. Only while `mcp_mail` is on.
+  /// Agents may send new emails and replies, forward, save drafts, archive, mark read, star, and label, not only read.
+  /// Only while `mcp_mail` is on.
   pub mcp_mail_write: bool,
   /// Serve the calendar tools, at `/mcp/calendar`, while `calendar` is on.
   pub mcp_calendar: bool,

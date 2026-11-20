@@ -81,7 +81,7 @@ Mail is Gmail, through the session you signed in with: there is no second sign-i
 - **Changes.** Archive from the Inbox with an Undo bar, and Mark as unread. A thread you open is marked read.
 - **New mail.** The inbox's first page shows from disk before Gmail answers. Working checks the inbox every minute, posts a notification for each unread email that arrives, and adds unread inbox threads to the unread badge.
 
-Mail does not forward, star, label, or delete. `just run-readonly` refuses every change. What differs on each system is in [docs/platforms.md](docs/platforms.md#mail).
+The Mail view does not forward, star, label, or delete; an agent you allow can forward, star, and label through the [mail tools](#mcp-servers). `just run-readonly` refuses every change. What differs on each system is in [docs/platforms.md](docs/platforms.md#mail).
 
 ## Features
 
@@ -109,11 +109,11 @@ Working serves one MCP server per product from one listener on `127.0.0.1`. Each
 | Server | Address and name | Tools |
 |---|---|---|
 | Chat | `http://127.0.0.1:3021/mcp/chat`, `working-chat` | `inbox`, `recent_activity`, `find_conversations`, `read_conversation`, `search_messages`; `send_message` only with **Let agents send messages** |
-| Mail | `/mcp/mail`, `working-mail` | `mail_inbox`, `mail_search`, `mail_read_thread`, `mail_labels`; with **Let agents send and change mail**, also `mail_send`, `mail_reply`, `mail_archive`, `mail_mark` |
+| Mail | `/mcp/mail`, `working-mail` | `mail_inbox`, `mail_search`, `mail_read_thread`, `mail_labels`, `mail_attachment`; with **Let agents send and change mail**, also `mail_send`, `mail_reply`, `mail_forward`, `mail_draft`, `mail_send_draft`, `mail_archive`, `mail_mark`, `mail_star`, `mail_label` |
 | Calendar | `/mcp/calendar`, `working-calendar` | `calendar_list`, `calendar_events`, `calendar_get_event`; with **Let agents change events**, also `calendar_create_event`, `calendar_update_event`, `calendar_delete_event`, `calendar_respond` |
 | Meet | `/mcp/meet`, `working-meet` | `meet_create_meeting`, `meet_upcoming` |
 
-What an agent sends is real: a chat message or an email reaches its recipients at once, as you. `mail_reply` answers the thread's newest email from someone else, or the one its `message` names (an id `mail_read_thread` shows), and addresses it the way Gmail's Reply and Reply all do; the agent does not pick the recipients. Reading leaves chats and mail unread. Under `just run-readonly` every tool that sends or changes something refuses.
+What an agent sends is real: a chat message or an email reaches its recipients at once, as you. `mail_send` takes `to`, `cc`, and `bcc`. `mail_reply` answers the thread's newest email from someone else, or the one its `message` names (an id `mail_read_thread` shows), and addresses it the way Gmail's Reply and Reply all do; the agent does not pick the recipients. `mail_forward` sends an email on as a new email on a thread of its own, with `Fwd:` before the subject and the email quoted under what the agent writes; the email's attached files are not sent with it, and pictures inside it that need your Gmail session do not show for the recipient. `mail_draft` saves a new email or a reply in your Gmail Drafts without sending it, for you to look over; `mail_send_draft` sends it exactly as saved, until Working restarts, and after that you send it from Gmail's Drafts. `mail_star` and `mail_label` star threads and put on or take off your own labels; making a label is left to Gmail. `mail_attachment` saves an email's file in Working's own folder, which Working empties when it starts, and refuses files over 25 MB. Reading leaves chats and mail unread. Under `just run-readonly` every tool that sends or changes something refuses.
 
 ## Build from source
 

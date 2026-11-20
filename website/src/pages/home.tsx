@@ -114,7 +114,7 @@ const parts: Part[] = [
         "The inbox's first page shows from disk before Gmail answers, and new mail is checked every minute.",
       ],
     ],
-    fine: "Mail does not forward, star, label, or delete. Turn Mail off in Settings, Features, and Working does not read Gmail at all.",
+    fine: "The Mail view does not forward, star, label, or delete; an agent you allow can forward, star, and label through the mail tools. Turn Mail off in Settings, Features, and Working does not read Gmail at all.",
   },
   {
     id: "calendar",
@@ -239,7 +239,7 @@ const questions = [
   ],
   [
     "Can I read and write Gmail in Working?",
-    "Yes. Mail shows the Inbox, Starred, Sent, All mail, and your labels, and searches with Gmail's own queries. It writes new emails and replies with your Gmail signature, archives, and marks threads unread. It uses the session you signed in with. It does not forward, star, label, or delete.",
+    "Yes. Mail shows the Inbox, Starred, Sent, All mail, and your labels, and searches with Gmail's own queries. It writes new emails and replies with your Gmail signature, archives, and marks threads unread. It uses the session you signed in with. The Mail view does not forward, star, label, or delete; an agent you allow can forward, star, and label through the mail tools.",
   ],
   [
     "Is Working free?",
