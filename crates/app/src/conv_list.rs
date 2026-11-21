@@ -1,11 +1,15 @@
 //! The conversation list of the Messages, Rail and IRC layouts beside the open conversation. Messages lists chats
 //! with previews under a header of view buttons, filtered with chips beside the sort button and the Unread toggle, or
-//! in a column narrower than `TITLE_MIN_WIDTH` with IRC's one-line filter; Rail lists the pane its icon column picked;
-//! IRC lists one line of the monospaced name a conversation, as WeeChat's buffer list, under a filter line, after rows
-//! that open the views. Every layout shares one Unread filter (`Store::unread_only`), combined with the pane in use.
-//! Each list scrolls to the open conversation when it changes, and IRC's also to the row of the open view.
+//! in a column narrower than `TITLE_MIN_WIDTH` with IRC's one-line filter, whose menu opens under it; Rail lists the
+//! pane its icon column picked. In a Messages or Rail column narrower than `TITLE_MIN_WIDTH` the rows are stacked: the
+//! time ends the name's line and the marks end the preview's. IRC lists one line of the monospaced name a
+//! conversation, as WeeChat's buffer list, under a filter line, after rows that open the views. Every layout shares one
+//! Unread filter (`Store::unread_only`), combined with the pane in use. Each list scrolls to the open conversation when
+//! it changes, and IRC's also to the row of the open view.
 
+use std::cell::Cell;
 use std::ops::Range;
+use std::rc::Rc;
 
 use gchat_core::{Group, GroupId, GroupKind, SearchHit, Shortcut};
 use gpui_kit::component::tooltip::Tooltip;
@@ -32,10 +36,13 @@ const LIST_ROW_HEIGHT: f32 = ROW_HEIGHT + 4.0;
 const PREFETCH_ROWS: usize = 8;
 /// An IRC buffer row: one line of the monospaced name.
 const BUFFER_ROW_HEIGHT: f32 = 24.0;
-/// Narrowest the Messages list shows its title beside the header buttons.
+/// Narrowest a list column keeps the Messages title and chips and one line of marks on its rows; a narrower Messages
+/// header drops the title for the one-line filter, and the Messages and Rail rows are stacked (`RowMarks::stacked`).
 const TITLE_MIN_WIDTH: f32 = 300.0;
 /// Height of a filter chip, and of the sort and Unread buttons beside the Messages chips.
 const CHIP_HEIGHT: f32 = 22.;
+/// Space between the one-line filter and the top of the menu it opens under it.
+const MENU_GAP: f32 = 4.;
 
 /// What the rows were filtered by. When any of it changes the list starts over at the top.
 struct Filter {
@@ -228,7 +235,9 @@ impl ConvList {
       View::Conversation(id) => Some(id),
       View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => None,
     };
-    let irc = cx.global::<Settings>().layout == Layout::Irc;
+    let settings = cx.global::<Settings>();
+    let irc = settings.layout == Layout::Irc;
+    let stacked = is_narrow(settings.column_width(column_layout(settings.layout)));
     let mut out = Vec::with_capacity(range.len());
     for ix in range {
       let conv = match store.list.row(ix) {
@@ -244,7 +253,7 @@ impl ConvList {
         out.push(self.buffer_row(ix, conv, selected, cx).into_any_element());
         continue;
       }
-      let marks = RowMarks { selected, pin: true };
+      let marks = RowMarks { selected, pin: true, stacked };
       let row = conv_row(&self.store, store, ("conv-row", ix), conv, marks, cx)
         .px_3()
         .rounded(px(10.));
@@ -423,7 +432,7 @@ impl ConvList {
         settings.mail,
       )
     };
-    let narrow = cx.global::<Settings>().column_width(Layout::Messages) < TITLE_MIN_WIDTH;
+    let narrow = is_narrow(cx.global::<Settings>().column_width(Layout::Messages));
     let fit = move |button: Stateful<Div>| if narrow { button.size(px(24.)) } else { button };
     let actions = h_flex()
       .when(narrow, gpui_kit::Styled::gap_0p5)
@@ -541,9 +550,9 @@ impl ConvList {
   }
 
   /// The filter in use on one line, for the IRC header and a narrow Messages header: the pane's chip label, and with
-  /// the Unread filter on "Unread" for All or "{label}, unread" for a kind. A click opens the menu of the panes the
-  /// chips offer (the one in use checked, a kind with unread conversations followed by their count), then the Unread
-  /// filter, then the two orders. It fills the width it is given; the caller picks its font.
+  /// the Unread filter on "Unread" for All or "{label}, unread" for a kind. A click opens, under the line as a dropdown,
+  /// the menu of the panes the chips offer (the one in use checked, a kind with unread conversations followed by their
+  /// count), then the Unread filter, then the two orders. It fills the width it is given; the caller picks its font.
   fn filter_line(&self, store: &Store) -> Stateful<Div> {
     let label = chip_label(&store.pane);
     let current = match (&store.pane, store.unread_only) {
@@ -552,6 +561,9 @@ impl ConvList {
       (Pane::Kind(_) | Pane::Section(_) | Pane::Shortcut(_), true) => format!("{label}, unread"),
     };
     let handle = self.store.clone();
+    // Where the line was last laid out (window coordinates), written as it is prepainted, so the menu opens under it.
+    let bounds = Rc::new(Cell::new(Bounds::default()));
+    let laid_out = bounds.clone();
     h_flex()
       .id("buffer-filter")
       .h(px(BUFFER_ROW_HEIGHT))
@@ -560,6 +572,7 @@ impl ConvList {
       .px_1()
       .gap_1()
       .items_center()
+      .relative()
       .rounded(px(4.))
       .cursor_pointer()
       .text_size(px(12.))
@@ -567,7 +580,12 @@ impl ConvList {
       .hover(|s| s.bg(rgb(ROW_HOVER)))
       .child(div().min_w_0().truncate().child(current))
       .child(icon(Icon::ChevronDown, 12., MUTED))
-      .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+      .child(
+        canvas(move |at, _, _| laid_out.set(at), |_, (), _, _| {})
+          .absolute()
+          .size_full(),
+      )
+      .on_mouse_down(MouseButton::Left, move |_, window, cx| {
         cx.stop_propagation();
         let store = handle.read(cx);
         let mut items: Vec<menu::MenuItem> = chip_panes(store)
@@ -602,7 +620,8 @@ impl ConvList {
           items.push(first.separated());
         }
         items.extend(orders);
-        menu::show(event.position, items, window, cx);
+        let under = bounds.get().bottom_left() + point(px(0.), px(MENU_GAP));
+        menu::show(under, items, window, cx);
       })
   }
 
@@ -636,6 +655,20 @@ impl ConvList {
         )
       })
   }
+}
+
+/// The layout whose column width a list in `layout` takes: Google Chat's list is the Messages column.
+const fn column_layout(layout: Layout) -> Layout {
+  match layout {
+    Layout::Rail => Layout::Rail,
+    Layout::Irc => Layout::Irc,
+    Layout::GoogleChat | Layout::Messages => Layout::Messages,
+  }
+}
+
+/// Whether a list column `width` wide is narrow: under `TITLE_MIN_WIDTH`.
+const fn is_narrow(width: f32) -> bool {
+  width < TITLE_MIN_WIDTH
 }
 
 /// The row of `view` in a list of the `views` rows and then `Store::list`'s rows, where `position` finds a
@@ -914,11 +947,7 @@ impl Render for ConvList {
         .into_any_element()
     };
     v_flex()
-      .w(px(settings.column_width(match layout {
-        Layout::Rail => Layout::Rail,
-        Layout::Irc => Layout::Irc,
-        Layout::GoogleChat | Layout::Messages => Layout::Messages,
-      })))
+      .w(px(settings.column_width(column_layout(layout))))
       .h_full()
       .flex_shrink_0()
       .child(header)
@@ -930,7 +959,8 @@ impl Render for ConvList {
 mod tests {
   use gchat_core::{GroupId, Shortcut};
 
-  use super::{ViewRow, open_row};
+  use super::{ViewRow, column_layout, is_narrow, open_row};
+  use crate::settings::{COLUMN_MIN_WIDTH, Layout};
   use crate::store::View;
 
   fn jordan() -> GroupId {
@@ -963,5 +993,22 @@ mod tests {
     let open = View::Conversation(jordan());
     assert_eq!(open_row(&open, std::iter::empty(), |_| Some(4)), Some(4));
     assert_eq!(open_row(&View::Mail, std::iter::empty(), |_| Some(4)), None);
+  }
+
+  #[test]
+  fn rows_stack_only_in_a_column_under_the_title_width() {
+    assert!(is_narrow(COLUMN_MIN_WIDTH));
+    assert!(is_narrow(299.5));
+    assert!(!is_narrow(300.));
+    assert!(!is_narrow(Layout::Messages.default_width()));
+    assert!(!is_narrow(Layout::Rail.default_width()));
+  }
+
+  #[test]
+  fn google_chat_takes_the_messages_column() {
+    assert_eq!(column_layout(Layout::GoogleChat), Layout::Messages);
+    assert_eq!(column_layout(Layout::Messages), Layout::Messages);
+    assert_eq!(column_layout(Layout::Rail), Layout::Rail);
+    assert_eq!(column_layout(Layout::Irc), Layout::Irc);
   }
 }

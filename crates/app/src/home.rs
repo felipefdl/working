@@ -259,12 +259,16 @@ pub struct RowMarks {
   pub selected: bool,
   /// A pinned conversation shows a pin beside its time.
   pub pin: bool,
+  /// The row is stacked for a narrow column: the time ends the name's line and the marks end the preview's, so the
+  /// name keeps the width a one-line cluster would take.
+  pub stacked: bool,
 }
 
-/// One conversation: avatar, name, a preview line led by "You:" or the sender's name, then at the right the muted mark
-/// while muted, the pin while pinned (`RowMarks::pin`), the time of the last message, and `ui::unread_mark`; name,
-/// preview, and time stand out while it shows as unread (`store::shows_unread`). A click opens it; a right-click shows
-/// its menu. The caller sets the id and may restyle the frame.
+/// One conversation: avatar, name, a preview line led by "You:" or the sender's name, the time of the last message,
+/// the muted mark while muted, the pin while pinned (`RowMarks::pin`), and `ui::unread_mark`; name, preview, and time
+/// stand out while it shows as unread (`store::shows_unread`). The marks and the time sit on one line at the right, or
+/// with `RowMarks::stacked` the time ends the name's line and the marks end the preview's. A click opens it; a
+/// right-click shows its menu. The caller sets the id and may restyle the frame.
 pub fn conv_row(
   handle: &Entity<Store>,
   store: &Store,
@@ -279,6 +283,31 @@ pub fn conv_row(
   let opened = g.id.clone();
   let right_click = conversation_menu(handle, g.id.clone());
   let handle = handle.clone();
+  let name = div()
+    .truncate()
+    .text_size(px(14.))
+    .text_color(rgb(TEXT))
+    .when(unread, |d| d.font_weight(FontWeight::SEMIBOLD))
+    .child(conv.name.clone());
+  let preview = div()
+    .truncate()
+    .text_size(px(13.))
+    .text_color(rgb(MUTED))
+    .when(unread, |d| d.text_color(rgb(TEXT)))
+    .child(emoji_font::text(conv.preview.clone()));
+  let time = div()
+    .flex_shrink_0()
+    .text_size(px(12.))
+    .text_color(rgb(MUTED))
+    .when(unread, |d| d.font_weight(FontWeight::SEMIBOLD).text_color(rgb(TEXT)))
+    .child(util::rel_time(time));
+  // The muted mark and the pin, ahead of the time (one line) or of the unread mark (stacked).
+  let flags = |line: Div| {
+    line
+      .when(g.muted, |d| d.child(muted_mark()))
+      .when(marks.pin && g.pinned, |d| d.child(icon(Icon::Pin, 12., MUTED)))
+  };
+  let text = v_flex().flex_1().min_w_0().gap_0p5();
   h_flex()
     .id(id)
     .h(px(ROW_HEIGHT))
@@ -295,44 +324,18 @@ pub fn conv_row(
     })
     .on_mouse_down(MouseButton::Right, right_click)
     .child(group_avatar(&store.images, cx, g, 40.))
-    .child(
-      v_flex()
-        .flex_1()
-        .min_w_0()
-        .gap_0p5()
-        .child(
-          div()
-            .truncate()
-            .text_size(px(14.))
-            .text_color(rgb(TEXT))
-            .when(unread, |d| d.font_weight(FontWeight::SEMIBOLD))
-            .child(conv.name.clone()),
-        )
-        .child(
-          div()
-            .truncate()
-            .text_size(px(13.))
-            .text_color(rgb(MUTED))
-            .when(unread, |d| d.text_color(rgb(TEXT)))
-            .child(emoji_font::text(conv.preview.clone())),
-        ),
-    )
-    .child(
-      h_flex()
-        .flex_shrink_0()
-        .gap_2()
-        .items_center()
-        .when(g.muted, |d| d.child(muted_mark()))
-        .when(marks.pin && g.pinned, |d| d.child(icon(Icon::Pin, 12., MUTED)))
-        .child(
-          div()
-            .text_size(px(12.))
-            .text_color(rgb(MUTED))
-            .when(unread, |d| d.font_weight(FontWeight::SEMIBOLD).text_color(rgb(TEXT)))
-            .child(util::rel_time(time)),
-        )
-        .child(unread_mark(g)),
-    )
+    .map(|row| {
+      if marks.stacked {
+        let first = h_flex().gap_2().items_center().child(name.flex_1().min_w_0()).child(time);
+        let second = flags(h_flex().gap_2().items_center().child(preview.flex_1().min_w_0())).child(unread_mark(g));
+        row.child(text.child(first).child(second))
+      } else {
+        let cluster = flags(h_flex().flex_shrink_0().gap_2().items_center())
+          .child(time)
+          .child(unread_mark(g));
+        row.child(text.child(name).child(preview)).child(cluster)
+      }
+    })
 }
 
 /// One message found by the search or listed by a shortcut: sender, conversation, time, and the text with the
