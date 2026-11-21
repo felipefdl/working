@@ -254,6 +254,12 @@ fn settle_mention(group: &mut Group, known: bool, history: Option<&History>, me:
     });
 }
 
+/// Whether a hit of the Mentions search marks its conversation (`group`, `None` when it is not listed) as mentioned:
+/// a message from someone else, in an unread conversation, sent after the conversation's `last_read_time`.
+fn seeds_mention(hit: &SearchHit, group: Option<&Group>, me: &str) -> bool {
+  hit.sender_id != me && group.is_some_and(|group| group.unread && hit.time > group.last_read_time)
+}
+
 /// One page of messages as converted: oldest topic first, replies after their first message.
 #[derive(Default)]
 struct Converted {
@@ -579,7 +585,7 @@ async fn run(
     async move {
       // The cached list already names the recent conversations: their histories load while the list refreshes.
       engine.prefetch_histories();
-      let result = engine.sync_world(true).await;
+      let result = engine.sync_world_and_mentions(true).await;
       engine.report(result);
     }
   });
@@ -865,6 +871,44 @@ impl Engine {
       self.emit(Event::People(people_list(users.values(), me_id)));
     }
     self.groups_changed.notify_one();
+  }
+
+  /// Reads the conversation list (`sync_world`); once it is in, the mention marks are seeded from the Mentions search
+  /// (`seed_mentions`) in the background.
+  async fn sync_world_and_mentions(self: &Arc<Self>, prefetch: bool) -> Result<()> {
+    self.sync_world(prefetch).await?;
+    tokio::spawn(self.clone().seed_mentions());
+    Ok(())
+  }
+
+  /// Marks the conversations that the newest page of the Mentions search names (`seeds_mention`), for mentions that
+  /// neither the stream nor a held history showed, such as one that came while the app was closed. One request, a
+  /// read (so also under `WORKING_READONLY=1`), with no paging; the Mentions shortcut's hits, cursor, and cache file
+  /// are left alone. Each mark goes through `update_group`, so a held history that reaches past the read cursor still
+  /// decides, reading the conversation clears it, and a change is published. A failed request is logged and ignored.
+  /// The search answers direct @mentions of the user only, never @all: checked read-only against a live account, the
+  /// held histories had @all messages from others newer than the page's oldest hit and none of them was a hit, while
+  /// every held direct mention in that span was. So an @all that came while the app was closed, in a conversation
+  /// whose history is not held, still shows as plain unread.
+  async fn seed_mentions(self: Arc<Self>) {
+    let me = self.me_id();
+    if me.is_empty() {
+      return;
+    }
+    let hits = match self.search_page("", Some(&me), None).await {
+      Ok((hits, _)) => hits,
+      Err(error) => {
+        tracing::warn!("mention seeding failed: {error:#}");
+        return;
+      },
+    };
+    for hit in &hits {
+      self.update_group(&hit.group, |group| {
+        if seeds_mention(hit, Some(group), &me) {
+          group.mentioned = true;
+        }
+      });
+    }
   }
 
   /// Saves the conversation list; the cache leaves the file alone when nothing in it changed.
@@ -1582,7 +1626,7 @@ impl Engine {
             Ok(_) => {
               engine.session_restored.notify_waiters();
               engine.emit(Event::Connection(Connection::Connecting));
-              let result = engine.sync_world(true).await;
+              let result = engine.sync_world_and_mentions(true).await;
               engine.report(result);
               // Also when the list failed to load: the held one names the recent conversations.
               engine.prefetch_histories();
@@ -3070,8 +3114,15 @@ impl Engine {
           }
           self.emit(Event::Connection(Connection::Online));
           if previous == Some(Connection::Offline) {
-            // Events were missed while offline: reload the list and the conversation on screen.
-            self.queue_world_refresh();
+            // Events were missed while offline: reload the list (and the mention marks with it) and the conversation
+            // on screen.
+            tokio::spawn({
+              let engine = self.clone();
+              async move {
+                let result = engine.sync_world_and_mentions(false).await;
+                engine.report(result);
+              }
+            });
             let open = self
               .state
               .lock()
@@ -5483,5 +5534,29 @@ mod tests {
     };
     super::settle_mention(&mut group, true, Some(&stale), "me");
     assert!(group.mentioned, "a history the stream may have missed messages of");
+  }
+
+  #[test]
+  fn a_mentions_search_hit_marks_only_an_unread_conversation_past_its_read_cursor() {
+    let hit = |sender: &str, time| crate::model::SearchHit {
+      group: GroupId::Dm("DM1".into()),
+      message_id: "m1".into(),
+      topic_id: "m1".into(),
+      sender_id: sender.into(),
+      sender_name: "Jordan Park".into(),
+      sender_avatar: None,
+      text: String::new(),
+      time,
+    };
+    let seeds = |sender, time, group| super::seeds_mention(&hit(sender, time), group, "me");
+    let unread = unread_group(150);
+    assert!(seeds("jpark", 200, Some(&unread)), "after the read time");
+    assert!(!seeds("jpark", 150, Some(&unread)), "at the read time");
+    assert!(!seeds("jpark", 100, Some(&unread)), "before the read time");
+    assert!(!seeds("me", 200, Some(&unread)), "the user's own message");
+    let mut read = unread_group(150);
+    read.unread = false;
+    assert!(!seeds("jpark", 200, Some(&read)), "a read conversation");
+    assert!(!seeds("jpark", 200, None), "a conversation not listed");
   }
 }

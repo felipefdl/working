@@ -352,8 +352,8 @@ impl Builder {
     self.users.get(id).cloned().unwrap_or_default()
   }
 
-  /// Adds a conversation; `read_back` is how many of its newest messages are unread. It is mentioned when one of
-  /// those, from someone else, mentions the demo user.
+  /// Adds a conversation; `read_back` is how many of its newest messages (by time, wherever they sit in the list, as a
+  /// thread reply does) are unread. It is mentioned when one of those, from someone else, mentions the demo user.
   fn group(&mut self, mut group: Group, members: &[&str], chat: Chat, read_back: usize) {
     let messages = chat.messages;
     if let Some(last) = messages.iter().rev().find(|message| !message.system) {
@@ -365,14 +365,21 @@ impl Builder {
         time: last.time,
       });
     }
-    let unread_from = messages.len().saturating_sub(read_back);
-    let first_unread = messages.iter().skip(unread_from).map(|message| message.time).min();
+    let mut times: Vec<Micros> = messages.iter().map(|message| message.time).collect();
+    times.sort_unstable_by(|a, b| b.cmp(a));
+    let first_unread = read_back
+      .min(times.len())
+      .checked_sub(1)
+      .and_then(|index| times.get(index))
+      .copied();
     group.unread = first_unread.is_some();
-    group.mentioned = messages
-      .iter()
-      .skip(unread_from)
-      .any(|message| message.sender_id != ME && message.mentions(ME));
     group.last_read_time = first_unread.map_or(self.now, |time| time - 1);
+    let read = group.last_read_time;
+    group.mentioned = group.unread
+      && messages
+        .iter()
+        .filter(|message| message.time > read)
+        .any(|message| message.sender_id != ME && message.mentions(ME));
     self
       .world
       .members
@@ -642,6 +649,12 @@ fn launch(b: &mut Builder) {
   let mut answer = chat.reply(&mention_id, &me, 4 * HOUR, "Tuesday 9:00 ET. I edited the doc to say so.");
   answer.edited = true;
   chat.add(answer);
+  chat.answer(
+    &mention_id,
+    &jordan,
+    30 * MINUTE,
+    "Thanks for confirming! Updating the press kit now.",
+  );
 
   let mut all = chat.post(&riley, 70 * MINUTE, "@all launch rehearsal moved to 3:30 today, same link.");
   all.spans = marks(&all.text.clone(), &[("@all", SpanKind::MentionAll)]);
@@ -658,7 +671,7 @@ fn launch(b: &mut Builder) {
     group,
     &["demo-jordan", "demo-riley", "demo-sam", "demo-priya", "demo-diego", "demo-mei"],
     chat,
-    2,
+    3,
   );
 }
 
@@ -730,6 +743,46 @@ mod tests {
     let release = named("Release train");
     assert!(release.muted && release.unread && !release.mentioned);
     assert!(world.groups.iter().all(|group| group.unread || !group.mentioned));
+  }
+
+  #[test]
+  fn the_launch_threads_newest_reply_is_unread_and_the_demo_users_is_not() {
+    let world = world(1_000_000_000_000_000);
+    let launch = world
+      .groups
+      .iter()
+      .find(|group| group.name == "Product launch")
+      .expect("Product launch");
+    let messages = &world.histories[&launch.id];
+    let embargo = messages
+      .iter()
+      .find(|message| message.text.contains("press embargo"))
+      .expect("the embargo question");
+    let replies: Vec<_> = messages
+      .iter()
+      .filter(|message| message.topic_id == embargo.topic_id && message.is_thread_reply())
+      .collect();
+    let mine = replies
+      .iter()
+      .find(|message| message.sender_id == ME)
+      .expect("the demo user's reply");
+    let theirs = replies
+      .iter()
+      .find(|message| message.sender_id == "demo-jordan")
+      .expect("Jordan Park's reply");
+    assert!(theirs.time > mine.time);
+    assert!(theirs.time > launch.last_read_time, "Jordan Park's reply is unread");
+    assert!(mine.time <= launch.last_read_time, "the demo user's reply is read");
+    let unread: Vec<&str> = messages
+      .iter()
+      .filter(|message| message.time > launch.last_read_time)
+      .map(|message| message.sender_id.as_str())
+      .collect();
+    assert_eq!(
+      unread,
+      ["demo-jordan", "demo-riley", "demo-priya"],
+      "the unread messages, in list order"
+    );
   }
 
   #[test]
