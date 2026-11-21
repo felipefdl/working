@@ -420,6 +420,9 @@ pub enum Act {
   Thread,
   /// The pointer came onto the message: it is the one with the toolbar now.
   Hover,
+  /// The pointer left the message's row, also when the row moved from under it: the toolbar goes unless the pointer
+  /// went onto it or onto another message.
+  Unhover,
   /// The pointer left a toolbar: the conversation checks whether any message is still pointed at.
   Leave,
 }
@@ -611,9 +614,8 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
       .gap_2()
       .items_start()
       .on_hover(move |hovered, window, cx| {
-        if *hovered {
-          act(Act::Hover, &entered, window, cx);
-        }
+        let act_kind = if *hovered { Act::Hover } else { Act::Unhover };
+        act(act_kind, &entered, window, cx);
       })
       .children(avatar_col)
       .child(content),
@@ -922,9 +924,8 @@ fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
       .px(px(ROW_PAD))
       .items_start()
       .on_hover(move |hovered, window, cx| {
-        if *hovered {
-          act(Act::Hover, &entered, window, cx);
-        }
+        let act_kind = if *hovered { Act::Hover } else { Act::Unhover };
+        act(act_kind, &entered, window, cx);
       })
       .child(time)
       .child(nick)

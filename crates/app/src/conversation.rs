@@ -105,7 +105,7 @@ const FORMAT_BAR: [&[FormatButton]; 3] = [
   ],
 ];
 
-/// Paging state and the messages below the fold, shared with the list's scroll handler.
+/// Paging state and the messages below the fold.
 struct LoadState {
   loading: Cell<bool>,
   reached: Cell<bool>,
@@ -114,8 +114,6 @@ struct LoadState {
   /// False while the list is a window around a search hit: newer pages load at the bottom.
   at_end: Cell<bool>,
   loading_newer: Cell<bool>,
-  /// Row count, for the scroll handler to know when the last row is in view.
-  rows: Cell<usize>,
   /// Messages of someone else that came at the end while the list was scrolled up from it, which the pill over the
   /// bottom of the list counts until the list is at its end again.
   unseen: Cell<usize>,
@@ -317,6 +315,11 @@ impl MessageList {
     self.rows.iter().position(|row| row.id == *id)
   }
 
+  /// Whether the list shows its first row: the first row is in view, or the whole list fits.
+  fn at_top(&self) -> bool {
+    self.list.logical_scroll_top().item_ix == 0 || self.list.max_offset_for_scrollbar().y <= px(0.)
+  }
+
   /// Whether the list shows the end of its last row. A list left at its end keeps no scroll position of its own;
   /// scrolled, it is at its end while the last row ends inside the viewport. `ListState::is_scrolled_to_end` cannot
   /// say for a long conversation, whose rows above the ones drawn have no height yet.
@@ -433,7 +436,7 @@ pub struct ConversationView {
   backdrop_kept: bool,
   loaded: bool,
   composer: Entity<TextareaState>,
-  load: Rc<LoadState>,
+  load: LoadState,
   typing_sent: bool,
   typing_task: Option<Task<()>>,
   typing: Vec<(String, String, Instant)>,
@@ -501,15 +504,14 @@ impl ConversationView {
     let caught_up = crate::calendar_layout::now_micros();
     // No thread has been on screen yet: every thread's replies count from the conversation's own time.
     let rows = message::build_rows(&messages, &me_id, |_| Some(read_at_open.unwrap_or(caught_up)));
-    let load = Rc::new(LoadState {
+    let load = LoadState {
       loading: Cell::new(false),
       reached: Cell::new(reached),
       stalled: Cell::new(false),
       at_end: Cell::new(true),
       loading_newer: Cell::new(false),
-      rows: Cell::new(rows.len()),
       unseen: Cell::new(0),
-    });
+    };
 
     let open_person: Opener = {
       let store = store.clone();
@@ -541,30 +543,14 @@ impl ConversationView {
     let threads = group.kind == GroupKind::Space;
     let main = cx.new(|cx| MessageList::new(rows, parts, Some(opener), threads, cx));
     {
-      let (load, core, id) = (load.clone(), core.clone(), group.id.clone());
       let weak = cx.weak_entity();
-      main.read(cx).list.set_scroll_handler(move |event, _, cx| {
-        if event.visible_range.start == 0 {
-          if !load.reached.get() && !load.loading.get() && !load.stalled.get() {
-            load.loading.set(true);
-            core.send(Command::LoadOlder(id.clone()));
-          }
-        } else {
-          load.stalled.set(false);
-        }
-        if event.visible_range.end >= load.rows.get() && !load.at_end.get() && !load.loading_newer.get() {
-          load.loading_newer.set(true);
-          core.send(Command::LoadNewer(id.clone()));
-        }
-        // Messages below the fold are counted: once the scroll is over, see whether the list reached its end. The
-        // event's range is the one the scroll started from, so it cannot say, and the list's state is busy while
-        // this runs.
-        if load.unseen.get() > 0 {
-          let weak = weak.clone();
-          cx.defer(move |cx| {
-            weak.update(cx, Self::check_unseen).ok();
-          });
-        }
+      // The event's range is the one the scroll started from, and the list's state is busy while this runs: once the
+      // scroll is over, see where the list landed.
+      main.read(cx).list.set_scroll_handler(move |_, _, cx| {
+        let weak = weak.clone();
+        cx.defer(move |cx| {
+          weak.update(cx, |this, cx| this.check_scroll(cx)).ok();
+        });
       });
     }
 
@@ -771,11 +757,12 @@ impl ConversationView {
       (Some(new), Some(old)) => reached_end && new.id != old.id && !new.pending && new.sender_id != self.me_id,
       _ => false,
     };
-    // Asked of the rows still on screen, before they are replaced.
-    if incoming
+    // Every message of someone else after the last one on screen counts, whichever message ends the list. Asked of the
+    // rows still on screen, before they are replaced.
+    if reached_end
       && self.load.at_end.get()
-      && !self.main.read(cx).at_end()
       && let Some(old) = &previous
+      && !self.main.read(cx).at_end()
     {
       let arrived = message::arrived(&messages, &old.id, &self.me_id);
       self.load.unseen.set(self.load.unseen.get().saturating_add(arrived));
@@ -1054,11 +1041,25 @@ impl ConversationView {
     cx.notify();
   }
 
-  /// After a scroll of the main list while messages below the fold are counted: at the list's end they are seen and
-  /// the pill goes.
-  fn check_unseen(&mut self, cx: &mut Context<Self>) {
-    if self.load.unseen.get() > 0 && self.main.read(cx).at_end() {
-      self.load.unseen.set(0);
+  /// After a scroll of the main list, from where it landed: away from the top, a load that added nothing may be tried
+  /// again; at the top, older messages are asked for (`check_top`); at the end of a window around a search hit, newer
+  /// ones; at the list's end, the messages counted below the fold are seen and the pill goes. Redraws only for the pill.
+  fn check_scroll(&self, cx: &mut Context<Self>) {
+    let (at_top, at_end) = {
+      let main = self.main.read(cx);
+      (main.at_top(), main.at_end())
+    };
+    let load = &self.load;
+    if !at_top {
+      load.stalled.set(false);
+    }
+    self.check_top(cx);
+    if at_end && !load.at_end.get() && !load.loading_newer.get() {
+      load.loading_newer.set(true);
+      self.core.send(Command::LoadNewer(self.group.id.clone()));
+    }
+    if at_end && load.unseen.get() > 0 {
+      load.unseen.set(0);
       cx.notify();
     }
   }
@@ -1100,7 +1101,6 @@ impl ConversationView {
   /// panel opens or closes and whenever the user sends.
   fn rebuild_main(&mut self, prepended: usize, cx: &mut Context<Self>) {
     let rows = message::build_rows(&self.messages, &self.me_id, |topic| self.thread_seen(topic));
-    self.load.rows.set(rows.len());
     let receipts = self.receipts.clone();
     self.main.update(cx, |list, cx| list.set_rows(rows, prepended, &receipts, cx));
   }
@@ -1116,7 +1116,7 @@ impl ConversationView {
     });
   }
 
-  /// After a layout pass: when the whole history fits or the list sits at the top, ask for older messages.
+  /// After a layout pass: when the list shows its first row, ask for older messages.
   fn schedule_top_check(&mut self, cx: &mut Context<Self>) {
     self._top_check = Some(cx.spawn(async move |this, cx| {
       cx.background_executor().timer(Duration::from_millis(150)).await;
@@ -1124,19 +1124,18 @@ impl ConversationView {
     }));
   }
 
+  /// Asks for older messages while the main list shows its first row (`MessageList::at_top`), unless the start is
+  /// reached, a load is on its way, or the last one added nothing (`LoadState::stalled`).
   fn check_top(&self, cx: &App) {
     let load = &self.load;
     if load.reached.get() || load.loading.get() || load.stalled.get() {
       return;
     }
-    let list = &self.main.read(cx).list;
-    if list.viewport_bounds().size.height <= px(0.) {
+    let main = self.main.read(cx);
+    if main.list.viewport_bounds().size.height <= px(0.) {
       return;
     }
-    let top = list.logical_scroll_top();
-    let fits = list.max_offset_for_scrollbar().y <= px(0.);
-    let at_top = top.item_ix == 0 && top.offset_in_item <= px(1.);
-    if fits || at_top {
+    if main.at_top() {
       load.loading.set(true);
       self.core.send(Command::LoadOlder(self.group.id.clone()));
     }
@@ -1267,6 +1266,16 @@ impl ConversationView {
           self.sync_marks(cx);
         }
         return;
+      },
+      // Once the move is over: another message's row has taken the toolbar by then, or the pointer is on this one's.
+      Act::Unhover => {
+        let id = message.id.clone();
+        return cx.defer_in(window, move |this, _, cx| {
+          if !this.on_tools.get() && this.hovered.as_deref() == Some(id.as_str()) {
+            this.hovered = None;
+            this.sync_marks(cx);
+          }
+        });
       },
       Act::Leave => return self.pointer_left(window, cx),
       Act::Thread => self.open_thread(&message.id, window, cx),
