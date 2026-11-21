@@ -685,6 +685,50 @@ fn conversation_actions_change_the_list() {
 }
 
 #[test]
+fn a_mention_marks_an_unread_conversation_until_it_is_read() {
+  // Seeded an hour back, so the read cursor `MarkRead` sets lands after every message below.
+  let (events, _received) = flume::unbounded();
+  let mut demo = Demo::new(events, super::now_micros() - 3_600_000_000);
+  let group = release();
+  let start = super::now_micros() - 1_000;
+  let base = demo.messages(&group).last().unwrap().clone();
+  assert_ne!(base.sender_id, ME);
+  let message = |id: &str, step: i64, mention: bool, sender: &str| {
+    let mut message = (*base).clone();
+    message.id = id.into();
+    message.topic_id = id.into();
+    message.sender_id = sender.into();
+    message.time = start + step;
+    message.spans = if mention {
+      vec![crate::model::Span {
+        range: 0..0,
+        kind: SpanKind::Mention(ME.into()),
+      }]
+    } else {
+      Vec::new()
+    };
+    std::sync::Arc::new(message)
+  };
+  let mark = |demo: &Demo| {
+    let held = &demo.groups[&group];
+    (held.unread, held.mentioned)
+  };
+  assert_eq!(mark(&demo), (true, false), "muted, unread, no mention");
+  demo.upsert(&message("m1", 1, true, &base.sender_id), None);
+  assert_eq!(mark(&demo), (true, true), "a mention arrived");
+  demo.upsert(&message("m2", 2, false, &base.sender_id), None);
+  assert_eq!(mark(&demo), (true, true), "a later message keeps the earlier mention");
+  demo.upsert(&message("m3", 3, false, ME), None);
+  assert_eq!(mark(&demo), (false, false), "the user's own message reads the conversation");
+  demo.handle(Command::MarkUnread(group.clone()));
+  assert_eq!(mark(&demo), (true, true), "the mention past the read cursor is held");
+  demo.handle(Command::MarkRead(group.clone()));
+  assert_eq!(mark(&demo), (false, false), "read clears it");
+  demo.handle(Command::MarkUnread(group.clone()));
+  assert_eq!(mark(&demo), (true, false), "marked unread by hand, with the mention read");
+}
+
+#[test]
 fn leaving_or_deleting_takes_the_conversation_out_of_the_world() {
   let (mut demo, events) = demo();
   let trio = GroupId::Dm("demo-trio".into());

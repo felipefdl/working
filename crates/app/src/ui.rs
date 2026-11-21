@@ -1,4 +1,4 @@
-//! Shared small widgets: avatars, icons, and switches.
+//! Shared small widgets: avatars, icons, switches, and the marks of a conversation row.
 
 use gchat_core::{Group, GroupKind, PersonStatus};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -63,6 +63,8 @@ pub enum Icon {
   Bot,
   Activity,
   Bell,
+  /// A muted conversation.
+  BellOff,
   Check,
   SmilePlus,
   Pencil,
@@ -88,6 +90,8 @@ pub enum Icon {
   Repeat,
   Trash,
   List,
+  /// The Unread filter.
+  ListFilter,
   Link,
   Bold,
   Italic,
@@ -224,6 +228,9 @@ impl Icon {
       Self::Bell => lucide!(
         r#"<path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M3.262 15.326A1 1 0 0 0 4 17h16a1 1 0 0 0 .74-1.673C19.41 13.956 18 12.499 18 8A6 6 0 0 0 6 8c0 4.499-1.411 5.956-2.738 7.326"/>"#
       ),
+      Self::BellOff => lucide!(
+        r#"<path d="M10.268 21a2 2 0 0 0 3.464 0"/><path d="M17 17H4a1 1 0 0 1-.74-1.673C4.59 13.956 6 12.499 6 8a6 6 0 0 1 .258-1.742"/><path d="m2 2 20 20"/><path d="M8.668 3.01A6 6 0 0 1 18 8c0 2.687.77 4.653 1.707 6.05"/>"#
+      ),
       Self::ArrowDownAZ => lucide!(
         r#"<path d="m3 16 4 4 4-4"/><path d="M7 20V4"/><path d="M20 8h-5"/><path d="M15 10V6.5a2.5 2.5 0 0 1 5 0V10"/><path d="M15 14h5l-5 6h5"/>"#
       ),
@@ -273,6 +280,7 @@ impl Icon {
       Self::List => lucide!(
         r#"<path d="M3 12h.01"/><path d="M3 18h.01"/><path d="M3 6h.01"/><path d="M8 12h13"/><path d="M8 18h13"/><path d="M8 6h13"/>"#
       ),
+      Self::ListFilter => lucide!(r#"<path d="M2 5h20"/><path d="M6 12h12"/><path d="M9 19h6"/>"#),
       Self::Users => lucide!(
         r#"<path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><path d="M16 3.128a4 4 0 0 1 0 7.744"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><circle cx="9" cy="7" r="4"/>"#
       ),
@@ -341,6 +349,37 @@ pub fn count_badge(count: usize) -> Div {
     .font_weight(FontWeight::SEMIBOLD)
     .text_color(rgb(BG))
     .child(text)
+}
+
+/// The mark at the right end of a conversation row, in a 16px square slot whatever it holds, so a row never shifts:
+/// an "@" on an accent disc while its unread activity mentions the user (`store::shows_mention`), an 8px accent dot
+/// while it shows as unread (`store::shows_unread`), nothing otherwise.
+pub fn unread_mark(group: &Group) -> Div {
+  let slot = div().size(px(16.)).flex().flex_shrink_0().items_center().justify_center();
+  if crate::store::shows_mention(group) {
+    slot.child(
+      div()
+        .size(px(16.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(rgb(ACCENT))
+        .text_size(px(10.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(BG))
+        .child("@"),
+    )
+  } else if crate::store::shows_unread(group) {
+    slot.child(div().size(px(8.)).rounded_full().bg(rgb(ACCENT)))
+  } else {
+    slot
+  }
+}
+
+/// The glyph of a muted conversation: `Icon::BellOff`, 12px, `MUTED`, never shrinking.
+pub fn muted_mark() -> impl IntoElement {
+  icon(Icon::BellOff, 12., MUTED)
 }
 
 /// Round avatar: the emoji when there is one, else the image when it is ready, else initials on a colored circle.

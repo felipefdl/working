@@ -237,6 +237,23 @@ impl History {
   }
 }
 
+/// Settles `Group::mentioned` after `group` changed: it holds only while the conversation is unread. A held history
+/// that is loaded and reaches back past the read cursor decides it alone: a message from someone else, newer than
+/// `last_read_time`, that mentions `me`. Short of that, `known` (what the stream told, with the read cursor where it
+/// was) stays, and a held message can only add to it.
+fn settle_mention(group: &mut Group, known: bool, history: Option<&History>, me: &str) {
+  let read = group.last_read_time;
+  group.mentioned = group.unread
+    && history.map_or(known, |history| {
+      let seen = history
+        .messages
+        .iter()
+        .any(|message| message.time > read && message.sender_id != me && message.mentions(me));
+      let whole = history.loaded() && !history.detached && (history.reached_start || history.anchor <= read);
+      seen || (known && !whole)
+    });
+}
+
 /// One page of messages as converted: oldest topic first, replies after their first message.
 #[derive(Default)]
 struct Converted {
@@ -813,7 +830,8 @@ impl Engine {
     first_error.map_or(Ok(()), Err)
   }
 
-  /// Converts the raw conversation list with the users known now and publishes it.
+  /// Converts the raw conversation list with the users known now and publishes it. Each conversation keeps what is
+  /// known of its mentions (`settle_mention`), which the list does not carry.
   fn rebuild_groups(&self, me_id: &str) {
     let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let state = &mut *guard;
@@ -827,7 +845,16 @@ impl Engine {
       .items
       .values()
       .filter_map(|item| convert::group(item, me_id, &state.users, &state.sections))
-      .map(|group| (group.id.clone(), group))
+      .map(|mut group| {
+        // The list carries no mention: the held history decides it, else the earlier flag while the cursor stays.
+        let known = state
+          .groups
+          .get(&group.id)
+          .is_some_and(|held| held.mentioned && held.last_read_time == group.last_read_time);
+        let history = state.histories.get(&group.id);
+        settle_mention(&mut group, known, history, me_id);
+        (group.id.clone(), group)
+      })
       .collect();
     state.groups = groups;
     self.emit(Event::World(Arc::new(state.groups.values().cloned().collect())));
@@ -1143,6 +1170,8 @@ impl Engine {
     history.partial = false;
     self.emit_history(&group, history, 0);
     self.save_history(&group, history);
+    drop(state);
+    self.settle_held_mention(&group);
     Ok(())
   }
 
@@ -1188,6 +1217,8 @@ impl Engine {
     let history = &state.histories[&group];
     self.emit_history(&group, history, prepended);
     self.save_history(&group, history);
+    drop(state);
+    self.settle_held_mention(&group);
     Ok(())
   }
 
@@ -1274,6 +1305,8 @@ impl Engine {
     let history = &state.histories[&group];
     self.emit_history(&group, history, 0);
     self.save_history(&group, history);
+    drop(state);
+    self.settle_held_mention(&group);
     Ok(())
   }
 
@@ -1806,7 +1839,10 @@ impl Engine {
           let result = engine.set_mark_as_unread(&group, time).await;
           if result.is_err() {
             engine.set_marked_unread(&group, marked);
-            engine.update_group(&group, |group| group.unread = before.unread);
+            engine.update_group(&group, |group| {
+              group.unread = before.unread;
+              group.mentioned = before.mentioned;
+            });
           }
           engine.report_change(result, "The conversation was not marked unread.");
         });
@@ -2027,23 +2063,34 @@ impl Engine {
     }
   }
 
-  /// Changes one conversation and publishes it. False when it is unknown or nothing changed.
+  /// Changes one conversation and publishes it. False when it is unknown or nothing changed. A hidden or blocked
+  /// conversation is never unread, and its mention mark is settled (`settle_mention`) after every change.
   fn update_group(&self, id: &GroupId, change: impl FnOnce(&mut Group)) -> bool {
-    let mut state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let state = &mut *guard;
+    let me = state.me_id();
     let Some(group) = state.groups.get_mut(id) else {
       return false;
     };
     let before = group.clone();
     change(group);
-    // A hidden or blocked conversation never counts as unread.
     if group.hidden || group.blocked {
       group.unread = false;
     }
+    // A mark known from the stream holds only while the read cursor stays where it was.
+    let known = group.mentioned && group.last_read_time == before.last_read_time;
+    settle_mention(group, known, state.histories.get(id), &me);
     if *group == before {
       return false;
     }
     self.emit(Event::GroupUpsert(group.clone()));
     true
+  }
+
+  /// Settles a conversation's mention mark against its held history after a page of it arrived, publishing the
+  /// conversation when the mark changed.
+  fn settle_held_mention(&self, id: &GroupId) {
+    self.update_group(id, |_| {});
   }
 
   /// A conversation as held now.
@@ -2178,6 +2225,7 @@ impl Engine {
         engine.update_group(&group, |group| {
           group.hidden = before.hidden;
           group.unread = before.unread;
+          group.mentioned = before.mentioned;
         });
       }
       let failure = if hidden {
@@ -2230,6 +2278,7 @@ impl Engine {
           engine.update_group(&group, |group| {
             group.blocked = before.blocked;
             group.unread = before.unread;
+            group.mentioned = before.mentioned;
           });
         },
       }
@@ -2802,11 +2851,14 @@ impl Engine {
         text: message.preview(),
         time: message.time,
       });
+      let mut known = group.mentioned;
       if message.sender_id == me_id {
         group.unread = false;
       } else if !open && !group.hidden && !group.blocked {
         group.unread = true;
+        known |= message.mentions(&me_id);
       }
+      settle_mention(group, known, state.histories.get(&message.group), &me_id);
       self.emit(Event::GroupUpsert(group.clone()));
     }
     listed
@@ -4895,6 +4947,7 @@ fn created_group(id: GroupId, member_ids: Vec<String>, me: &str, users: &convert
     sort_time: now,
     last_read_time: now,
     unread: false,
+    mentioned: false,
     pinned: false,
     muted: false,
     notify: Notify::All,
@@ -5350,5 +5403,85 @@ mod tests {
     assert_eq!(topics.len(), 2);
     assert_eq!(topics.first().map(|(time, messages)| (*time, messages.len())), Some((90, 2)));
     assert_eq!(topics.last().map(|(time, _)| *time), Some(200));
+  }
+
+  /// `posted` with an @mention of `who` (or @all for `None`).
+  fn mentioning(id: &str, time: i64, who: Option<&str>) -> std::sync::Arc<crate::model::Message> {
+    let mut message = (*posted(id, id, time)).clone();
+    message.spans.push(crate::model::Span {
+      range: 0..0,
+      kind: who.map_or(crate::model::SpanKind::MentionAll, |who| {
+        crate::model::SpanKind::Mention(who.into())
+      }),
+    });
+    std::sync::Arc::new(message)
+  }
+
+  fn unread_group(read: i64) -> crate::model::Group {
+    let mut group = super::created_group(GroupId::Dm("DM1".into()), Vec::new(), "me", &Users::default());
+    group.unread = true;
+    group.last_read_time = read;
+    group
+  }
+
+  #[test]
+  fn the_mention_mark_holds_only_while_unread() {
+    let mut group = unread_group(100);
+    super::settle_mention(&mut group, true, None, "me");
+    assert!(group.mentioned, "a mention the stream told stays while unread");
+    group.unread = false;
+    super::settle_mention(&mut group, true, None, "me");
+    assert!(!group.mentioned, "read clears it");
+    let mut group = unread_group(100);
+    super::settle_mention(&mut group, false, None, "me");
+    assert!(!group.mentioned, "nothing known, nothing held: plain unread");
+  }
+
+  #[test]
+  fn the_mention_mark_comes_from_the_held_history_past_the_read_cursor() {
+    let loaded = |messages| super::History {
+      messages,
+      reached_start: true,
+      fetched: true,
+      ..Default::default()
+    };
+    let history = loaded(vec![posted("m1", "m1", 100), mentioning("m2", 200, Some("me"))]);
+    let mut group = unread_group(150);
+    super::settle_mention(&mut group, false, Some(&history), "me");
+    assert!(group.mentioned, "an unread mention held");
+    let mut group = unread_group(250);
+    super::settle_mention(&mut group, true, Some(&history), "me");
+    assert!(
+      !group.mentioned,
+      "the mention was read: the whole history overrides what was known"
+    );
+
+    let others = loaded(vec![mentioning("m1", 200, Some("rbrooks")), posted("m2", "m2", 300)]);
+    let mut group = unread_group(150);
+    super::settle_mention(&mut group, false, Some(&others), "me");
+    assert!(!group.mentioned, "someone else mentioned");
+    let mut own = (*mentioning("m1", 200, None)).clone();
+    own.sender_id = "me".into();
+    let mine = loaded(vec![std::sync::Arc::new(own)]);
+    super::settle_mention(&mut group, false, Some(&mine), "me");
+    assert!(!group.mentioned, "the user's own @all");
+    let everyone = loaded(vec![mentioning("m1", 200, None)]);
+    super::settle_mention(&mut group, false, Some(&everyone), "me");
+    assert!(group.mentioned, "@all from someone else");
+
+    // A history that starts after the read cursor, or one not loaded, cannot rule a known mention out.
+    let mut partial = loaded(vec![posted("m3", "m3", 400)]);
+    partial.reached_start = false;
+    partial.anchor = 400;
+    let mut group = unread_group(150);
+    super::settle_mention(&mut group, true, Some(&partial), "me");
+    assert!(group.mentioned, "a later message without a mention keeps the earlier one");
+    let stale = super::History {
+      messages: vec![posted("m3", "m3", 400)],
+      reached_start: true,
+      ..Default::default()
+    };
+    super::settle_mention(&mut group, true, Some(&stale), "me");
+    assert!(group.mentioned, "a history the stream may have missed messages of");
   }
 }

@@ -1,4 +1,4 @@
-//! The Rail layout's icon column: one button per pane (Home, Mentions, Starred, then each section and kind) with its
+//! The Rail layout's icon column: one button per pane (All, Mentions, Starred, then each section and kind) with its
 //! unread count, and Calendar, Meet, Mail (with its unread count), and New chat at the bottom.
 
 use gchat_core::Shortcut;
@@ -54,14 +54,14 @@ enum Glyph {
 
 fn glyph(pane: &Pane) -> Glyph {
   match pane {
-    Pane::All | Pane::Unread | Pane::Section(Section::Shortcuts) => Glyph::Icon(Icon::House),
+    Pane::All | Pane::Section(Section::Dms) => Glyph::Icon(Icon::Thread),
+    Pane::Section(Section::Shortcuts) => Glyph::Icon(Icon::House),
     Pane::Shortcut(Shortcut::Mentions) => Glyph::Icon(Icon::AtSign),
     Pane::Shortcut(Shortcut::Starred) => Glyph::Icon(Icon::Star),
     Pane::Kind(Kind::People) => Glyph::Icon(Icon::User),
     Pane::Kind(Kind::Groups) => Glyph::Icon(Icon::Users),
     Pane::Kind(Kind::Spaces) => Glyph::Letter('#'),
     Pane::Kind(Kind::Apps) => Glyph::Icon(Icon::Bot),
-    Pane::Section(Section::Dms) => Glyph::Icon(Icon::Thread),
     Pane::Section(Section::Apps) => Glyph::Icon(Icon::Bot),
     Pane::Section(Section::Meetings) => Glyph::Icon(Icon::Video),
     Pane::Section(Section::Spaces) => Glyph::Letter('#'),
@@ -72,7 +72,7 @@ fn glyph(pane: &Pane) -> Glyph {
 /// The short name under a button's glyph. Its tooltip has the whole title.
 fn label(pane: &Pane) -> &str {
   match pane {
-    Pane::All | Pane::Unread => "Home",
+    Pane::All => "All",
     Pane::Kind(kind) => kind.title(),
     Pane::Section(_) | Pane::Shortcut(_) => pane_title(pane),
   }
@@ -102,15 +102,12 @@ fn badge(count: usize) -> Div {
   count_badge(count).absolute().top(px(-5.)).right(px(-9.))
 }
 
-/// Whether a button is the pane in use. The Unread pane a Messages chip may have left is All narrowed to the unread.
-fn is_picked(store: &Store, pane: &Pane) -> bool {
-  store.pane == *pane || (*pane == Pane::All && store.pane == Pane::Unread)
-}
-
-fn tab_button(handle: &Entity<Store>, ix: usize, tab: &Tab, selected: bool) -> Stateful<Div> {
+/// A pane's button. Mentions and Starred carry their number key in the tooltip and the place menu on a right click, as
+/// their sidebar rows do; the others have their title as the tooltip.
+fn tab_button(store: &Entity<Store>, ix: usize, tab: &Tab, selected: bool) -> Stateful<Div> {
   let color = if selected { TEXT_STRONG } else { MUTED };
-  let (handle, pane, title) = (handle.clone(), tab.pane.clone(), pane_title(&tab.pane).to_string());
-  v_flex()
+  let (handle, pane) = (store.clone(), tab.pane.clone());
+  let button = v_flex()
     .id(("rail", ix))
     .w(px(TAB_WIDTH))
     .h(px(TAB_HEIGHT))
@@ -122,7 +119,6 @@ fn tab_button(handle: &Entity<Store>, ix: usize, tab: &Tab, selected: bool) -> S
     .cursor_pointer()
     .when(selected, |button| button.bg(rgb(ROW_SELECTED)))
     .when(!selected, |button| button.hover(|s| s.bg(rgb(ROW_HOVER))))
-    .tooltip(move |window, cx| Tooltip::new(title.clone()).build(window, cx))
     .on_click(move |_, _, cx| {
       handle.update(cx, |s, cx| s.set_pane(pane.clone(), cx));
     })
@@ -143,7 +139,22 @@ fn tab_button(handle: &Entity<Store>, ix: usize, tab: &Tab, selected: bool) -> S
         .text_size(px(11.))
         .text_color(rgb(color))
         .child(label(&tab.pane).to_string()),
-    )
+    );
+  match &tab.pane {
+    Pane::Shortcut(shortcut) => {
+      let name = match shortcut {
+        Shortcut::Mentions => "Mentions",
+        Shortcut::Starred => "Starred",
+      };
+      button
+        .tooltip(place_tip(name, (*shortcut).into()))
+        .on_mouse_down(MouseButton::Right, menu::place_menu(store, (*shortcut).into()))
+    },
+    Pane::All | Pane::Kind(_) | Pane::Section(_) => {
+      let title = pane_title(&tab.pane).to_string();
+      button.tooltip(move |window, cx| Tooltip::new(title.clone()).build(window, cx))
+    },
+  }
 }
 
 /// A button under the panes for a view of its own, Calendar, Meet, or Mail: it changes what the panel shows, not which
@@ -185,7 +196,7 @@ impl Render for Rail {
       .tabs
       .iter()
       .enumerate()
-      .map(|(ix, tab)| tab_button(&self.store, ix, tab, is_picked(store, &tab.pane)));
+      .map(|(ix, tab)| tab_button(&self.store, ix, tab, store.pane == tab.pane));
     v_flex()
       .w(px(RAIL_WIDTH))
       .h_full()

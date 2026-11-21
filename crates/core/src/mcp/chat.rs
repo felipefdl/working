@@ -31,7 +31,7 @@ use super::shared::{
 };
 use crate::engine::{Engine, Page};
 use crate::fuzzy::Fuzzy;
-use crate::model::{AttachmentKind, Group, GroupId, GroupKind, Message, Micros, Notify, SpanKind};
+use crate::model::{AttachmentKind, Group, GroupId, GroupKind, Message, Micros, Notify};
 
 /// The server's name.
 pub(super) const NAME: &str = "working-chat";
@@ -660,14 +660,6 @@ fn sender(message: &Message) -> &str {
   }
 }
 
-fn mentions(message: &Message, me: &str) -> bool {
-  message.spans.iter().any(|span| match &span.kind {
-    SpanKind::Mention(user) => user == me,
-    SpanKind::MentionAll => true,
-    _ => false,
-  })
-}
-
 fn reacted(message: &Message) -> bool {
   message.reactions.iter().any(|reaction| reaction.mine)
 }
@@ -738,7 +730,7 @@ fn involvement<'a>(group: &'a Group, topics: &'a [Topic], me: &str, since: Micro
     });
     let call = messages
       .iter()
-      .rposition(|message| message.time >= since && !mine(message) && mentions(message, me));
+      .rposition(|message| message.time >= since && !mine(message) && message.mentions(me));
     let answered =
       call.is_some_and(|at| reacted(messages[at]) || messages[at + 1..].iter().any(|message| mine(message)));
     if let Some(at) = call.filter(|_| !answered) {
@@ -1259,6 +1251,7 @@ mod tests {
       sort_time: NOW,
       last_read_time: NOW,
       unread: false,
+      mentioned: false,
       pinned: false,
       muted: false,
       notify: Notify::All,

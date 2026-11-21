@@ -382,14 +382,13 @@ impl RootView {
       }),
       // "System" appearance follows the system's as it changes.
       cx.observe_window_appearance(window, |_, _, cx| settings::apply_appearance(cx)),
-      // The layout rearranges the window: the Rail's list may need its messages. The sort orders and the auto-hide
-      // switch follow the settings too.
+      // The layout rearranges the window; the store takes it and fits its pane to it (`Store::sync_settings`). The sort
+      // orders and the auto-hide switch follow the settings too.
       cx.observe_global::<settings::Settings>(|this, cx| {
         let layout = cx.global::<settings::Settings>().layout;
         if layout != this.layout {
           this.layout = layout;
           this.close_overlay_state();
-          this.store.update(cx, |store, cx| store.sync_pane(cx));
         }
         this.store.update(cx, super::store::Store::sync_settings);
         this.sync_overlay(cx);

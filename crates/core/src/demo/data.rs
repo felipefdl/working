@@ -352,7 +352,8 @@ impl Builder {
     self.users.get(id).cloned().unwrap_or_default()
   }
 
-  /// Adds a conversation; `read_back` is how many of its newest messages are unread.
+  /// Adds a conversation; `read_back` is how many of its newest messages are unread. It is mentioned when one of
+  /// those, from someone else, mentions the demo user.
   fn group(&mut self, mut group: Group, members: &[&str], chat: Chat, read_back: usize) {
     let messages = chat.messages;
     if let Some(last) = messages.iter().rev().find(|message| !message.system) {
@@ -367,6 +368,10 @@ impl Builder {
     let unread_from = messages.len().saturating_sub(read_back);
     let first_unread = messages.iter().skip(unread_from).map(|message| message.time).min();
     group.unread = first_unread.is_some();
+    group.mentioned = messages
+      .iter()
+      .skip(unread_from)
+      .any(|message| message.sender_id != ME && message.mentions(ME));
     group.last_read_time = first_unread.map_or(self.now, |time| time - 1);
     self
       .world
@@ -394,6 +399,7 @@ impl Builder {
       sort_time: 0,
       last_read_time: 0,
       unread: false,
+      mentioned: false,
       pinned: false,
       muted: false,
       notify: Notify::All,
@@ -656,7 +662,7 @@ fn launch(b: &mut Builder) {
   );
 }
 
-/// A long, quiet space: enough messages to page through older history.
+/// A long, muted space with one unread message and no mention: enough messages to page through older history.
 fn release_train(b: &mut Builder) {
   let people = ["demo-riley", "demo-noah", "demo-sam", "demo-diego"].map(|id| b.user(id));
   let (mut group, mut chat) = b.space("demo-release", "Release train", "🚂");
@@ -679,7 +685,7 @@ fn release_train(b: &mut Builder) {
     }
     ago -= 9 * HOUR;
   }
-  b.group(group, &["demo-riley", "demo-noah", "demo-sam", "demo-diego"], chat, 0);
+  b.group(group, &["demo-riley", "demo-noah", "demo-sam", "demo-diego"], chat, 1);
 }
 
 fn coffee(b: &mut Builder) {
@@ -714,6 +720,17 @@ mod tests {
   use std::collections::HashSet;
 
   use super::{BUILD_BOT, ME, world};
+
+  #[test]
+  fn the_seed_has_a_mentioned_space_and_a_muted_unread_one() {
+    let world = world(1_000_000_000_000_000);
+    let named = |name: &str| world.groups.iter().find(|group| group.name == name).expect(name);
+    let launch = named("Product launch");
+    assert!(launch.unread && launch.mentioned, "its unread tail holds an @all");
+    let release = named("Release train");
+    assert!(release.muted && release.unread && !release.mentioned);
+    assert!(world.groups.iter().all(|group| group.unread || !group.mentioned));
+  }
 
   #[test]
   fn spans_fall_on_their_text() {

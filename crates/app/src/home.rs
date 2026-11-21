@@ -1,5 +1,6 @@
-//! Home: every conversation by recency (or the search results) in a virtualized list. Beside the conversation list of
-//! the Messages and Rail layouts it shows only the message search. Also the rows the lists share.
+//! Home: every conversation by recency (or the search results) in a virtualized list, filtered by the chips the
+//! Messages header shares and the Unread switch. Beside the conversation list of the Messages and Rail layouts it shows
+//! only the message search. Also the rows the lists share.
 
 use std::ops::Range;
 use std::sync::Arc;
@@ -11,13 +12,13 @@ use gpui_kit::*;
 
 use gchat_core::{GroupId, SearchHit};
 
-use crate::conv_list::{chip_button, chip_row, kinds_present, sort_button};
+use crate::conv_list::{chips, kinds_present, sort_button};
 use crate::emoji_font;
 use crate::menu;
 use crate::settings::Settings;
-use crate::store::{Conv, Pane, Store};
-use crate::theme::{ACCENT, FIELD, MARK, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, rgb};
-use crate::ui::{Icon, avatar, group_avatar, icon, switch};
+use crate::store::{Conv, Store, shows_unread};
+use crate::theme::{FIELD, MARK, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, rgb};
+use crate::ui::{Icon, avatar, group_avatar, icon, muted_mark, switch, unread_mark};
 use crate::util;
 
 /// Height of a conversation or message row.
@@ -133,21 +134,6 @@ impl Render for HomeView {
     let unread_only = store.unread_only;
     let store_handle = self.store.clone();
 
-    // The filters under the title: All and the kinds of conversation the account has.
-    let mut chips = vec![("All", Pane::All)];
-    chips.extend(kinds_present(store).map(|kind| (kind.title(), Pane::Kind(kind))));
-    let chips = (chips.len() > 1).then(|| {
-      let mut row = chip_row();
-      for (ix, (name, pane)) in chips.into_iter().enumerate() {
-        let on = store.pane == pane || (pane == Pane::All && store.pane == Pane::Unread);
-        let handle = self.store.clone();
-        row = row.child(
-          chip_button(ix, name, on).on_click(move |_, _, cx| handle.update(cx, |s, cx| s.set_pane(pane.clone(), cx))),
-        );
-      }
-      row
-    });
-
     let header = v_flex()
       .flex_shrink_0()
       .child(
@@ -165,7 +151,10 @@ impl Render for HomeView {
             ))
           }),
       )
-      .when_some(chips.filter(|_| !kept), ParentElement::child);
+      // The filters under the title, while the account has a kind to pick besides All.
+      .when(!kept && kinds_present(store).next().is_some(), |header| {
+        header.child(chips(&self.store, store).w_full().px_4().pb_2())
+      });
 
     let body = if count == 0 {
       div()
@@ -272,9 +261,10 @@ pub struct RowMarks {
   pub pin: bool,
 }
 
-/// One conversation: avatar, name, a preview line led by "You:" or the sender's name, the time of the last message,
-/// and a dot while it is unread. A click opens it; a right-click shows its menu. The caller sets the id and may restyle
-/// the frame.
+/// One conversation: avatar, name, a preview line led by "You:" or the sender's name, then at the right the muted mark
+/// while muted, the pin while pinned (`RowMarks::pin`), the time of the last message, and `ui::unread_mark`; name,
+/// preview, and time stand out while it shows as unread (`store::shows_unread`). A click opens it; a right-click shows
+/// its menu. The caller sets the id and may restyle the frame.
 pub fn conv_row(
   handle: &Entity<Store>,
   store: &Store,
@@ -284,6 +274,7 @@ pub fn conv_row(
   cx: &App,
 ) -> Stateful<Div> {
   let g = &conv.g;
+  let unread = shows_unread(g);
   let time = g.snippet.as_ref().map_or(g.sort_time, |s| s.time);
   let opened = g.id.clone();
   let right_click = conversation_menu(handle, g.id.clone());
@@ -314,7 +305,7 @@ pub fn conv_row(
             .truncate()
             .text_size(px(14.))
             .text_color(rgb(TEXT))
-            .when(g.unread, |d| d.font_weight(FontWeight::SEMIBOLD))
+            .when(unread, |d| d.font_weight(FontWeight::SEMIBOLD))
             .child(conv.name.clone()),
         )
         .child(
@@ -322,7 +313,7 @@ pub fn conv_row(
             .truncate()
             .text_size(px(13.))
             .text_color(rgb(MUTED))
-            .when(g.unread, |d| d.text_color(rgb(TEXT)))
+            .when(unread, |d| d.text_color(rgb(TEXT)))
             .child(emoji_font::text(conv.preview.clone())),
         ),
     )
@@ -331,15 +322,16 @@ pub fn conv_row(
         .flex_shrink_0()
         .gap_2()
         .items_center()
+        .when(g.muted, |d| d.child(muted_mark()))
         .when(marks.pin && g.pinned, |d| d.child(icon(Icon::Pin, 12., MUTED)))
         .child(
           div()
             .text_size(px(12.))
             .text_color(rgb(MUTED))
-            .when(g.unread, |d| d.font_weight(FontWeight::SEMIBOLD).text_color(rgb(TEXT)))
+            .when(unread, |d| d.font_weight(FontWeight::SEMIBOLD).text_color(rgb(TEXT)))
             .child(util::rel_time(time)),
         )
-        .child(div().size(px(8.)).rounded_full().when(g.unread, |d| d.bg(rgb(ACCENT)))),
+        .child(unread_mark(g)),
     )
 }
 

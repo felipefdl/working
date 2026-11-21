@@ -716,16 +716,25 @@ impl Demo {
     }
   }
 
+  /// Changes one conversation and tells the UI when something changed. A hidden or blocked conversation never counts
+  /// as unread, and the mention mark follows the messages held, as in the engine.
   fn update_group(&mut self, id: &GroupId, change: impl FnOnce(&mut Group)) {
     let Some(group) = self.groups.get_mut(id) else {
       return;
     };
     let before = group.clone();
     change(group);
-    // A hidden or blocked conversation never counts as unread, as in the engine.
     if group.hidden || group.blocked {
       group.unread = false;
     }
+    // The demo holds every message, so they alone decide the mark.
+    let read = group.last_read_time;
+    group.mentioned = group.unread
+      && self.histories.get(id).is_some_and(|list| {
+        list
+          .iter()
+          .any(|message| message.time > read && message.sender_id != ME && message.mentions(ME))
+      });
     if *group != before {
       let group = group.clone();
       self.emit(Event::GroupUpsert(group));
@@ -1114,14 +1123,7 @@ impl Demo {
     } else {
       match shortcut {
         Shortcut::Starred => self.hits(|message| message.starred),
-        Shortcut::Mentions => self.hits(|message| {
-          message.sender_id != ME
-            && message.spans.iter().any(|span| match &span.kind {
-              crate::model::SpanKind::Mention(id) => id == ME,
-              crate::model::SpanKind::MentionAll => true,
-              _ => false,
-            })
-        }),
+        Shortcut::Mentions => self.hits(|message| message.sender_id != ME && message.mentions(ME)),
       }
     };
     self.emit(Event::Shortcut {
@@ -1172,6 +1174,7 @@ impl Demo {
       sort_time: now_micros(),
       last_read_time: now_micros(),
       unread: false,
+      mentioned: false,
       pinned: false,
       muted: false,
       notify: Notify::All,

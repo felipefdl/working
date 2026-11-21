@@ -1,6 +1,8 @@
 //! The conversation list of the Messages, Rail and IRC layouts beside the open conversation. Messages lists chats
-//! with previews, filtered with chips under a header of buttons; Rail lists the pane its icon column picked; IRC has
-//! the Messages header and chips over one line of the monospaced name a conversation, as WeeChat's buffer list.
+//! with previews under a header of view buttons, filtered with chips beside the sort button and the Unread toggle;
+//! Rail lists the pane its icon column picked; IRC lists one line of the monospaced name a conversation, as WeeChat's
+//! buffer list, under a filter line, after rows that open the views. Every layout shares one Unread filter
+//! (`Store::unread_only`), combined with the pane in use.
 
 use std::ops::Range;
 
@@ -19,9 +21,9 @@ use crate::meet::OpenMeet;
 use crate::menu;
 use crate::new_chat::OpenNewChat;
 use crate::settings::{Layout, Place, Settings};
-use crate::store::{Conv, Kind, ListRow, Pane, Store, View};
+use crate::store::{Conv, Kind, ListRow, Pane, Store, View, shows_mention, shows_unread};
 use crate::theme::{ACCENT, ACCENT_BG, BORDER, FIELD, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, mono, rgb};
-use crate::ui::{Icon, count_badge, icon, person_status, status_dot};
+use crate::ui::{Icon, count_badge, icon, muted_mark, person_status, status_dot, unread_mark};
 
 /// A list row: the shared conversation row with a sliver of air above and below, so selected rows stand apart.
 const LIST_ROW_HEIGHT: f32 = ROW_HEIGHT + 4.0;
@@ -31,6 +33,8 @@ const PREFETCH_ROWS: usize = 8;
 const BUFFER_ROW_HEIGHT: f32 = 24.0;
 /// Narrowest the Messages list shows its title beside the header buttons.
 const TITLE_MIN_WIDTH: f32 = 300.0;
+/// Height of a filter chip, and of the sort and Unread buttons beside the Messages chips.
+const CHIP_HEIGHT: f32 = 22.;
 
 /// What the rows were filtered by. When any of it changes the list starts over at the top.
 struct Filter {
@@ -50,6 +54,74 @@ impl Filter {
 
   fn matches(&self, store: &Store) -> bool {
     self.pane == store.pane && self.unread_only == store.unread_only && self.query == store.query
+  }
+}
+
+/// A view the IRC buffer list opens from its first rows, as the Messages header buttons do.
+#[derive(Clone, Copy)]
+enum ViewRow {
+  Mentions,
+  Starred,
+  Calendar,
+  Meet,
+  Mail,
+}
+
+impl ViewRow {
+  const ALL: [Self; 5] = [Self::Mentions, Self::Starred, Self::Calendar, Self::Meet, Self::Mail];
+
+  /// The rows the settings show, in order: each under the switch of its Messages header button.
+  fn shown(settings: &Settings) -> impl Iterator<Item = Self> + use<> {
+    let on = [
+      settings.show_mentions,
+      settings.show_starred,
+      settings.calendar,
+      settings.meet,
+      settings.mail,
+    ];
+    Self::ALL.into_iter().zip(on).filter_map(|(row, on)| on.then_some(row))
+  }
+
+  const fn name(self) -> &'static str {
+    match self {
+      Self::Mentions => "Mentions",
+      Self::Starred => "Starred",
+      Self::Calendar => "Calendar",
+      Self::Meet => "Meet",
+      Self::Mail => "Mail",
+    }
+  }
+
+  const fn place(self) -> Place {
+    match self {
+      Self::Mentions => Place::Mentions,
+      Self::Starred => Place::Starred,
+      Self::Calendar => Place::Calendar,
+      Self::Meet => Place::Meet,
+      Self::Mail => Place::Mail,
+    }
+  }
+
+  /// Whether `view` is this row's view.
+  const fn is_open(self, view: &View) -> bool {
+    match self {
+      Self::Mentions => matches!(view, View::Shortcut(Shortcut::Mentions)),
+      Self::Starred => matches!(view, View::Shortcut(Shortcut::Starred)),
+      Self::Calendar => matches!(view, View::Calendar),
+      Self::Meet => matches!(view, View::Meet),
+      Self::Mail => matches!(view, View::Mail),
+    }
+  }
+
+  /// Opens the view, as its Messages header button does.
+  fn open(self, store: &Entity<Store>, window: &mut Window, cx: &mut App) {
+    match self {
+      Self::Mentions => store.update(cx, |s, cx| s.open_shortcut(Shortcut::Mentions, cx)),
+      Self::Starred => store.update(cx, |s, cx| s.open_shortcut(Shortcut::Starred, cx)),
+      Self::Calendar => window.dispatch_action(Box::new(OpenCalendar), cx),
+      Self::Meet => window.dispatch_action(Box::new(OpenMeet), cx),
+      Self::Mail => window.dispatch_action(Box::new(OpenMail), cx),
+    }
   }
 }
 
@@ -88,24 +160,14 @@ impl ConvList {
     }
   }
 
-  /// Lists another pane. The Unread chip and the Unread switch are one filter, so picking a pane ends the switch.
+  /// Lists another pane. The Unread filter stays as it is.
   fn pick(store: &Entity<Store>, pane: Pane, cx: &mut App) {
-    store.update(cx, |store, cx| {
-      if store.unread_only {
-        store.set_unread_only(false, cx);
-      }
-      store.set_pane(pane, cx);
-    });
+    store.update(cx, |store, cx| store.set_pane(pane, cx));
   }
 
-  /// The Rail's Unread switch. Turning it off also ends the Unread pane a Messages chip may have left.
+  /// Turns the Unread filter on or off. The pane stays as it is.
   fn set_only_unread(&mut self, on: bool, cx: &mut Context<Self>) {
-    self.store.update(cx, |store, cx| {
-      store.set_unread_only(on, cx);
-      if !on && store.pane == Pane::Unread {
-        store.set_pane(Pane::All, cx);
-      }
-    });
+    self.store.update(cx, |store, cx| store.set_unread_only(on, cx));
   }
 
   /// A new filter, whoever set it, lists from the first row.
@@ -118,7 +180,8 @@ impl ConvList {
   }
 
   /// Scrolls to the open conversation when it changes, so stepping with the keys or the switcher keeps it in view.
-  fn follow_open(&mut self, store: &Store) {
+  /// `views` is how many view rows come before the conversations (IRC).
+  fn follow_open(&mut self, store: &Store, views: usize) {
     let open = match &store.view {
       View::Conversation(id) => Some(id),
       View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => None,
@@ -127,7 +190,7 @@ impl ConvList {
       return;
     }
     if let Some(ix) = open.and_then(|id| store.list.position(id)) {
-      self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+      self.scroll.scroll_to_item(views + ix, ScrollStrategy::Nearest);
     }
     self.followed = open.cloned();
   }
@@ -135,7 +198,18 @@ impl ConvList {
   fn rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
     let store = self.store.read(cx);
     if !matches!(store.pane, Pane::Shortcut(_)) {
-      return self.conversation_rows(range, store, cx);
+      let settings = cx.global::<Settings>();
+      if settings.layout != Layout::Irc {
+        return self.conversation_rows(range, store, cx);
+      }
+      // IRC: the view rows come first, then the conversations.
+      let views = ViewRow::shown(settings).count();
+      let mut out = Vec::with_capacity(range.len());
+      for (ix, view) in ViewRow::shown(settings).enumerate().take(range.end).skip(range.start) {
+        out.push(self.view_row(ix, view, ix + 1 == views, store, cx).into_any_element());
+      }
+      out.extend(self.conversation_rows(range.start.saturating_sub(views)..range.end.saturating_sub(views), store, cx));
+      return out;
     }
     let Some(hits) = shortcut_hits(store) else {
       return Vec::new();
@@ -151,6 +225,7 @@ impl ConvList {
     rows
   }
 
+  /// The rows `range` of `Store::list`, by their index there.
   fn conversation_rows(&self, range: Range<usize>, store: &Store, cx: &App) -> Vec<AnyElement> {
     let open = match &store.view {
       View::Conversation(id) => Some(id),
@@ -224,11 +299,66 @@ impl ConvList {
     }
   }
 
-  /// IRC: a conversation as one line of its buffer name, after `@` while pinned, bold in the accent color while
-  /// unread. A person's row ends with their status. A click opens it and a right-click shows its menu, as on the
-  /// Messages row.
+  /// IRC: a view as one line of its name, with its number key and, for Mail, the unread count (the name then bold in
+  /// the accent color, as an unread buffer). The open view's row is painted selected. A click opens the view and a
+  /// right-click shows its place menu, as its Messages header button. The `last` view row ends with a rule, so the
+  /// views read apart from the buffers.
+  fn view_row(&self, ix: usize, view: ViewRow, last: bool, store: &Store, cx: &App) -> Stateful<Div> {
+    let open = view.is_open(&store.view);
+    let unread = if matches!(view, ViewRow::Mail) {
+      store.mail.unread as usize
+    } else {
+      0
+    };
+    let handle = self.store.clone();
+    h_flex()
+      .id(("view", ix))
+      .h(px(BUFFER_ROW_HEIGHT))
+      .w_full()
+      .px_3()
+      .gap_2()
+      .items_center()
+      .cursor_pointer()
+      .font_family(mono())
+      .text_size(px(13.))
+      .when(last, |row| row.border_b_1().border_color(rgb(BORDER)))
+      .when(open, |row| row.bg(rgb(ROW_SELECTED)))
+      .when(!open, |row| row.hover(|s| s.bg(rgb(ROW_HOVER))))
+      .tooltip(place_tip(view.name(), view.place()))
+      .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, view.place()))
+      .on_click(move |_, window, cx| view.open(&handle, window, cx))
+      .child(
+        div()
+          .flex_1()
+          .min_w_0()
+          .truncate()
+          .text_color(rgb(if unread > 0 {
+            ACCENT
+          } else if open {
+            TEXT
+          } else {
+            MUTED
+          }))
+          .when(unread > 0, |d| d.font_weight(FontWeight::BOLD))
+          .child(view.name()),
+      )
+      .children(key_hint(&view.place(), cx))
+      .when(unread > 0, |row| row.child(count_badge(unread)))
+  }
+
+  /// IRC: a conversation as one line of its buffer name, after `@` while pinned, bold in the accent color while it
+  /// shows as unread, with its whole name as the tooltip. After the name: the muted mark while muted, the mention mark
+  /// while its unread activity mentions the user, and a person's status. A click opens it and a right-click shows its
+  /// menu, as on the Messages row.
   fn buffer_row(&self, ix: usize, conv: &Conv, selected: bool, cx: &App) -> Stateful<Div> {
     let g = &conv.g;
+    let unread = shows_unread(g);
+    let name = SharedString::from(buffer_name(g));
+    let label = if g.pinned {
+      SharedString::from(format!("@{name}"))
+    } else {
+      name.clone()
+    };
     let opened = g.id.clone();
     let right_click = conversation_menu(&self.store, g.id.clone());
     let handle = self.store.clone();
@@ -244,6 +374,7 @@ impl ConvList {
       .text_size(px(13.))
       .when(selected, |row| row.bg(rgb(ROW_SELECTED)))
       .when(!selected, |row| row.hover(|s| s.bg(rgb(ROW_HOVER))))
+      .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
       .on_click(move |_, window, cx| {
         let group = opened.clone();
         handle.update(cx, |s, cx| s.open(group, window, cx));
@@ -254,26 +385,24 @@ impl ConvList {
           .flex_1()
           .min_w_0()
           .truncate()
-          .text_color(rgb(if g.unread {
+          .text_color(rgb(if unread {
             ACCENT
           } else if selected {
             TEXT
           } else {
             MUTED
           }))
-          .when(g.unread, |d| d.font_weight(FontWeight::BOLD))
-          .child(emoji_font::text(if g.pinned {
-            format!("@{}", buffer_name(g))
-          } else {
-            buffer_name(g)
-          })),
+          .when(unread, |d| d.font_weight(FontWeight::BOLD))
+          .child(emoji_font::text(label)),
       )
+      .when(g.muted, |row| row.child(muted_mark()))
+      .when(shows_mention(g), |row| row.child(unread_mark(g)))
       .when_some(person_status(g, cx), |row, status| row.child(status_dot(status)))
   }
 
   /// Messages: the title with buttons for Mentions, Starred, Calendar, Meet, Mail (with its unread count), and New
-  /// chat, then the filter chips. A column too narrow for both drops the title and makes the buttons smaller.
-  /// IRC: one line, the filter in use (its menu also holds the two orders) and then the buttons, smaller.
+  /// chat, then the filter chips with the sort button and the Unread toggle at their right. A column too narrow for
+  /// both drops the title and makes the buttons smaller.
   fn messages_header(&self, store: &Store, cx: &Context<Self>) -> Div {
     let shown = match &store.view {
       View::Shortcut(shortcut) => Some(*shortcut),
@@ -296,13 +425,11 @@ impl ConvList {
         settings.mail,
       )
     };
-    let irc = cx.global::<Settings>().layout == Layout::Irc;
-    let narrow = !irc && cx.global::<Settings>().column_width(Layout::Messages) < TITLE_MIN_WIDTH;
-    let small = irc || narrow;
-    let fit = move |button: Stateful<Div>| if small { button.size(px(24.)) } else { button };
+    let narrow = cx.global::<Settings>().column_width(Layout::Messages) < TITLE_MIN_WIDTH;
+    let fit = move |button: Stateful<Div>| if narrow { button.size(px(24.)) } else { button };
     let actions = h_flex()
-      .when(small, gpui_kit::Styled::gap_0p5)
-      .when(!small, gpui_kit::Styled::gap_1)
+      .when(narrow, gpui_kit::Styled::gap_0p5)
+      .when(!narrow, gpui_kit::Styled::gap_1)
       .when(show_mentions, |actions| {
         actions.child(fit(shortcut_button("mentions", Icon::AtSign, "Mentions", Shortcut::Mentions)))
       })
@@ -338,23 +465,7 @@ impl ConvList {
             }),
         ))
       })
-      .when(!irc, |actions| actions.child(fit(sort_button("sort-list", cx))))
-      .child(fit(
-        header_button("new-chat", Icon::Plus, false)
-          .tooltip(new_chat_tip)
-          .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenNewChat), cx)),
-      ));
-    if irc {
-      return h_flex()
-        .h(px(32.))
-        .flex_shrink_0()
-        .pl_2()
-        .pr_1()
-        .gap_1()
-        .items_center()
-        .child(self.filter_line(store, cx))
-        .child(actions.flex_shrink_0());
-    }
+      .child(fit(new_chat_button()));
     let title = h_flex()
       .h(px(52.))
       .items_center()
@@ -374,37 +485,68 @@ impl ConvList {
     v_flex()
       .flex_shrink_0()
       .child(title.child(actions.flex_shrink_0().items_center()))
-      .child(self.chips(store))
+      .child(self.chip_row(store, cx))
   }
 
-  /// The filters: All and Unread, then the kinds of conversation the account has. They fit one line at the default
-  /// width, and wrap onto more when the list is dragged narrower.
-  fn chips(&self, store: &Store) -> Div {
-    let mut chips = chip_row();
-    for (ix, pane) in chip_panes(store).into_iter().enumerate() {
-      let chip = chip_button(ix, chip_label(&pane), chip_on(store, &pane));
-      let handle = self.store.clone();
-      chips = chips.child(chip.on_click(move |_, _, cx| Self::pick(&handle, pane.clone(), cx)));
-    }
-    chips
+  /// Messages: the chips, wrapping onto more lines when the list is dragged narrower, and at their right, level with
+  /// their first line, the sort button and the Unread toggle with the count of every unread conversation.
+  fn chip_row(&self, store: &Store, cx: &Context<Self>) -> Div {
+    let on = store.unread_only;
+    let unread = store.pane_unread(&Pane::All);
+    h_flex()
+      .w_full()
+      .px_4()
+      .pb_2()
+      .gap_2()
+      .items_start()
+      .child(chips(&self.store, store).flex_1().min_w_0())
+      .child(
+        h_flex()
+          .flex_shrink_0()
+          .gap_1()
+          .items_center()
+          .child(
+            icon_button("sort-list", Icon::ArrowDownAZ, false, CHIP_HEIGHT, 14.)
+              .tooltip(hint("Sort"))
+              .on_mouse_down(MouseButton::Left, sort_menu(cx)),
+          )
+          .child(
+            icon_button("unread-only", Icon::ListFilter, on, CHIP_HEIGHT, 14.)
+              .relative()
+              .tooltip(hint("Unread only"))
+              .on_click(cx.listener(move |this, _, _, cx| this.set_only_unread(!on, cx)))
+              .when(unread > 0, |button| {
+                button.child(count_badge(unread).absolute().top(px(-4.)).right(px(-6.)))
+              }),
+          ),
+      )
   }
 
-  /// IRC: the filter in use on one line over the buffers. A click opens the menu of the filters the chips offer, the
-  /// one in use checked, and of the two orders.
-  fn filter_line(&self, store: &Store, cx: &App) -> Stateful<Div> {
-    let choices: Vec<(Pane, bool)> = chip_panes(store)
-      .into_iter()
-      .map(|pane| {
-        let on = chip_on(store, &pane);
-        (pane, on)
-      })
-      .collect();
-    let current = choices
-      .iter()
-      .find(|(_, on)| *on)
-      .map_or("All", |(pane, _)| chip_label(pane))
-      .to_string();
-    let sort = cx.global::<Settings>().list_sort;
+  /// IRC: one line, the filter in use (its menu also holds the Unread filter and the two orders) and the New chat
+  /// button. The views open from the first rows of the buffer list.
+  fn irc_header(&self, store: &Store) -> Div {
+    h_flex()
+      .h(px(32.))
+      .flex_shrink_0()
+      .pl_2()
+      .pr_1()
+      .gap_1()
+      .items_center()
+      .child(self.filter_line(store))
+      .child(new_chat_button().size(px(24.)))
+  }
+
+  /// IRC: the filter in use on one line over the buffers: the pane's chip label, and with the Unread filter on
+  /// "Unread" for All or "{label}, unread" for a kind. A click opens the menu of the panes the chips offer (the one in
+  /// use checked, a kind with unread conversations followed by their count), then the Unread filter, then the two
+  /// orders.
+  fn filter_line(&self, store: &Store) -> Stateful<Div> {
+    let label = chip_label(&store.pane);
+    let current = match (&store.pane, store.unread_only) {
+      (_, false) => label.to_string(),
+      (Pane::All, true) => "Unread".to_string(),
+      (Pane::Kind(_) | Pane::Section(_) | Pane::Shortcut(_), true) => format!("{label}, unread"),
+    };
     let handle = self.store.clone();
     h_flex()
       .id("buffer-filter")
@@ -424,16 +566,33 @@ impl ConvList {
       .child(icon(Icon::ChevronDown, 12., MUTED))
       .on_mouse_down(MouseButton::Left, move |event, window, cx| {
         cx.stop_propagation();
-        let mut items: Vec<menu::MenuItem> = choices
-          .iter()
-          .map(|(pane, on)| {
-            let (handle, picked) = (handle.clone(), pane.clone());
-            menu::MenuItem::new(chip_label(pane).to_string(), move |_, cx| {
-              Self::pick(&handle, picked.clone(), cx);
-            })
-            .checked(*on)
+        let store = handle.read(cx);
+        let mut items: Vec<menu::MenuItem> = chip_panes(store)
+          .map(|pane| {
+            let unread = match pane {
+              Pane::All => 0,
+              Pane::Kind(_) | Pane::Section(_) | Pane::Shortcut(_) => store.pane_unread(&pane),
+            };
+            let label = if unread > 0 {
+              format!("{} ({unread})", chip_label(&pane))
+            } else {
+              chip_label(&pane).to_string()
+            };
+            let on = store.pane == pane;
+            let picker = handle.clone();
+            menu::MenuItem::new(label, move |_, cx| Self::pick(&picker, pane.clone(), cx)).checked(on)
           })
           .collect();
+        let only = store.unread_only;
+        let flipper = handle.clone();
+        items.push(
+          menu::MenuItem::new("Unread only", move |_, cx| {
+            flipper.update(cx, |store, cx| store.set_unread_only(!only, cx));
+          })
+          .checked(only)
+          .separated(),
+        );
+        let sort = cx.global::<Settings>().list_sort;
         let mut orders =
           menu::sort_items(sort, |sort, cx| Settings::update(cx, |settings| settings.list_sort = sort)).into_iter();
         if let Some(first) = orders.next() {
@@ -446,7 +605,7 @@ impl ConvList {
 
   /// Rail: the title of the pane and, for conversations, the Unread switch.
   fn rail_header(&self, store: &Store, cx: &Context<Self>) -> Div {
-    let on = only_unread(store);
+    let on = store.unread_only;
     h_flex()
       .h(px(56.))
       .flex_shrink_0()
@@ -480,7 +639,6 @@ impl ConvList {
 pub fn pane_title(pane: &Pane) -> &str {
   match pane {
     Pane::All => "All chats",
-    Pane::Unread => "Unread",
     Pane::Kind(kind) => kind.title(),
     Pane::Section(section) => section.title(),
     Pane::Shortcut(Shortcut::Mentions) => "Mentions",
@@ -517,14 +675,21 @@ pub fn place_tip(name: &'static str, place: Place) -> impl Fn(&mut Window, &mut 
   }
 }
 
+/// The number key that opens a place, dim, for the right end of its row, while it has one.
+pub fn key_hint(place: &Place, cx: &App) -> Option<Div> {
+  let keys = cx.global::<Settings>().hotkey_of(place).and_then(crate::keys::hotkey_keys)?;
+  Some(
+    div()
+      .flex_shrink_0()
+      .text_size(px(11.))
+      .text_color(rgb(MUTED))
+      .child(crate::keys::text(keys)),
+  )
+}
+
 /// A tooltip naming a button.
 pub fn hint(text: &'static str) -> impl Fn(&mut Window, &mut App) -> AnyView {
   move |window, cx| Tooltip::new(text).build(window, cx)
-}
-
-/// Whether the list holds only unread conversations: the Unread switch is on, or the Unread pane is picked.
-fn only_unread(store: &Store) -> bool {
-  store.unread_only || store.pane == Pane::Unread
 }
 
 /// The loaded messages of the Mentions or Starred pane; `None` until the core answers.
@@ -537,8 +702,8 @@ fn shortcut_hits(store: &Store) -> Option<&[SearchHit]> {
 }
 
 /// How many rows the list has: conversations, or in the Rail's Mentions and Starred the messages loaded so far.
-fn row_count(store: &Store, rail: bool) -> usize {
-  if rail && matches!(store.pane, Pane::Shortcut(_)) {
+fn row_count(store: &Store) -> usize {
+  if matches!(store.pane, Pane::Shortcut(_)) {
     shortcut_hits(store).map_or(0, <[SearchHit]>::len)
   } else {
     store.list.rows()
@@ -546,17 +711,15 @@ fn row_count(store: &Store, rail: bool) -> usize {
 }
 
 /// What the list says when it has no rows.
-fn empty_text(store: &Store, rail: bool) -> &'static str {
+fn empty_text(store: &Store) -> &'static str {
   match &store.pane {
-    // The Messages layout opens Mentions and Starred from its buttons; a pane left over from the Rail lists nothing.
-    Pane::Shortcut(_) if !rail => "Pick All or another filter to list your conversations.",
     Pane::Shortcut(_) if shortcut_hits(store).is_none() => "Loading…",
     Pane::Shortcut(Shortcut::Mentions) => "No one has mentioned you yet.",
     Pane::Shortcut(Shortcut::Starred) => "Messages you star in Google Chat show here.",
     _ if !store.query.is_empty() => "No conversations match. Press Enter to search messages.",
-    _ if only_unread(store) => "No unread conversations",
+    _ if store.unread_only => "No unread conversations",
     Pane::Section(_) | Pane::Kind(_) => "No conversations here",
-    Pane::All | Pane::Unread => "No conversations yet",
+    Pane::All => "No conversations yet",
   }
 }
 
@@ -567,46 +730,47 @@ pub fn kinds_present(store: &Store) -> impl Iterator<Item = Kind> + '_ {
     .filter(|kind| store.tabs.iter().any(|tab| tab.pane == Pane::Kind(*kind)))
 }
 
-/// The Messages chips: All and Unread, then People, Groups, Spaces, and Apps when the account has them, then the pane
-/// in use when it is none of those (the Rail can leave a section or Mentions picked).
-fn chip_panes(store: &Store) -> Vec<Pane> {
-  let mut panes = vec![Pane::All, Pane::Unread];
-  panes.extend(kinds_present(store).map(Pane::Kind));
-  if !panes.contains(&store.pane) {
-    panes.push(store.pane.clone());
-  }
-  panes
-}
-
-/// Whether a Messages chip is the filter in use. Unread also reads as on when the Unread switch was left on by the
-/// other layouts, and then All is not.
-fn chip_on(store: &Store, pane: &Pane) -> bool {
-  match pane {
-    Pane::Unread => only_unread(store),
-    Pane::All => store.pane == Pane::All && !store.unread_only,
-    Pane::Kind(_) | Pane::Section(_) | Pane::Shortcut(_) => store.pane == *pane,
-  }
+/// The panes the chips offer: All, then People, Groups, Spaces, and Apps when the account has them.
+fn chip_panes(store: &Store) -> impl Iterator<Item = Pane> + '_ {
+  std::iter::once(Pane::All).chain(kinds_present(store).map(Pane::Kind))
 }
 
 /// The name on a filter's chip. Short, so the chips keep to one line at the list's default width.
 fn chip_label(pane: &Pane) -> &str {
   match pane {
     Pane::All => "All",
-    _ => pane_title(pane),
+    Pane::Kind(_) | Pane::Section(_) | Pane::Shortcut(_) => pane_title(pane),
   }
 }
 
-/// The filter chips: on one line while they fit, wrapped onto more when they do not.
-pub fn chip_row() -> Div {
-  h_flex().w_full().flex_wrap().gap_1().px_4().pb_2()
+/// The filter chips of Home and the Messages header, one exclusive pick of `Store::pane`: All, then each kind of
+/// conversation the account has, the one in use painted. A kind with unread conversations carries an accent dot at
+/// its chip's top-right corner, over the chip so its width never changes. They wrap onto more lines when the width
+/// runs out; the caller sizes and places them.
+pub fn chips(handle: &Entity<Store>, store: &Store) -> Div {
+  let mut row = h_flex().flex_wrap().gap_1();
+  for (ix, pane) in chip_panes(store).enumerate() {
+    let unread = match pane {
+      Pane::All => false,
+      Pane::Kind(_) | Pane::Section(_) | Pane::Shortcut(_) => store.pane_unread(&pane) > 0,
+    };
+    let chip = chip_button(ix, chip_label(&pane), store.pane == pane, unread);
+    let handle = handle.clone();
+    row = row.child(chip.on_click(move |_, _, cx| ConvList::pick(&handle, pane.clone(), cx)));
+  }
+  row
 }
 
-pub fn chip_button(ix: usize, label: &str, on: bool) -> Stateful<Div> {
+/// One filter chip: `on` paints the one in use, `unread` adds the accent dot at its top-right corner.
+fn chip_button(ix: usize, label: &str, on: bool, unread: bool) -> Stateful<Div> {
   div()
     .id(("chip", ix))
+    .relative()
     .flex_shrink_0()
+    .h(px(CHIP_HEIGHT))
     .px_2()
-    .py_0p5()
+    .flex()
+    .items_center()
     .rounded_full()
     .text_size(px(11.))
     .cursor_pointer()
@@ -614,59 +778,106 @@ pub fn chip_button(ix: usize, label: &str, on: bool) -> Stateful<Div> {
     .text_color(rgb(if on { ACCENT } else { TEXT }))
     .when(!on, |chip| chip.hover(|s| s.bg(rgb(BORDER))))
     .child(label.to_string())
+    .when(unread, |chip| {
+      chip.child(
+        div()
+          .absolute()
+          .top(px(-1.))
+          .right(px(-1.))
+          .size(px(6.))
+          .rounded_full()
+          .bg(rgb(ACCENT)),
+      )
+    })
 }
 
-/// A round icon button of the Messages header. `on` paints the one whose view is open.
-fn header_button(id: &'static str, glyph: Icon, on: bool) -> Stateful<Div> {
+/// A round icon button `size` across with a `glyph_size` glyph. `on` paints it as in use.
+fn icon_button(id: &'static str, glyph: Icon, on: bool, size: f32, glyph_size: f32) -> Stateful<Div> {
   div()
     .id(id)
-    .size(px(30.))
+    .size(px(size))
     .flex()
+    .flex_shrink_0()
     .items_center()
     .justify_center()
     .rounded_full()
     .cursor_pointer()
     .when(on, |button| button.bg(rgb(ACCENT_BG)))
     .when(!on, |button| button.hover(|s| s.bg(rgb(ROW_HOVER))))
-    .child(icon(glyph, 16., if on { ACCENT } else { MUTED }))
+    .child(icon(glyph, glyph_size, if on { ACCENT } else { MUTED }))
+}
+
+/// A round icon button of the Messages header. `on` paints the one whose view is open.
+fn header_button(id: &'static str, glyph: Icon, on: bool) -> Stateful<Div> {
+  icon_button(id, glyph, on, 30., 16.)
+}
+
+/// The New chat button of the Messages and IRC headers.
+fn new_chat_button() -> Stateful<Div> {
+  header_button("new-chat", Icon::Plus, false)
+    .tooltip(new_chat_tip)
+    .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenNewChat), cx))
+}
+
+/// What a press on a sort button does: opens the menu of the two orders, the one in `Settings::list_sort` checked,
+/// and picking one writes it.
+fn sort_menu(cx: &App) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+  let current = cx.global::<Settings>().list_sort;
+  move |event, window, cx| {
+    cx.stop_propagation();
+    let items = menu::sort_items(current, |sort, cx| Settings::update(cx, |settings| settings.list_sort = sort));
+    menu::show(event.position, items, window, cx);
+  }
 }
 
 /// The sort button of a list header: opens the menu of the two orders, the one in `Settings::list_sort` checked, and
 /// picking one writes it.
 pub fn sort_button(id: &'static str, cx: &App) -> Stateful<Div> {
-  let current = cx.global::<Settings>().list_sort;
-  header_button(id, Icon::ArrowDownAZ, false).tooltip(hint("Sort")).on_mouse_down(
-    MouseButton::Left,
-    move |event, window, cx| {
-      cx.stop_propagation();
-      let items = menu::sort_items(current, |sort, cx| Settings::update(cx, |settings| settings.list_sort = sort));
-      menu::show(event.position, items, window, cx);
-    },
-  )
+  header_button(id, Icon::ArrowDownAZ, false)
+    .tooltip(hint("Sort"))
+    .on_mouse_down(MouseButton::Left, sort_menu(cx))
 }
 
 impl Render for ConvList {
   fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-    let rail = cx.global::<Settings>().layout == Layout::Rail;
+    let settings = cx.global::<Settings>();
+    let layout = settings.layout;
+    let views = if layout == Layout::Irc {
+      ViewRow::shown(settings).count()
+    } else {
+      0
+    };
     let store = self.store.read(cx);
     self.follow_filter(store);
-    self.follow_open(store);
-    let header = if rail {
-      self.rail_header(store, cx)
-    } else {
-      self.messages_header(store, cx)
+    self.follow_open(store, views);
+    let header = match layout {
+      Layout::Rail => self.rail_header(store, cx),
+      Layout::Irc => self.irc_header(store),
+      Layout::GoogleChat | Layout::Messages => self.messages_header(store, cx),
     };
-    let count = row_count(store, rail);
+    let count = row_count(store);
     let body = if count == 0 {
-      div()
+      // IRC keeps its view rows over the empty text.
+      v_flex()
         .flex_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .px_6()
-        .text_center()
-        .text_color(rgb(MUTED))
-        .child(empty_text(store, rail))
+        .min_h_0()
+        .children(
+          ViewRow::shown(settings)
+            .take(views)
+            .enumerate()
+            .map(|(ix, view)| self.view_row(ix, view, ix + 1 == views, store, cx)),
+        )
+        .child(
+          div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .px_6()
+            .text_center()
+            .text_color(rgb(MUTED))
+            .child(empty_text(store)),
+        )
         .into_any_element()
     } else {
       div()
@@ -675,7 +886,7 @@ impl Render for ConvList {
         .child(
           uniform_list(
             "conv-list",
-            count,
+            views + count,
             cx.processor(|this, range: Range<usize>, _, cx| this.rows(range, cx)),
           )
           .track_scroll(&self.scroll)
@@ -684,7 +895,7 @@ impl Render for ConvList {
         .into_any_element()
     };
     v_flex()
-      .w(px(cx.global::<Settings>().column_width(match cx.global::<Settings>().layout {
+      .w(px(settings.column_width(match layout {
         Layout::Rail => Layout::Rail,
         Layout::Irc => Layout::Irc,
         Layout::GoogleChat | Layout::Messages => Layout::Messages,

@@ -225,6 +225,8 @@ pub fn group(
     last_read_time,
     // A hidden or blocked conversation never counts as unread.
     unread: !hidden && !blocked && (marked_unread || counted_unread || newer),
+    // The wire carries no mention signal: the engine sets it from the messages it sees.
+    mentioned: false,
     pinned: state.and_then(|state| state.starred).unwrap_or(false),
     muted,
     notify: notify(muted, settings.and_then(|settings| settings.room_state)),

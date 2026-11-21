@@ -82,6 +82,10 @@ pub struct Group {
   pub last_read_time: Micros,
   /// True when there is activity newer than `last_read_time`.
   pub unread: bool,
+  /// The unread activity mentions the signed-in user, by name or with @all. Known only from messages the core has
+  /// seen: the stream, and the histories it holds. Never true while the conversation is read.
+  #[serde(default)]
+  pub mentioned: bool,
   /// Pinned in the sidebar.
   pub pinned: bool,
   /// Notifications muted.
@@ -463,6 +467,23 @@ impl Message {
       .map(|card| card.title.clone())
       .filter(|title| !title.is_empty())
       .unwrap_or_else(|| ATTACHMENT_PREVIEW.into())
+  }
+
+  /// Whether the message mentions `me` (a user id), by name or with @all. Never for an empty `me`.
+  pub fn mentions(&self, me: &str) -> bool {
+    !me.is_empty()
+      && self.spans.iter().any(|span| match &span.kind {
+        SpanKind::Mention(user) => user == me,
+        SpanKind::MentionAll => true,
+        SpanKind::Bold
+        | SpanKind::Italic
+        | SpanKind::Strike
+        | SpanKind::Underline
+        | SpanKind::Code
+        | SpanKind::CodeBlock
+        | SpanKind::Link(_)
+        | SpanKind::ListItem => false,
+      })
   }
 }
 

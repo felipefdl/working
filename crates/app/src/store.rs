@@ -7,7 +7,7 @@ use gchat_core::fuzzy::Fuzzy;
 use gchat_core::{
   AttachmentKind, Calendar, CalendarEvent, Command, Connection, Core, Event, Group, GroupId, GroupKind, MailCompose,
   MailLabel, MailMessage, MailReply, MailSignature, MailThread, Mailbox, Message, Micros, Notify, Placement,
-  ReadReceipt, SearchHit, Shortcut, Snippet, SpanKind, User,
+  ReadReceipt, SearchHit, Shortcut, Snippet, User,
 };
 use gpui_kit::*;
 
@@ -134,16 +134,26 @@ pub enum SidebarItem {
   Toggle(Section),
 }
 
-/// What the Messages chips and the Rail select: the conversations listed beside the open one.
+/// What the Home chips, the Messages chips, and the Rail select: the conversations listed. The Unread filter
+/// (`Store::unread_only`) narrows whichever is picked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pane {
   All,
-  Unread,
   /// People, group chats, spaces, or apps, wherever the sidebar places them.
   Kind(Kind),
   Section(Section),
   /// Mentions or Starred: the list shows the shortcut's messages (`Store::shortcut`) instead of conversations.
   Shortcut(Shortcut),
+}
+
+impl Pane {
+  /// Whether `layout` can pick the pane: All and a kind anywhere; a section, Mentions, and Starred only in the Rail.
+  pub const fn fits(&self, layout: Layout) -> bool {
+    match self {
+      Self::All | Self::Kind(_) => true,
+      Self::Section(_) | Self::Shortcut(_) => matches!(layout, Layout::Rail),
+    }
+  }
 }
 
 /// What a conversation is, for the kind filters of Home, the Messages chips, and the Rail.
@@ -189,7 +199,7 @@ impl Kind {
   }
 }
 
-/// One Rail entry: a pane and how many of its conversations are unread.
+/// One Rail entry: a pane and how many of its conversations show as unread (`shows_unread`).
 #[derive(Clone)]
 pub struct Tab {
   pub pane: Pane,
@@ -220,6 +230,16 @@ pub enum View {
   /// Gmail.
   Mail,
   Conversation(GroupId),
+}
+
+impl View {
+  /// The conversation on screen, when the view is one.
+  pub const fn conversation(&self) -> Option<&GroupId> {
+    match self {
+      Self::Conversation(id) => Some(id),
+      Self::Home | Self::Shortcut(_) | Self::Calendar | Self::Meet | Self::Mail => None,
+    }
+  }
 }
 
 /// Google Calendar as the core last answered it, for the Calendar view.
@@ -405,13 +425,14 @@ pub struct ShortcutList {
 const DAY_MICROS: Micros = 86_400_000_000;
 
 /// Whether the list leaves a conversation behind its Show older row under `window`: a space or group chat last
-/// active more than the window's days before `now`, neither pinned, unread, nor `open`. People and apps never are.
+/// active more than the window's days before `now`, neither pinned, shown as unread (`shows_unread`), nor `open`.
+/// People and apps never are.
 pub fn is_older(group: &Group, open: bool, window: ListWindow, now: Micros) -> bool {
   let Some(days) = window.days() else {
     return false;
   };
   let stale = now.saturating_sub(group.sort_time) > Micros::from(days) * DAY_MICROS;
-  matches!(group.kind, GroupKind::Space | GroupKind::GroupDm) && stale && !group.pinned && !group.unread && !open
+  matches!(group.kind, GroupKind::Space | GroupKind::GroupDm) && stale && !group.pinned && !shows_unread(group) && !open
 }
 
 /// A row of the Messages, Rail, and IRC list.
@@ -487,7 +508,24 @@ impl Listing {
   }
 }
 
+/// Unpinned rows a sidebar section shows before its Show all row is clicked.
 const COLLAPSED_ROWS: usize = 8;
+
+/// Which unpinned conversations of a sidebar section get rows, in the section's order: every one while the section
+/// shows all; otherwise the first `COLLAPSED_ROWS`, and past those the ones that show as unread (`shows_unread`) and
+/// the `open` one.
+fn sidebar_rows<'a>(
+  unpinned: &[&'a Arc<Conv>],
+  show_all: bool,
+  open: Option<&GroupId>,
+) -> impl Iterator<Item = &'a Arc<Conv>> {
+  unpinned
+    .iter()
+    .copied()
+    .enumerate()
+    .filter(move |(ix, conv)| show_all || *ix < COLLAPSED_ROWS || shows_unread(&conv.g) || open == Some(&conv.g.id))
+    .map(|(_, conv)| conv)
+}
 
 pub struct Store {
   pub core: Core,
@@ -502,17 +540,21 @@ pub struct Store {
   /// `every` without hidden and blocked conversations: what the browsing lists, unread counts, and the Dock badge
   /// take.
   pub all: Vec<Arc<Conv>>,
-  /// What Home shows: `all` narrowed by the Unread toggle; while there is search text, `every` narrowed by the toggle
-  /// and ranked by the text, best match first. Empty in the layouts with a list beside the conversation, where Home
-  /// shows none.
+  /// What Home shows: `all` narrowed by the kind picked (`pane`) and the Unread filter; while there is search text,
+  /// `every` narrowed by those and ranked by the text, best match first. Empty in the layouts with a list beside the
+  /// conversation, where Home shows none.
   pub home: Vec<Arc<Conv>>,
-  /// What the Messages, Rail, and IRC list shows: `all` narrowed by `pane` and the Unread toggle, pinned first, with
+  /// What the Messages, Rail, and IRC list shows: `all` narrowed by `pane` and the Unread filter, pinned first, with
   /// the conversations older than `list_window` behind a row at the end; while there is search text, `every` narrowed
   /// by those and the text instead, nothing held back. Empty in the Google Chat layout.
   pub list: Listing,
+  /// What the chips or the Rail picked. It always fits the layout (`Pane::fits`): `sync_settings` puts it back to
+  /// All when a layout change leaves one that does not.
   pub pane: Pane,
   /// Every Rail entry: All, Mentions, Starred, the user's own sections, each kind the account has, then Meetings.
   pub tabs: Vec<Tab>,
+  /// How many conversations of each sidebar section show as unread (`shows_unread`), for the sections in `all`.
+  section_unread: HashMap<Section, usize>,
   /// The Google Chat layout's sidebar. Built only while that layout is on.
   pub sidebar: Vec<SidebarItem>,
   pub view: View,
@@ -528,6 +570,8 @@ pub struct Store {
   pub search: Option<Search>,
   /// What the Mentions or Starred view shows.
   pub shortcut: Option<ShortcutList>,
+  /// The Unread filter of every layout: Home and the list keep only the conversations that show as unread
+  /// (`shows_unread`), within whatever `pane` is picked.
   pub unread_only: bool,
   /// Copies of `Settings::list_sort`, `Settings::section_sort`, and the `show_*` switches of the Mentions, Starred,
   /// Calendar, Meet, and Mail buttons, taken by `sync_settings`.
@@ -557,7 +601,7 @@ pub struct Store {
   pub recent: Vec<GroupId>,
   /// What the Dock icon shows: unread conversations, and unread inbox threads while Mail is on.
   badge: usize,
-  /// `notified` changed since `badge` was counted.
+  /// The unread mail count or the account changed since `badge` was counted.
   badge_dirty: bool,
   /// Notifications still showing, by conversation: taken down when the conversation is read.
   notified: HashMap<GroupId, Vec<String>>,
@@ -583,6 +627,7 @@ impl Store {
       list: Listing::default(),
       pane: Pane::All,
       tabs: Vec::new(),
+      section_unread: HashMap::new(),
       sidebar: vec![
         SidebarItem::Header(Section::Shortcuts),
         SidebarItem::Home,
@@ -1034,8 +1079,8 @@ impl Store {
     }
   }
 
-  /// Counts the Dock number again: unread conversations set to notify for everything, and the others only while a
-  /// notification Working posted for them (a mention) is still unread, plus the unread inbox threads while Mail is on.
+  /// Counts the Dock number again: unread conversations set to notify for everything, and those set to notify for
+  /// mentions only while their unread activity mentions the user, plus the unread inbox threads while Mail is on.
   /// Hidden and blocked conversations are out of the lists, so they are out of it too.
   fn count_badge(&mut self) {
     self.badge_dirty = false;
@@ -1045,7 +1090,7 @@ impl Store {
       .filter(|c| c.g.unread)
       .filter(|c| match c.g.notify {
         Notify::All | Notify::MainConversations => true,
-        Notify::Mentions => self.notified.contains_key(&c.g.id),
+        Notify::Mentions => c.g.mentioned,
         Notify::Off => false,
       })
       .count();
@@ -1156,7 +1201,6 @@ impl Store {
   fn clear_notifications(&mut self, group: &GroupId) {
     if let Some(ids) = self.notified.remove(group) {
       crate::notify::clear(&ids);
-      self.badge_dirty = true;
     }
   }
 
@@ -1166,10 +1210,7 @@ impl Store {
     let Some(conv) = self.groups.get(&message.group) else {
       return;
     };
-    let me = self.me_id();
-    let mentioned = message.spans.iter().any(|span| {
-      matches!(&span.kind, SpanKind::MentionAll) || matches!(&span.kind, SpanKind::Mention(id) if *id == me)
-    });
+    let mentioned = message.mentions(&self.me_id());
     let wanted = match conv.g.notify {
       Notify::All => true,
       Notify::MainConversations => mentioned || !message.is_thread_reply(),
@@ -1195,7 +1236,6 @@ impl Store {
     let space = (!direct).then_some(conv.g.name.as_str());
     crate::notify::post(&message.id, &message.group.key(), &message.sender_name, space, &body, sound);
     self.notified.entry(message.group.clone()).or_default().push(message.id.clone());
-    self.badge_dirty = true;
   }
 
   fn upsert_message(
@@ -1266,7 +1306,8 @@ impl Store {
     self.rebuild_lists();
   }
 
-  /// Home or the Messages, Rail, and IRC list, whichever the layout shows, and the Rail tabs.
+  /// Home or the Messages, Rail, and IRC list, whichever the layout shows, the Rail tabs, and the sections' unread
+  /// counts.
   fn rebuild_lists(&mut self) {
     let query = self.query.trim();
     // Searching finds hidden and blocked conversations too, so they can be opened, unhidden, or unblocked again.
@@ -1276,24 +1317,19 @@ impl Store {
       &self.every
     };
     let unread_only = self.unread_only;
+    // `pane` fits the layout, so Home, in the Google Chat layout, only ever has All or a kind.
     let pane = &self.pane;
     let in_pane = |conv: &Arc<Conv>| match pane {
       Pane::All => true,
-      Pane::Unread => conv.g.unread,
       Pane::Kind(kind) => Kind::of(conv.g.kind) == *kind,
       Pane::Section(section) => conv.section == *section,
       Pane::Shortcut(_) => false,
-    };
-    // Home takes the Unread and kind filters; sections and shortcuts belong to the Rail.
-    let in_home = |conv: &Arc<Conv>| match pane {
-      Pane::Unread | Pane::Kind(_) => in_pane(conv),
-      Pane::All | Pane::Section(_) | Pane::Shortcut(_) => true,
     };
     // Home lists conversations only where no list sits beside it, and the list only there.
     let beside = self.layout.keeps_list();
     let mut shown: Vec<Arc<Conv>> = source
       .iter()
-      .filter(|conv| (!unread_only || conv.g.unread) && if beside { in_pane(conv) } else { in_home(conv) })
+      .filter(|conv| (!unread_only || shows_unread(&conv.g)) && in_pane(conv))
       .cloned()
       .collect();
     if query.is_empty() {
@@ -1332,7 +1368,7 @@ impl Store {
     let mut by_section: HashMap<&Section, usize> = HashMap::new();
     let mut by_kind: HashMap<Kind, usize> = HashMap::new();
     for conv in &self.all {
-      let unread = usize::from(conv.g.unread);
+      let unread = usize::from(shows_unread(&conv.g));
       *by_section.entry(&conv.section).or_default() += unread;
       *by_kind.entry(Kind::of(conv.g.kind)).or_default() += unread;
     }
@@ -1372,14 +1408,25 @@ impl Store {
         .map(section_tab),
     );
     self.tabs = tabs;
+    self.section_unread.clear();
+    self
+      .section_unread
+      .extend(by_section.into_iter().map(|(section, unread)| (section.clone(), unread)));
+  }
+
+  /// How many conversations of a pane show as unread: its tab's count, 0 for a pane without a tab.
+  pub fn pane_unread(&self, pane: &Pane) -> usize {
+    self.tabs.iter().find(|tab| tab.pane == *pane).map_or(0, |tab| tab.unread)
+  }
+
+  /// How many conversations of a sidebar section show as unread.
+  pub fn section_unread(&self, section: &Section) -> usize {
+    self.section_unread.get(section).copied().unwrap_or(0)
   }
 
   /// Splits the list by `list_window` around the open conversation.
   fn set_list(&mut self, list: Vec<Arc<Conv>>, searching: bool) {
-    let open = match &self.view {
-      View::Conversation(id) => Some(id),
-      View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => None,
-    };
+    let open = self.view.conversation();
     let now = crate::calendar_layout::now_micros();
     self.list.set(list, searching, self.list_window, open, now);
   }
@@ -1390,7 +1437,8 @@ impl Store {
     cx.notify();
   }
 
-  /// The Google Chat layout's sidebar; the other layouts have none.
+  /// The Google Chat layout's sidebar; the other layouts have none. Its rows depend on the open conversation
+  /// (`sidebar_rows`), so `set_view` builds it again when that changes.
   pub fn rebuild_sidebar(&mut self) {
     if self.layout != Layout::GoogleChat {
       self.sidebar = Vec::new();
@@ -1437,12 +1485,9 @@ impl Store {
         unpinned.sort_by(|a, b| name_key(a).cmp(name_key(b)));
       }
       items.extend(pinned.into_iter().map(|c| SidebarItem::Conv(c.clone())));
-      let shown = if self.show_all.contains(&section) {
-        unpinned.len()
-      } else {
-        unpinned.len().min(COLLAPSED_ROWS)
-      };
-      items.extend(unpinned.iter().take(shown).map(|c| SidebarItem::Conv((*c).clone())));
+      let show_all = self.show_all.contains(&section);
+      let rows = sidebar_rows(&unpinned, show_all, self.view.conversation());
+      items.extend(rows.map(|c| SidebarItem::Conv(c.clone())));
       if unpinned.len() > COLLAPSED_ROWS {
         items.push(SidebarItem::Toggle(section));
       }
@@ -1502,7 +1547,8 @@ impl Store {
   }
 
   /// Loads the shortcut messages the Rail list shows when they are not the ones in `shortcut`, as after another
-  /// layout used it. Call when the pane or the layout changes.
+  /// layout used it, and forgets them when nothing on screen shows them. `set_pane` and `sync_settings` call it when
+  /// the pane or the layout changes.
   pub fn sync_pane(&mut self, cx: &App) {
     let Pane::Shortcut(shortcut) = self.pane else {
       self.drop_shortcut(cx);
@@ -1560,9 +1606,10 @@ impl Store {
   }
 
   /// Takes the layout, the sort orders, the list's window, the Mentions and Starred buttons, and the features from the
-  /// settings, rebuilding the lists when they changed. Call at start and whenever the settings change. Mail turning on
-  /// starts reading Gmail, and turning off stops it (`stop_mail`); a feature going off with its view on screen goes
-  /// Home.
+  /// settings, rebuilding the lists when they changed. Call at start and whenever the settings change. A layout
+  /// change puts the pane back to All when the new layout cannot pick it (`Pane::fits`) and syncs the Rail's shortcut
+  /// messages (`sync_pane`). Mail turning on starts reading Gmail, and turning off stops it (`stop_mail`); a feature
+  /// going off with its view on screen goes Home.
   pub fn sync_settings(&mut self, cx: &mut Context<Self>) {
     let settings = cx.global::<Settings>();
     if settings.list_sort == self.list_sort
@@ -1576,6 +1623,7 @@ impl Store {
     {
       return;
     }
+    let layout_changed = settings.layout != self.layout;
     self.list_sort = settings.list_sort;
     self.layout = settings.layout;
     self.list_window = settings.list_window;
@@ -1585,6 +1633,12 @@ impl Store {
     let mail_was = self.features.mail;
     self.features = settings.features();
     self.event_reminders = settings.event_reminders;
+    if layout_changed {
+      if !self.pane.fits(self.layout) {
+        self.pane = Pane::All;
+      }
+      self.sync_pane(cx);
+    }
     if self.features.mail {
       self.start_mail();
     } else if mail_was {
@@ -1621,16 +1675,13 @@ impl Store {
     self.open(id, window, cx);
   }
 
-  /// Opens the newest unread conversation other than the open one.
+  /// Opens the newest conversation showing as unread (`shows_unread`) other than the open one.
   pub fn open_next_unread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-    let open = match &self.view {
-      View::Conversation(id) => Some(id),
-      View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => None,
-    };
+    let open = self.view.conversation();
     let Some(id) = self
       .all
       .iter()
-      .find(|conv| conv.g.unread && Some(&conv.g.id) != open)
+      .find(|conv| shows_unread(&conv.g) && Some(&conv.g.id) != open)
       .map(|conv| conv.g.id.clone())
     else {
       return;
@@ -1702,8 +1753,10 @@ impl Store {
     cx.notify();
   }
 
-  /// Switches the view, recording the one it leaves as a step Back can return to.
+  /// Switches the view, recording the one it leaves as a step Back can return to. A change of the open conversation
+  /// builds the sidebar again, whose rows depend on it.
   fn set_view(&mut self, view: View) {
+    let reopened = view.conversation() != self.view.conversation();
     if view != self.view && !self.moving {
       self.back.push(std::mem::replace(&mut self.view, View::Home));
       if self.back.len() > HISTORY_LIMIT {
@@ -1715,6 +1768,9 @@ impl Store {
     // Who has read a conversation belongs to it alone.
     if self.receipts.as_ref().is_some_and(|held| !self.is_open(&held.group)) {
       self.receipts = None;
+    }
+    if reopened {
+      self.rebuild_sidebar();
     }
   }
 
@@ -2172,6 +2228,17 @@ pub const fn listed(group: &Group) -> bool {
   !group.hidden && !group.blocked
 }
 
+/// Whether the lists show a conversation as unread (bold, marked, counted, kept by the Unread filter): it is unread,
+/// and a muted one only once it mentions the user, as the Google Chat web app does.
+pub const fn shows_unread(group: &Group) -> bool {
+  group.unread && (!group.muted || group.mentioned)
+}
+
+/// Whether the unread mark is the mention one.
+pub const fn shows_mention(group: &Group) -> bool {
+  group.unread && group.mentioned
+}
+
 /// Sections in sidebar order: the user's own A to Z, then the fixed ones. Only those in `present`.
 fn ordered<'a>(present: impl Iterator<Item = &'a Section>) -> Vec<Section> {
   let present: Vec<&Section> = present.collect();
@@ -2203,8 +2270,11 @@ pub const fn shows(view: &View, features: Features) -> bool {
 mod tests {
   use std::sync::Arc;
 
-  use super::{Calling, Conv, DAY_MICROS, ListRow, Listing, Section, View, conv, is_older, shows};
-  use crate::settings::{Features, ListWindow, Sort};
+  use super::{
+    Calling, Conv, DAY_MICROS, Kind, ListRow, Listing, Pane, Section, View, conv, is_older, shows, shows_mention,
+    shows_unread, sidebar_rows,
+  };
+  use crate::settings::{Features, Layout, ListWindow, Sort};
   use gchat_core::{Group, GroupId, GroupKind, Micros, Notify, Placement};
 
   #[test]
@@ -2238,6 +2308,7 @@ mod tests {
       sort_time: 0,
       last_read_time: 0,
       unread: false,
+      mentioned: false,
       pinned: false,
       muted: false,
       notify: Notify::All,
@@ -2394,5 +2465,71 @@ mod tests {
     assert_eq!(names(listing.visible()), ["launch", "garden-club", "riley-brooks", "archive"]);
     assert_eq!(listing.rows(), 4);
     assert!(listing.older.is_empty());
+  }
+
+  #[test]
+  fn sections_and_shortcuts_fit_only_the_rail() {
+    for layout in Layout::ALL {
+      assert!(Pane::All.fits(layout));
+      assert!(Pane::Kind(Kind::Spaces).fits(layout));
+      let rail = layout == Layout::Rail;
+      assert_eq!(Pane::Section(Section::Dms).fits(layout), rail);
+      assert_eq!(Pane::Shortcut(gchat_core::Shortcut::Mentions).fits(layout), rail);
+    }
+  }
+
+  #[test]
+  fn a_muted_conversation_shows_as_unread_only_once_it_mentions_the_user() {
+    let mut g = group(GroupKind::Space, Placement::ByKind);
+    assert!(!shows_unread(&g) && !shows_mention(&g));
+    g.unread = true;
+    assert!(shows_unread(&g) && !shows_mention(&g));
+    g.muted = true;
+    assert!(!shows_unread(&g) && !shows_mention(&g));
+    g.mentioned = true;
+    assert!(shows_unread(&g) && shows_mention(&g));
+    g.muted = false;
+    assert!(shows_unread(&g) && shows_mention(&g));
+    g.unread = false;
+    assert!(!shows_unread(&g) && !shows_mention(&g));
+  }
+
+  #[test]
+  fn a_muted_unread_space_is_older_unless_it_mentions_the_user() {
+    let mut space = chat("design-review", GroupKind::Space, 8);
+    space.unread = true;
+    space.muted = true;
+    assert!(is_older(&space, false, ListWindow::Week, NOW));
+    space.mentioned = true;
+    assert!(!is_older(&space, false, ListWindow::Week, NOW));
+  }
+
+  #[test]
+  fn a_section_past_its_first_rows_keeps_its_unread_and_open_conversations() {
+    // Twelve spaces: the tenth unread, the twelfth unread but muted.
+    let convs: Vec<Arc<Conv>> = (0..12)
+      .map(|ix| {
+        let mut g = chat(&format!("space-{ix}"), GroupKind::Space, 1);
+        g.unread = ix == 9 || ix == 11;
+        g.muted = ix == 11;
+        Arc::new(conv(g, ""))
+      })
+      .collect();
+    let unpinned: Vec<&Arc<Conv>> = convs.iter().collect();
+    let spaces = |ixs: &[usize]| -> Vec<String> { ixs.iter().map(|ix| format!("space-{ix}")).collect() };
+
+    assert_eq!(
+      names(sidebar_rows(&unpinned, false, None)),
+      spaces(&[0, 1, 2, 3, 4, 5, 6, 7, 9])
+    );
+    let open = GroupId::Space("space-10".into());
+    assert_eq!(
+      names(sidebar_rows(&unpinned, false, Some(&open))),
+      spaces(&[0, 1, 2, 3, 4, 5, 6, 7, 9, 10])
+    );
+    assert_eq!(
+      names(sidebar_rows(&unpinned, true, None)),
+      spaces(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+    );
   }
 }

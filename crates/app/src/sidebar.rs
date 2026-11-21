@@ -1,26 +1,29 @@
-//! Fixed-width, virtualized sidebar: Home, Mentions, Starred, Calendar, Meet, and Mail, then the Direct messages /
-//! Apps / Spaces sections.
+//! Fixed-width, virtualized sidebar: New chat, Home, Mentions, Starred, Calendar, Meet, and Mail, then the Direct
+//! messages / Apps / Spaces sections, each header with its unread count. It scrolls to the open conversation when that
+//! changes.
 
 use std::ops::Range;
 use std::rc::Rc;
 
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use gchat_core::Shortcut;
+use gchat_core::{GroupId, Shortcut};
 
 use crate::calendar::OpenCalendar;
-use crate::conv_list::place_tip;
+use crate::conv_list::{key_hint, new_chat_tip, place_tip};
 use crate::home::conversation_menu;
+use crate::keys;
 use crate::mail::OpenMail;
 use crate::meet::OpenMeet;
 use crate::menu;
 use crate::new_chat::OpenNewChat;
 use crate::settings::{Layout, Place, Settings};
-use crate::store::{Section, SidebarItem, Store, View};
-use crate::theme::{ACCENT, MUTED, ROW_HOVER, ROW_SELECTED, TEXT, TEXT_DIM, TEXT_STRONG, rgb};
-use crate::ui::{Icon, group_avatar, icon};
+use crate::store::{Section, SidebarItem, Store, View, shows_unread};
+use crate::theme::{MUTED, ROW_HOVER, ROW_SELECTED, TEXT, TEXT_DIM, TEXT_STRONG, rgb};
+use crate::ui::{Icon, count_badge, group_avatar, icon, muted_mark, unread_mark};
 
 const ROW_HEIGHT: f32 = 30.0;
 
@@ -29,6 +32,8 @@ const ROW_HEIGHT: f32 = 30.0;
 pub struct Sidebar {
   store: Entity<Store>,
   scroll: UniformListScrollHandle,
+  /// The open conversation the list last scrolled to.
+  followed: Option<GroupId>,
   _subs: [Subscription; 3],
 }
 
@@ -43,8 +48,31 @@ impl Sidebar {
     Self {
       store,
       scroll: UniformListScrollHandle::new(),
+      followed: None,
       _subs: subs,
     }
+  }
+
+  /// Scrolls to the open conversation when it changes, so stepping with the keys or the switcher keeps it in view.
+  /// A conversation without a row, its section folded, scrolls nothing.
+  fn follow_open(&mut self, store: &Store) {
+    let open = match &store.view {
+      View::Conversation(id) => Some(id),
+      View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => None,
+    };
+    if open == self.followed.as_ref() {
+      return;
+    }
+    let row = open.and_then(|id| {
+      store
+        .sidebar
+        .iter()
+        .position(|item| matches!(item, SidebarItem::Conv(conv) if conv.g.id == *id))
+    });
+    if let Some(ix) = row {
+      self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
+    }
+    self.followed = open.cloned();
   }
 
   fn rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -125,7 +153,7 @@ impl Sidebar {
           .into_any_element(),
         // Bright and bold while the inbox has unread threads, with their number at the right.
         SidebarItem::Mail => {
-          let unread = store.mail.unread;
+          let unread = store.mail.unread as usize;
           row
             .child(
               item_frame(selected_mail)
@@ -134,16 +162,7 @@ impl Sidebar {
                 .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMail), cx))
                 .child(icon(Icon::Mail, 16., TEXT))
                 .child(label("Mail", unread > 0).flex_1())
-                .when(unread > 0, |d| {
-                  d.child(
-                    div()
-                      .flex_shrink_0()
-                      .text_size(px(12.))
-                      .font_weight(FontWeight::SEMIBOLD)
-                      .text_color(rgb(ACCENT))
-                      .child(unread.to_string()),
-                  )
-                })
+                .when(unread > 0, |d| d.child(count_badge(unread).flex_shrink_0()))
                 .children(key_hint(&Place::Mail, cx)),
             )
             .into_any_element()
@@ -152,6 +171,12 @@ impl Sidebar {
           let section = section.clone();
           let title = section.title().to_string();
           let collapsed = store.is_collapsed(&section);
+          // Shortcuts holds no conversations to count.
+          let unread = if section == Section::Shortcuts {
+            0
+          } else {
+            store.section_unread(&section)
+          };
           let store_handle = self.store.clone();
           // Shortcuts is not a list of conversations: it has no order to pick.
           let sort_menu: Option<Rc<dyn Fn(Point<Pixels>, &mut Window, &mut App)>> = if section == Section::Shortcuts {
@@ -199,7 +224,8 @@ impl Sidebar {
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(rgb(MUTED))
                 .child(title),
-            );
+            )
+            .when(unread > 0, |header| header.child(count_badge(unread).flex_shrink_0()));
           let header = match sort_menu {
             Some(open) => {
               let right_click = open.clone();
@@ -234,11 +260,13 @@ impl Sidebar {
         SidebarItem::Conv(conv) => {
           let selected = selected_group.as_ref() == Some(&conv.g.id);
           let id = conv.g.id.clone();
+          let name = conv.name.clone();
           let right_click = conversation_menu(&self.store, conv.g.id.clone());
           let store_handle = self.store.clone();
           row
             .child(
               item_frame(selected)
+                .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
                 .on_click(move |_, window, cx| {
                   let id = id.clone();
                   store_handle.update(cx, |s, cx| s.open(id, window, cx));
@@ -249,13 +277,12 @@ impl Sidebar {
                   div()
                     .flex_1()
                     .min_w_0()
-                    .child(label(conv.name.clone(), conv.g.unread).truncate()),
+                    .child(label(conv.name.clone(), shows_unread(&conv.g)).truncate()),
                 )
                 .children(key_hint(&Place::Conversation(conv.g.id.clone()), cx))
+                .when(conv.g.muted, |d| d.child(muted_mark()))
                 .when(conv.g.pinned, |d| d.child(icon(Icon::Pin, 12., MUTED)))
-                .when(conv.g.unread && !conv.g.pinned, |d| {
-                  d.child(div().size(px(7.)).flex_shrink_0().rounded_full().bg(rgb(ACCENT)))
-                }),
+                .child(unread_mark(&conv.g)),
             )
             .into_any_element()
         },
@@ -314,21 +341,11 @@ fn label(text: impl Into<SharedString>, bold: bool) -> Div {
     .child(text.into())
 }
 
-/// The number key that opens a row's place, dim at the row's right edge, while it has one.
-fn key_hint(place: &Place, cx: &App) -> Option<Div> {
-  let keys = cx.global::<Settings>().hotkey_of(place).and_then(crate::keys::hotkey_keys)?;
-  Some(
-    div()
-      .flex_shrink_0()
-      .text_size(px(11.))
-      .text_color(rgb(MUTED))
-      .child(crate::keys::text(keys)),
-  )
-}
-
 impl Render for Sidebar {
   fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-    let count = self.store.read(cx).sidebar.len();
+    let store = self.store.read(cx);
+    self.follow_open(store);
+    let count = store.sidebar.len();
     v_flex()
       .w(px(cx.global::<Settings>().column_width(Layout::GoogleChat)))
       .h_full()
@@ -338,9 +355,17 @@ impl Render for Sidebar {
           item_frame(false)
             .id("new-chat")
             .h(px(ROW_HEIGHT))
+            .tooltip(new_chat_tip)
             .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenNewChat), cx))
             .child(icon(Icon::Plus, 16., TEXT))
-            .child(label("New chat", false)),
+            .child(label("New chat", false).flex_1())
+            .child(
+              div()
+                .flex_shrink_0()
+                .text_size(px(11.))
+                .text_color(rgb(MUTED))
+                .child(keys::text("secondary-n")),
+            ),
         ),
       )
       .child(
