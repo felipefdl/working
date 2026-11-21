@@ -158,14 +158,16 @@ fn tab_button(store: &Entity<Store>, ix: usize, tab: &Tab, selected: bool) -> St
 }
 
 /// A button under the panes for a view of its own, Calendar, Meet, or Mail: it changes what the panel shows, not which
-/// conversations are listed. `unread` goes over its glyph, as on the panes, when there is any.
+/// conversations are listed. `unread` goes over its glyph, as on the panes, when there is any. It is as tall as a
+/// pane button at its least (`TAB_MIN_HEIGHT`), so the panes above keep the room a short window has.
 fn view_button(id: &'static str, glyph: Icon, name: &'static str, selected: bool, unread: usize) -> Stateful<Div> {
   let color = if selected { TEXT_STRONG } else { MUTED };
   v_flex()
     .id(id)
     .w(px(TAB_WIDTH))
-    .py_1p5()
+    .h(px(TAB_MIN_HEIGHT))
     .flex_shrink_0()
+    .justify_center()
     .items_center()
     .gap_1()
     .rounded(px(10.))
@@ -217,36 +219,43 @@ impl Render for Rail {
           .overflow_y_scroll()
           .children(tabs),
       )
-      .when(show_calendar, |rail| {
-        rail.child(
-          view_button("rail-calendar", Icon::Calendar, "Calendar", store.view == View::Calendar, 0)
-            .tooltip(place_tip("Calendar", Place::Calendar))
-            .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Calendar))
-            .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenCalendar), cx)),
-        )
-      })
-      .when(show_meet, |rail| {
-        rail.child(
-          view_button("rail-meet", Icon::Video, "Meet", store.view == View::Meet, 0)
-            .tooltip(place_tip("Meet", Place::Meet))
-            .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Meet))
-            .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMeet), cx)),
-        )
-      })
-      .when(show_mail, |rail| {
-        rail.child(
-          view_button(
-            "rail-mail",
-            Icon::Mail,
-            "Mail",
-            store.view == View::Mail,
-            store.mail.unread as usize,
-          )
-          .tooltip(place_tip("Mail", Place::Mail))
-          .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Mail))
-          .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMail), cx)),
-        )
-      })
+      // The views, as close together as the panes.
+      .child(
+        v_flex()
+          .flex_shrink_0()
+          .items_center()
+          .gap_1()
+          .when(show_calendar, |views| {
+            views.child(
+              view_button("rail-calendar", Icon::Calendar, "Calendar", store.view == View::Calendar, 0)
+                .tooltip(place_tip("Calendar", Place::Calendar))
+                .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Calendar))
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenCalendar), cx)),
+            )
+          })
+          .when(show_meet, |views| {
+            views.child(
+              view_button("rail-meet", Icon::Video, "Meet", store.view == View::Meet, 0)
+                .tooltip(place_tip("Meet", Place::Meet))
+                .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Meet))
+                .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMeet), cx)),
+            )
+          })
+          .when(show_mail, |views| {
+            views.child(
+              view_button(
+                "rail-mail",
+                Icon::Mail,
+                "Mail",
+                store.view == View::Mail,
+                store.mail.unread as usize,
+              )
+              .tooltip(place_tip("Mail", Place::Mail))
+              .on_mouse_down(MouseButton::Right, menu::place_menu(&self.store, Place::Mail))
+              .on_click(|_, window, cx| window.dispatch_action(Box::new(OpenMail), cx)),
+            )
+          }),
+      )
       .child(
         div()
           .id("rail-new-chat")
