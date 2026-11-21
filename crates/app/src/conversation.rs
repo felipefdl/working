@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gchat_core::{Command, Core, Group, GroupKind, Message, ReadReceipt, SlashCommand, User};
+use gchat_core::{Command, Core, Group, GroupKind, Message, Micros, ReadReceipt, SlashCommand, User};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Paste, RopeExt as _, Textarea, TextareaState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
@@ -186,6 +186,9 @@ struct MessageList {
   nick_width: Cell<(usize, f32)>,
   /// Who has read up to each message.
   readers: Readers,
+  /// The New line: the message it sits above, the first the user had not read when the conversation opened, and
+  /// whether a message past it mentions them.
+  new_line: Option<(SharedString, bool)>,
   marks: Marks,
   parts: ListParts,
   /// The main list's thread footers open the thread; the thread panel has none.
@@ -218,6 +221,7 @@ impl MessageList {
       rows,
       nick_width: Cell::default(),
       readers: Readers::default(),
+      new_line: None,
       marks: Marks::default(),
       parts,
       opener,
@@ -231,6 +235,12 @@ impl MessageList {
   /// Replaces the rows, telling the list only about the changed middle so heights and scroll stay put. Rows that stay
   /// keep what they already worked out (`Row::adopt`).
   fn set_rows(&mut self, mut new: Vec<Row>, prepended: usize, receipts: &[ReadReceipt], cx: &mut Context<Self>) {
+    // The message under the New line starts a run: its sender shows, whoever wrote the one above it.
+    if let Some((id, _)) = &self.new_line
+      && let Some(row) = new.iter_mut().find(|row| row.id == *id)
+    {
+      row.head = true;
+    }
     let old = &mut self.rows;
     let (old_len, new_len) = (old.len(), new.len());
     let mut prefix = 0;
@@ -276,6 +286,31 @@ impl MessageList {
     cx.notify();
   }
 
+  /// Puts the New line above a message, or takes it away. The rows it leaves and comes to are measured again, their
+  /// heights having changed, and the row it comes to starts a run.
+  fn set_new_line(&mut self, line: Option<(SharedString, bool)>, cx: &mut Context<Self>) {
+    if line == self.new_line {
+      return;
+    }
+    let old = std::mem::replace(&mut self.new_line, line);
+    let under = self.new_line.as_ref().map(|(id, _)| id.clone());
+    for id in old.iter().map(|(id, _)| id).chain(&under) {
+      if let Some(ix) = self.rows.iter().position(|row| row.id == *id) {
+        self.list.splice(ix..ix + 1, 1);
+      }
+    }
+    if let Some(row) = under.and_then(|id| self.rows.iter_mut().find(|row| row.id == id)) {
+      row.head = true;
+    }
+    cx.notify();
+  }
+
+  /// The row the New line sits above.
+  fn new_line_row(&self) -> Option<usize> {
+    let (id, _) = self.new_line.as_ref()?;
+    self.rows.iter().position(|row| row.id == *id)
+  }
+
   /// Moves the list's scroll position, and redraws it there.
   fn scroll(&mut self, cx: &mut Context<Self>, to: Option<ListOffset>) {
     match to {
@@ -314,6 +349,11 @@ impl MessageList {
       on_tools: &self.parts.on_tools,
       readers: self.readers.of(id),
       nick_width: message::irc_nick_width(&self.rows, &self.nick_width),
+      new_line: self
+        .new_line
+        .as_ref()
+        .filter(|(line, _)| *line == row.id)
+        .map(|(_, mention)| *mention),
       scale: window.scale_factor(),
     };
     message::render_row(row, &ctx, cx)
@@ -383,6 +423,11 @@ pub struct ConversationView {
   _focus_clear: Option<Task<()>>,
   /// The user asked for the latest messages: scroll to the end when they arrive.
   to_latest: bool,
+  /// The conversation's read time as it was when it opened unread: what the New line of each list is placed by. None
+  /// when it opened read, and once the user writes in it.
+  read_at_open: Option<Micros>,
+  /// The main list's New line is still to be placed: the messages it is placed among have not all come.
+  placing_new_line: bool,
   rewrite_task: Option<Task<()>>,
   /// Which composer is being rewritten: `Some(false)` main, `Some(true)` thread.
   rewriting: Option<bool>,
@@ -498,6 +543,7 @@ impl ConversationView {
     ];
     composer.update(cx, |state, cx| state.focus(window, cx));
 
+    let read_at_open = group.unread.then_some(group.last_read_time);
     let mut view = Self {
       store,
       core,
@@ -533,6 +579,8 @@ impl ConversationView {
       focus: None,
       _focus_clear: None,
       to_latest: false,
+      read_at_open,
+      placing_new_line: read_at_open.is_some(),
       rewrite_task: None,
       rewriting: None,
       rewrite_error: None,
@@ -554,6 +602,7 @@ impl ConversationView {
     view._subs.push(cx.observe(view.images.tick(), |_, _, cx| cx.notify()));
     view._subs.push(cx.observe_global::<crate::ui::People>(|_, cx| cx.notify()));
     view.want_members(cx);
+    view.place_new_line(false, true, cx);
     view.schedule_top_check(cx);
     view
   }
@@ -581,12 +630,46 @@ impl ConversationView {
       view.update(cx, |list, _| list.parts.me_avatar = avatar);
     }
     self.rebuild(0, cx);
+    self.place_new_line(false, true, cx);
     cx.notify();
   }
 
   /// The main list, then the thread panel's when a thread is open.
   fn lists(&self) -> impl Iterator<Item = Entity<MessageList>> + use<> {
     std::iter::once(self.main.clone()).chain(self.thread.as_ref().map(|thread| thread.view.clone()))
+  }
+
+  /// Places the main list's New line, once: above the first message the user had not read when the conversation
+  /// opened (`message::new_line`), where the list then goes with `scroll`. Until the user is known and the messages
+  /// have come there is nothing to place it by. `settled` says the messages are the core's latest: with none of them
+  /// past the read time, the line of a conversation marked unread by hand goes above the newest message of someone
+  /// else, and with none of those the placing ends without a line. Placed, the line stays where it is, whatever comes.
+  fn place_new_line(&mut self, settled: bool, scroll: bool, cx: &mut Context<Self>) {
+    if !self.placing_new_line || !self.loaded || self.me_id.is_empty() {
+      return;
+    }
+    let line = self
+      .read_at_open
+      .and_then(|read| message::new_line(&self.messages, &self.main.read(cx).rows, &self.me_id, read, settled));
+    self.placing_new_line = line.is_none() && !settled;
+    if line.is_none() {
+      return;
+    }
+    self.main.update(cx, |list, cx| {
+      list.set_new_line(line, cx);
+      if scroll && let Some(ix) = list.new_line_row() {
+        list.scroll(cx, Some(ListOffset { item_ix: ix, offset_in_item: px(0.) }));
+      }
+    });
+  }
+
+  /// Takes the New line off both lists: the user wrote, so everything before is read.
+  fn clear_new_line(&mut self, cx: &mut Context<Self>) {
+    self.read_at_open = None;
+    self.placing_new_line = false;
+    for view in self.lists() {
+      view.update(cx, |list, cx| list.set_new_line(None, cx));
+    }
   }
 
   /// Hands what the rows show besides their messages (`Marks`) to both lists.
@@ -654,6 +737,7 @@ impl ConversationView {
     self.load.reached.set(reached_start);
     self.load.at_end.set(reached_end);
     self.load.loading_newer.set(false);
+    self.place_new_line(reached_end, focus.is_none(), cx);
     if let Some(id) = focus {
       self.focus_message(id, window, cx);
     } else if reached_end && self.to_latest {
@@ -1055,6 +1139,7 @@ impl ConversationView {
         files: release(files, window, cx),
         chips,
       });
+      self.clear_new_line(cx);
       scroll_list(&self.main, None, cx);
     }
     self.stop_typing();
@@ -1212,6 +1297,14 @@ impl ConversationView {
     let view = cx.new(|cx| {
       let mut list = MessageList::new(rows, parts, None, false, cx);
       list.readers = Readers::place(&list.rows, &receipts);
+      // The thread's own New line, placed as the main list's is, and the panel opens on it.
+      let line = self
+        .read_at_open
+        .and_then(|read| message::new_line(&self.messages, &list.rows, &self.me_id, read, false));
+      list.set_new_line(line, cx);
+      if let Some(ix) = list.new_line_row() {
+        list.list.scroll_to(ListOffset { item_ix: ix, offset_in_item: px(0.) });
+      }
       list
     });
     let composer = cx.new(|cx| {
@@ -1270,6 +1363,7 @@ impl ConversationView {
       return;
     }
     let group = self.group.id.clone();
+    let sent = !editing;
     if let Some(editing) = self.editing.take_if(|editing| editing.in_thread) {
       self.core.send(Command::Edit {
         group,
@@ -1289,6 +1383,9 @@ impl ConversationView {
       scroll_list(&thread.view, None, cx);
     }
     thread.composer.update(cx, |state, cx| state.set_value("", window, cx));
+    if sent {
+      self.clear_new_line(cx);
+    }
     cx.notify();
   }
 

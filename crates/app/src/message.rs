@@ -228,6 +228,82 @@ pub fn build_thread_rows(messages: &[Arc<Message>], topic: &str, me_id: &str) ->
   Some(rows)
 }
 
+/// Where the New line goes among `rows`, the main list's or a thread panel's, built from `messages`: the id of the
+/// row it sits above, and whether a message past it mentions the user (`receipt_logic::new_line`). A reply the rows
+/// do not show stands for the row of the message that started its thread, and a message without either for nothing;
+/// a line of the conversation itself is never new.
+pub fn new_line(
+  messages: &[Arc<Message>],
+  rows: &[Row],
+  me_id: &str,
+  read: Micros,
+  marked: bool,
+) -> Option<(SharedString, bool)> {
+  let at: HashMap<&str, usize> = rows.iter().enumerate().map(|(ix, row)| (row.msg.id.as_str(), ix)).collect();
+  let sent: Vec<receipt_logic::Sent> = messages
+    .iter()
+    .filter(|msg| !msg.system)
+    .filter_map(|msg| {
+      let row = at.get(msg.id.as_str()).or_else(|| at.get(msg.topic_id.as_str())).copied()?;
+      Some(receipt_logic::Sent {
+        time: msg.time,
+        own: msg.sender_id == me_id,
+        mention: msg.mentions(me_id),
+        row,
+      })
+    })
+    .collect();
+  let line = receipt_logic::new_line(&sent, read, marked)?;
+  Some((rows.get(line.row)?.id.clone(), line.mention))
+}
+
+/// What the New line says: that what follows is new, and when it is so, that it mentions the user.
+const fn new_label(mention: bool) -> &'static str {
+  if mention {
+    "New · mentions you"
+  } else {
+    "New"
+  }
+}
+
+/// The New line above the first message the user has not read: its label between two rules, in the accent color, as
+/// wide as the messages.
+fn new_rule(mention: bool) -> Div {
+  let rule = || div().flex_1().h(px(1.)).bg(rgb(ACCENT));
+  h_flex()
+    .w_full()
+    .max_w(px(780.))
+    .px(px(ROW_PAD))
+    .py_2()
+    .gap_3()
+    .items_center()
+    .child(rule())
+    .child(
+      div()
+        .flex_shrink_0()
+        .text_size(px(11.))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(rgb(ACCENT))
+        .child(new_label(mention)),
+    )
+    .child(rule())
+}
+
+/// The IRC style's New line: written as its date line is, in the accent color.
+fn irc_new_rule(mention: bool) -> Div {
+  h_flex()
+    .w_full()
+    .px(px(ROW_PAD))
+    .py_1()
+    .gap_2()
+    .items_center()
+    .text_size(px(12.))
+    .text_color(rgb(ACCENT))
+    .child(div().w(px(24.)).h(px(1.)).flex_shrink_0().bg(rgb(ACCENT)))
+    .child(div().flex_shrink_0().child(new_label(mention)))
+    .child(div().flex_1().h(px(1.)).bg(rgb(ACCENT)))
+}
+
 /// Who has read up to each message of a list of rows, by message id: their avatars sit on its corner.
 #[derive(Default)]
 pub struct Readers(HashMap<SharedString, Rc<[ReadReceipt]>>);
@@ -291,6 +367,8 @@ pub struct MsgCtx<'a> {
   pub readers: Option<&'a Rc<[ReadReceipt]>>,
   /// IRC style: the width of the sender column, as wide as the longest name among the rows (`irc_nick_width`).
   pub nick_width: f32,
+  /// The New line sits above this message, the first the user has not read: whether a message past it mentions them.
+  pub new_line: Option<bool>,
   /// The window's pixels per point: thumbnails are decoded for the size they are drawn at.
   pub scale: f32,
 }
@@ -332,6 +410,9 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
           .child(date.clone()),
       ),
     );
+  }
+  if let Some(mention) = ctx.new_line {
+    out = out.child(new_rule(mention));
   }
   let prepared = row.prepared();
   if msg.system {
@@ -685,6 +766,9 @@ fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
         .child(div().flex_shrink_0().child(date.clone()))
         .child(div().flex_1().h(px(1.)).bg(rgb(BORDER))),
     );
+  }
+  if let Some(mention) = ctx.new_line {
+    out = out.child(irc_new_rule(mention));
   }
   // A message that shows more than text (an attachment, a card, reactions) stands clear of the rows over and under
   // it. The space is inside its columns, so the rule between them still runs on unbroken.
