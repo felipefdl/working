@@ -57,6 +57,9 @@ fn main() {
   // when the run ends.
   let mut message_times: HashMap<gchat_core::GroupId, Vec<i64>> = HashMap::new();
   let mut read_times: HashMap<gchat_core::GroupId, Vec<i64>> = HashMap::new();
+  // The conversations as last told, and those a history arrived for, for the counts printed when the run ends.
+  let mut conversations: HashMap<gchat_core::GroupId, gchat_core::Group> = HashMap::new();
+  let mut histories: std::collections::HashSet<gchat_core::GroupId> = std::collections::HashSet::new();
   // Google Calendar: the calendars, then five weeks of events around today. `WORKING_PROBE_CALENDAR_WRITE=1`, without
   // `WORKING_READONLY`, also creates one private event without guests, renames it, and deletes it.
   const PROBE_TITLE: &str = "Working probe (safe to delete)";
@@ -111,6 +114,7 @@ fn main() {
     let at = started.elapsed().as_millis();
     if let Event::History { group, messages, .. } = &event {
       message_times.insert(group.clone(), messages.iter().map(|message| message.time).collect());
+      histories.insert(group.clone());
     }
     match event {
       Event::Me(me) => {
@@ -124,6 +128,7 @@ fn main() {
       },
       Event::Connection(connection) => println!("[{at}ms] connection: {connection:?}"),
       Event::World(groups) => {
+        conversations = groups.iter().map(|group| (group.id.clone(), group.clone())).collect();
         let count = |kind| groups.iter().filter(|group| group.kind == kind).count();
         println!(
           "[{at}ms] world: {} groups (dm {}, app {}, group dm {}, space {}), unread {}, pinned {}, unnamed {}, snippets {}, avatars {}",
@@ -250,7 +255,10 @@ fn main() {
         );
         read_times.insert(group, receipts.iter().map(|receipt| receipt.read_time).collect());
       },
-      Event::GroupUpsert(group) => println!("[{at}ms] group upsert: kind={:?} unread={}", group.kind, group.unread),
+      Event::GroupUpsert(group) => {
+        println!("[{at}ms] group upsert: kind={:?} unread={}", group.kind, group.unread);
+        conversations.insert(group.id.clone(), group);
+      },
       Event::MessageUpsert { message, replaces, .. } => {
         println!(
           "[{at}ms] message upsert: chars={} pending={} replaces={}",
@@ -520,6 +528,18 @@ fn main() {
     "read receipts summary: {} conversations, {} receipts: {exact} at a message time, {between} between messages, {after} after the newest message, {before} before the oldest, {unplaced} where no history is held",
     read_times.len(),
     read_times.values().map(Vec::len).sum::<usize>()
+  );
+  let shown: Vec<&gchat_core::Group> = conversations.values().filter(|group| !group.hidden && !group.blocked).collect();
+  let unread: Vec<&gchat_core::Group> = shown.iter().copied().filter(|group| group.unread).collect();
+  println!(
+    "conversations summary: {} listed, {} unread ({} muted, {} mentioned, {} muted and mentioned), {} histories arrived ({} of unread ones)",
+    shown.len(),
+    unread.len(),
+    unread.iter().filter(|group| group.muted).count(),
+    unread.iter().filter(|group| group.mentioned).count(),
+    unread.iter().filter(|group| group.muted && group.mentioned).count(),
+    histories.len(),
+    unread.iter().filter(|group| histories.contains(&group.id)).count()
   );
 }
 

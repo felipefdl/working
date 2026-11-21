@@ -46,8 +46,11 @@ use crate::proto;
 /// Topics per history page, as the web client asks.
 const LATEST_PAGE: i32 = 40;
 const OLDER_PAGE: i32 = 30;
-/// Conversations whose history is fetched right after start, so the first click on them is instant.
-const PREFETCH_GROUPS: usize = 16;
+/// The most recent conversations whose history is fetched right after start, so the first click on them is instant.
+const PREFETCH_RECENT: usize = 16;
+/// Most histories one prefetch asks for: one `list_topics` request each, three at a time. Past what memory holds
+/// (`HELD_HISTORIES`), each prefetched history would push an earlier one out of memory again.
+const PREFETCH_MAX: usize = HELD_HISTORIES;
 const XSRF_MAX_AGE_SECS: u64 = 6 * 3600;
 /// Conversations held in memory besides the open one; one used longer ago leaves memory, and the disk cache brings
 /// it back when it is opened again.
@@ -258,6 +261,23 @@ fn settle_mention(group: &mut Group, known: bool, history: Option<&History>, me:
 /// a message from someone else, in an unread conversation, sent after the conversation's `last_read_time`.
 fn seeds_mention(hit: &SearchHit, group: Option<&Group>, me: &str) -> bool {
   hit.sender_id != me && group.is_some_and(|group| group.unread && hit.time > group.last_read_time)
+}
+
+/// Which conversations a prefetch loads, in order, at most `PREFETCH_MAX`, leaving out hidden and blocked ones and
+/// those `loaded` says are loaded: first the unread ones, newest first, muted ones too (only their history tells
+/// whether the unread activity mentions the user, @all included, which the Mentions search does not answer); then
+/// the rest of the `PREFETCH_RECENT` most recent, newest first.
+fn prefetch_order<'a>(groups: impl IntoIterator<Item = &'a Group>, loaded: impl Fn(&GroupId) -> bool) -> Vec<GroupId> {
+  let mut listed: Vec<&Group> = groups.into_iter().filter(|group| !group.hidden && !group.blocked).collect();
+  listed.sort_unstable_by(|a, b| b.sort_time.cmp(&a.sort_time).then_with(|| a.id.cmp(&b.id)));
+  let unread = listed.iter().filter(|group| group.unread);
+  let recent = listed.iter().take(PREFETCH_RECENT).filter(|group| !group.unread);
+  unread
+    .chain(recent)
+    .filter(|group| !loaded(&group.id))
+    .take(PREFETCH_MAX)
+    .map(|group| group.id.clone())
+    .collect()
 }
 
 /// One page of messages as converted: oldest topic first, replies after their first message.
@@ -583,7 +603,8 @@ async fn run(
   tokio::spawn({
     let engine = engine.clone();
     async move {
-      // The cached list already names the recent conversations: their histories load while the list refreshes.
+      // The cached list already names the unread and recent conversations: their histories load while the list
+      // refreshes.
       engine.prefetch_histories();
       let result = engine.sync_world_and_mentions(true).await;
       engine.report(result);
@@ -678,8 +699,8 @@ impl Engine {
 
   // ---- Conversation list ----
 
-  /// Reads the conversation list again and publishes it. With `prefetch`, the recent conversations' histories start
-  /// loading as soon as the list is in.
+  /// Reads the conversation list again and publishes it. With `prefetch`, the unread and recent conversations'
+  /// histories start loading as soon as the list is in.
   async fn sync_world(self: &Arc<Self>, prefetch: bool) -> Result<()> {
     let known_me = self.me_id();
     let request = proto::PaginatedWorldRequest {
@@ -962,21 +983,14 @@ impl Engine {
 
   // ---- History ----
 
-  /// Loads the latest messages of the most recent conversations not loaded yet, three at a time, so the first click
-  /// on them is instant.
+  /// Loads the latest messages of the conversations `prefetch_order` picks, three at a time, so their mention marks
+  /// settle and the first click on them is instant.
   fn prefetch_histories(self: &Arc<Self>) {
     let mut guard = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let state = &mut *guard;
-    let mut recent: Vec<(Micros, GroupId)> = state
-      .groups
-      .values()
-      .filter(|group| !group.hidden && !group.blocked)
-      .map(|group| (group.sort_time, group.id.clone()))
-      .collect();
-    recent.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-    for (_, group) in recent.into_iter().take(PREFETCH_GROUPS) {
-      let loaded = state.histories.get(&group).is_some_and(History::loaded);
-      if loaded || !state.prefetching.insert(group.clone()) {
+    let order = prefetch_order(state.groups.values(), |id| state.histories.get(id).is_some_and(History::loaded));
+    for group in order {
+      if !state.prefetching.insert(group.clone()) {
         continue;
       }
       let engine = self.clone();
@@ -1628,7 +1642,7 @@ impl Engine {
               engine.emit(Event::Connection(Connection::Connecting));
               let result = engine.sync_world_and_mentions(true).await;
               engine.report(result);
-              // Also when the list failed to load: the held one names the recent conversations.
+              // Also when the list failed to load: the held one names the unread and recent conversations.
               engine.prefetch_histories();
             },
             Err(error) => engine.report(Err(error)),
@@ -5558,5 +5572,77 @@ mod tests {
     read.unread = false;
     assert!(!seeds("jpark", 200, Some(&read)), "a read conversation");
     assert!(!seeds("jpark", 200, None), "a conversation not listed");
+  }
+
+  fn listed_group(id: &str, time: i64, unread: bool) -> crate::model::Group {
+    let mut group = super::created_group(GroupId::Space(id.into()), Vec::new(), "me", &Users::default());
+    group.sort_time = time;
+    group.unread = unread;
+    group
+  }
+
+  fn spaces(ids: &[&str]) -> Vec<GroupId> {
+    ids.iter().map(|id| GroupId::Space((*id).into())).collect()
+  }
+
+  #[test]
+  fn prefetch_takes_unread_conversations_before_recent_ones() {
+    let mut muted = listed_group("muted", 30, true);
+    muted.muted = true;
+    let mut hidden = listed_group("hidden", 90, true);
+    hidden.hidden = true;
+    let mut blocked = listed_group("blocked", 80, true);
+    blocked.blocked = true;
+    let groups = vec![
+      listed_group("read new", 100, false),
+      listed_group("unread old", 10, true),
+      muted,
+      listed_group("unread new", 50, true),
+      hidden,
+      blocked,
+      listed_group("read old", 5, false),
+    ];
+    assert_eq!(
+      super::prefetch_order(&groups, |_| false),
+      spaces(&["unread new", "muted", "unread old", "read new", "read old"]),
+      "unread first, newest first within each, hidden and blocked left out"
+    );
+    let loaded = spaces(&["muted", "read new"]);
+    assert_eq!(
+      super::prefetch_order(&groups, |id| loaded.contains(id)),
+      spaces(&["unread new", "unread old", "read old"]),
+      "loaded ones left out"
+    );
+  }
+
+  #[test]
+  fn prefetch_takes_the_most_recent_and_stops_at_the_cap() {
+    let mut groups: Vec<_> = (0..20_i64)
+      .map(|n| listed_group(&format!("read {n:02}"), 100 + n, false))
+      .collect();
+    groups.push(listed_group("unread oldest", 1, true));
+    let order = super::prefetch_order(&groups, |_| false);
+    assert_eq!(order.len(), 1 + super::PREFETCH_RECENT);
+    assert_eq!(
+      order.first(),
+      Some(&GroupId::Space("unread oldest".into())),
+      "an unread one outside the recent"
+    );
+    assert_eq!(order.get(1), Some(&GroupId::Space("read 19".into())));
+    assert_eq!(
+      order.last(),
+      Some(&GroupId::Space("read 04".into())),
+      "only the most recent read ones"
+    );
+
+    let unread: Vec<_> = (0..40_i64).map(|n| listed_group(&format!("unread {n:02}"), n, true)).collect();
+    let order = super::prefetch_order(&unread, |_| false);
+    assert_eq!(order.len(), super::PREFETCH_MAX);
+    assert_eq!(order.first(), Some(&GroupId::Space("unread 39".into())));
+    assert_eq!(
+      order.last(),
+      Some(&GroupId::Space("unread 16".into())),
+      "the newest unread ones"
+    );
   }
 }
