@@ -1,5 +1,5 @@
-//! Where read receipts and the New line land among the messages of a list, and how a group of receipts is told, as
-//! plain code. No GPUI here: `message.rs` draws what this decides.
+//! Where read receipts and the New line land among the messages of a list, how a group of receipts is told, and how
+//! many of a thread's replies are new, as plain code. No GPUI here: `message.rs` draws what this decides.
 
 use std::collections::BTreeMap;
 
@@ -101,9 +101,28 @@ pub fn new_line(sent: &[Sent], read: Micros, marked: bool) -> Option<NewLine> {
   Some(NewLine { row: newest.row, mention: newest.mention })
 }
 
+/// A thread reply as the count of new replies sees it.
+pub struct Reply {
+  pub time: Micros,
+  /// The user sent it.
+  pub own: bool,
+}
+
+/// How many of a thread's `replies` are new to the user: those of someone else sent after `seen`, the time the user
+/// is known to have been up to date in the thread. The user's own replies move it on, as in `new_line`: writing is
+/// having read, so everything up to their newest reply counts as read too.
+pub fn new_replies(replies: impl Iterator<Item = Reply> + Clone, seen: Micros) -> usize {
+  let seen = replies
+    .clone()
+    .filter(|reply| reply.own)
+    .map(|reply| reply.time)
+    .fold(seen, Micros::max);
+  replies.filter(|reply| !reply.own && reply.time > seen).count()
+}
+
 #[cfg(test)]
 mod tests {
-  use super::{MAX_SHOWN, NewLine, Sent, new_line, place, read_by, shown};
+  use super::{MAX_SHOWN, NewLine, Reply, Sent, new_line, new_replies, place, read_by, shown};
 
   /// The places `place` answers, as `(message, readers)` pairs.
   fn placed(times: &[i64], read_times: &[i64]) -> Vec<(usize, Vec<usize>)> {
@@ -168,6 +187,30 @@ mod tests {
       new_line(&[theirs(10, 0), theirs(20, 1), mention(30, 2)], 10, false),
       Some(NewLine { row: 1, mention: true })
     );
+  }
+
+  /// How many of `replies`, as `(time, own)`, are new past `seen`.
+  fn new_of(replies: &[(i64, bool)], seen: i64) -> usize {
+    new_replies(replies.iter().map(|&(time, own)| Reply { time, own }), seen)
+  }
+
+  #[test]
+  fn replies_of_others_past_the_seen_time_are_new() {
+    assert_eq!(new_of(&[(10, false), (20, false), (30, false)], 15), 2);
+    assert_eq!(new_of(&[(10, false), (20, false)], 0), 2);
+  }
+
+  #[test]
+  fn the_users_own_reply_moves_the_seen_time_on_and_is_never_new() {
+    // Theirs at 20 is past the seen time, but the user replied after it.
+    assert_eq!(new_of(&[(10, false), (20, false), (30, true), (40, false)], 15), 1);
+    assert_eq!(new_of(&[(10, false), (20, true)], 0), 0);
+  }
+
+  #[test]
+  fn nothing_past_the_seen_time_is_nothing_new() {
+    assert_eq!(new_of(&[(10, false), (20, false)], 20), 0);
+    assert_eq!(new_of(&[], 0), 0);
   }
 
   #[test]

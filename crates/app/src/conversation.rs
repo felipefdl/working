@@ -105,7 +105,7 @@ const FORMAT_BAR: [&[FormatButton]; 3] = [
   ],
 ];
 
-/// Older-history paging state, shared with the list's scroll handler.
+/// Paging state and the messages below the fold, shared with the list's scroll handler.
 struct LoadState {
   loading: Cell<bool>,
   reached: Cell<bool>,
@@ -116,6 +116,9 @@ struct LoadState {
   loading_newer: Cell<bool>,
   /// Row count, for the scroll handler to know when the last row is in view.
   rows: Cell<usize>,
+  /// Messages of someone else that came at the end while the list was scrolled up from it, which the pill over the
+  /// bottom of the list counts until the list is at its end again.
+  unseen: Cell<usize>,
 }
 
 /// The open thread panel: its rows (starting message first, then replies) are rebuilt with the message list.
@@ -178,7 +181,8 @@ struct ListParts {
 
 /// A message list as a view of its own, which the conversation draws cached: typing in a composer, the `@` menu and
 /// the typing line redraw the conversation without laying out these rows again. Whatever changes what the rows show
-/// (rows, receipts, marks, images, settings) notifies this view.
+/// (rows, receipts, marks, images, settings) notifies this view, and it redraws each minute for the times its rows
+/// show (`now`, `5 min`).
 struct MessageList {
   rows: Vec<Row>,
   list: ListState,
@@ -200,6 +204,7 @@ struct MessageList {
   /// The message layout the list was measured with.
   density: MessageStyle,
   _subs: [Subscription; 2],
+  _clock: Task<()>,
 }
 
 impl MessageList {
@@ -229,6 +234,7 @@ impl MessageList {
       under_thread: false,
       density: cx.global::<Settings>().message_style,
       _subs: subs,
+      _clock: crate::home::minute_clock(cx),
     }
   }
 
@@ -309,6 +315,24 @@ impl MessageList {
   fn new_line_row(&self) -> Option<usize> {
     let (id, _) = self.new_line.as_ref()?;
     self.rows.iter().position(|row| row.id == *id)
+  }
+
+  /// Whether the list shows the end of its last row. A list left at its end keeps no scroll position of its own;
+  /// scrolled, it is at its end while the last row ends inside the viewport. `ListState::is_scrolled_to_end` cannot
+  /// say for a long conversation, whose rows above the ones drawn have no height yet.
+  fn at_end(&self) -> bool {
+    let count = self.list.item_count();
+    let Some(last) = count.checked_sub(1) else {
+      return true;
+    };
+    if self.list.logical_scroll_top().item_ix >= count {
+      return true;
+    }
+    let viewport = self.list.viewport_bounds();
+    self
+      .list
+      .bounds_for_item(last)
+      .is_some_and(|row| row.bottom() <= viewport.bottom() + px(1.))
   }
 
   /// Moves the list's scroll position, and redraws it there.
@@ -423,9 +447,14 @@ pub struct ConversationView {
   _focus_clear: Option<Task<()>>,
   /// The user asked for the latest messages: scroll to the end when they arrive.
   to_latest: bool,
-  /// The conversation's read time as it was when it opened unread: what the New line of each list is placed by. None
-  /// when it opened read, and once the user writes in it.
+  /// The conversation's read time as it was when it opened unread: what the New line of each list is placed by, and
+  /// what thread replies count as new from (`thread_seen`). None when it opened read, and once the user writes in it.
   read_at_open: Option<Micros>,
+  /// When the conversation opened or the user last sent a message in it, whichever is later: what thread replies
+  /// count as new from once `read_at_open` is gone.
+  caught_up: Micros,
+  /// The last time each thread's panel was on screen, by topic: its replies up to then are read.
+  threads_seen: HashMap<String, Micros>,
   /// The main list's New line is still to be placed: the messages it is placed among have not all come.
   placing_new_line: bool,
   rewrite_task: Option<Task<()>>,
@@ -468,7 +497,10 @@ impl ConversationView {
     };
     let me_id = me.as_ref().map_or_default(|u| u.id.clone());
     let me_avatar = me.and_then(|u| u.avatar_url);
-    let rows = message::build_rows(&messages, &me_id);
+    let read_at_open = group.unread.then_some(group.last_read_time);
+    let caught_up = crate::calendar_layout::now_micros();
+    // No thread has been on screen yet: every thread's replies count from the conversation's own time.
+    let rows = message::build_rows(&messages, &me_id, |_| Some(read_at_open.unwrap_or(caught_up)));
     let load = Rc::new(LoadState {
       loading: Cell::new(false),
       reached: Cell::new(reached),
@@ -476,6 +508,7 @@ impl ConversationView {
       at_end: Cell::new(true),
       loading_newer: Cell::new(false),
       rows: Cell::new(rows.len()),
+      unseen: Cell::new(0),
     });
 
     let open_person: Opener = {
@@ -509,7 +542,8 @@ impl ConversationView {
     let main = cx.new(|cx| MessageList::new(rows, parts, Some(opener), threads, cx));
     {
       let (load, core, id) = (load.clone(), core.clone(), group.id.clone());
-      main.read(cx).list.set_scroll_handler(move |event, _, _| {
+      let weak = cx.weak_entity();
+      main.read(cx).list.set_scroll_handler(move |event, _, cx| {
         if event.visible_range.start == 0 {
           if !load.reached.get() && !load.loading.get() && !load.stalled.get() {
             load.loading.set(true);
@@ -521,6 +555,15 @@ impl ConversationView {
         if event.visible_range.end >= load.rows.get() && !load.at_end.get() && !load.loading_newer.get() {
           load.loading_newer.set(true);
           core.send(Command::LoadNewer(id.clone()));
+        }
+        // Messages below the fold are counted: once the scroll is over, see whether the list reached its end. The
+        // event's range is the one the scroll started from, so it cannot say, and the list's state is busy while
+        // this runs.
+        if load.unseen.get() > 0 {
+          let weak = weak.clone();
+          cx.defer(move |cx| {
+            weak.update(cx, Self::check_unseen).ok();
+          });
         }
       });
     }
@@ -543,7 +586,6 @@ impl ConversationView {
     ];
     composer.update(cx, |state, cx| state.focus(window, cx));
 
-    let read_at_open = group.unread.then_some(group.last_read_time);
     let mut view = Self {
       store,
       core,
@@ -580,6 +622,8 @@ impl ConversationView {
       _focus_clear: None,
       to_latest: false,
       read_at_open,
+      caught_up,
+      threads_seen: HashMap::new(),
       placing_new_line: read_at_open.is_some(),
       rewrite_task: None,
       rewriting: None,
@@ -708,7 +752,8 @@ impl ConversationView {
     std::mem::take(&mut self.messages)
   }
 
-  /// Takes the full message list. Returns true when a message from someone else arrived at the end.
+  /// Takes the full message list. Returns true when a message from someone else arrived at the end. Those that arrive
+  /// while the main list is scrolled up from its end are counted for its pill (`LoadState::unseen`).
   pub fn set_history(
     &mut self,
     messages: Arc<Vec<Arc<Message>>>,
@@ -722,10 +767,19 @@ impl ConversationView {
     // The last message before this list: after `take_messages`, the one it kept.
     let previous = self.messages.last().cloned().or_else(|| self.taken_last.take());
     self.taken_last = None;
-    let incoming = match (messages.last(), previous) {
+    let incoming = match (messages.last(), &previous) {
       (Some(new), Some(old)) => reached_end && new.id != old.id && !new.pending && new.sender_id != self.me_id,
       _ => false,
     };
+    // Asked of the rows still on screen, before they are replaced.
+    if incoming
+      && self.load.at_end.get()
+      && !self.main.read(cx).at_end()
+      && let Some(old) = &previous
+    {
+      let arrived = message::arrived(&messages, &old.id, &self.me_id);
+      self.load.unseen.set(self.load.unseen.get().saturating_add(arrived));
+    }
     self.messages = messages;
     self.loaded = true;
     self.rebuild(prepended, cx);
@@ -993,23 +1047,62 @@ impl ConversationView {
     cx.notify();
   }
 
+  /// Takes the main list to its end, past the messages that came below the fold, and the pill that counts them goes.
+  fn show_unseen(&mut self, cx: &mut Context<Self>) {
+    self.load.unseen.set(0);
+    scroll_list(&self.main, None, cx);
+    cx.notify();
+  }
+
+  /// After a scroll of the main list while messages below the fold are counted: at the list's end they are seen and
+  /// the pill goes.
+  fn check_unseen(&mut self, cx: &mut Context<Self>) {
+    if self.load.unseen.get() > 0 && self.main.read(cx).at_end() {
+      self.load.unseen.set(0);
+      cx.notify();
+    }
+  }
+
+  /// The time from which a thread's replies count as new on its footer (`message::build_rows`): the later of the
+  /// conversation's own (`read_at_open` while there is one, else `caught_up`) and the last time the thread's panel
+  /// was on screen. None for the thread whose panel is open, whose replies are all on screen.
+  fn thread_seen(&self, topic: &str) -> Option<Micros> {
+    if self.thread.as_ref().is_some_and(|thread| thread.topic == topic) {
+      return None;
+    }
+    let base = self.read_at_open.unwrap_or(self.caught_up);
+    Some(self.threads_seen.get(topic).map_or(base, |&seen| seen.max(base)))
+  }
+
+  /// Notes that a thread's panel leaves the screen: its replies up to now are read.
+  fn left_thread(&mut self, topic: String) {
+    self.threads_seen.insert(topic, crate::calendar_layout::now_micros());
+  }
+
   /// Rebuilds the main list rows and the thread panel rows from the current messages.
   fn rebuild(&mut self, prepended: usize, cx: &mut Context<Self>) {
-    let rows = message::build_rows(&self.messages, &self.me_id);
-    self.load.rows.set(rows.len());
-    let receipts = self.receipts.clone();
-    self.main.update(cx, |list, cx| list.set_rows(rows, prepended, &receipts, cx));
+    self.rebuild_main(prepended, cx);
     let Some(thread) = &self.thread else {
       return;
     };
+    let receipts = self.receipts.clone();
     if let Some(rows) = message::build_thread_rows(&self.messages, &thread.topic, &self.me_id) {
       thread.view.update(cx, |list, cx| list.set_rows(rows, 0, &receipts, cx));
-    } else {
+    } else if let Some(thread) = self.thread.take() {
       // The starting message is gone.
-      self.thread = None;
+      self.left_thread(thread.topic);
       self.refocus = true;
       self.set_under_thread(cx);
     }
+  }
+
+  /// Rebuilds the main list rows, whose thread footers count new replies (`thread_seen`): again whenever a thread
+  /// panel opens or closes and whenever the user sends.
+  fn rebuild_main(&mut self, prepended: usize, cx: &mut Context<Self>) {
+    let rows = message::build_rows(&self.messages, &self.me_id, |topic| self.thread_seen(topic));
+    self.load.rows.set(rows.len());
+    let receipts = self.receipts.clone();
+    self.main.update(cx, |list, cx| list.set_rows(rows, prepended, &receipts, cx));
   }
 
   /// Tells the main list whether a thread is open, which under the pop-up hides its toolbar.
@@ -1139,7 +1232,8 @@ impl ConversationView {
         files: release(files, window, cx),
         chips,
       });
-      self.clear_new_line(cx);
+      self.load.unseen.set(0);
+      self.sent(cx);
       scroll_list(&self.main, None, cx);
     }
     self.stop_typing();
@@ -1319,6 +1413,9 @@ impl ConversationView {
       _ => {},
     });
     composer.update(cx, |state, cx| state.focus(window, cx));
+    if let Some(old) = self.thread.take() {
+      self.left_thread(old.topic);
+    }
     self.thread = Some(Thread {
       topic: topic.to_string(),
       view,
@@ -1327,6 +1424,7 @@ impl ConversationView {
       _sub: sub,
     });
     self.set_under_thread(cx);
+    self.rebuild_main(0, cx);
     self.sync_marks(cx);
     cx.notify();
   }
@@ -1337,7 +1435,9 @@ impl ConversationView {
       return false;
     };
     release(thread.files, window, cx);
+    self.left_thread(thread.topic);
     self.set_under_thread(cx);
+    self.rebuild_main(0, cx);
     self.editing.take_if(|editing| editing.in_thread);
     self.composer.update(cx, |state, cx| state.focus(window, cx));
     cx.notify();
@@ -1384,9 +1484,17 @@ impl ConversationView {
     }
     thread.composer.update(cx, |state, cx| state.set_value("", window, cx));
     if sent {
-      self.clear_new_line(cx);
+      self.sent(cx);
     }
     cx.notify();
+  }
+
+  /// The user sent a message: writing is having read, so the New line goes and thread replies count as new only past
+  /// now.
+  fn sent(&mut self, cx: &mut Context<Self>) {
+    self.clear_new_line(cx);
+    self.caught_up = crate::calendar_layout::now_micros();
+    self.rebuild_main(0, cx);
   }
 
   // Attachments.
@@ -2331,8 +2439,27 @@ impl Render for ConversationView {
       self.header(cx)
     };
 
+    // Over the bottom of the message list, so it moves neither the list nor the composer as it comes and goes. The
+    // window around a search hit comes first.
+    let unseen = self.load.unseen.get();
+    let latest = if !self.load.at_end.get() {
+      Some(latest_pill(
+        "Jump to latest".into(),
+        cx.listener(|this, _, _, cx| this.jump_latest(cx)),
+      ))
+    } else if unseen > 0 {
+      let label = if unseen == 1 {
+        SharedString::from("1 new message")
+      } else {
+        format!("{unseen} new messages").into()
+      };
+      Some(latest_pill(label, cx.listener(|this, _, _, cx| this.show_unseen(cx))))
+    } else {
+      None
+    };
     let body = if self.main.read(cx).rows.is_empty() {
       div()
+        .relative()
         .flex_1()
         .flex()
         .items_center()
@@ -2343,15 +2470,18 @@ impl Render for ConversationView {
         } else {
           "Loading messages…"
         })
+        .children(latest)
         .into_any_element()
     } else {
       div()
         .id("body")
         .on_hover(cx.listener(|this, hovered: &bool, window, cx| this.list_hovered(*hovered, window, cx)))
+        .relative()
         .flex_1()
         .min_h_0()
         .w_full()
         .child(self.main.clone().cached(StyleRefinement::default().size_full()))
+        .children(latest)
         .into_any_element()
     };
 
@@ -2379,21 +2509,6 @@ impl Render for ConversationView {
       .children(self.attached(false, cx))
       .child(self.composer_field(&self.composer, false, cx));
 
-    let latest = (!self.load.at_end.get()).then(|| {
-      div().w_full().flex().justify_center().pb_1().child(
-        div()
-          .id("jump-latest")
-          .px_3()
-          .py_1()
-          .rounded_full()
-          .bg(rgb(ACCENT_BG))
-          .text_size(px(12.))
-          .text_color(rgb(TEXT))
-          .cursor_pointer()
-          .on_click(cx.listener(|this, _, _, cx| this.jump_latest(cx)))
-          .child("Jump to latest"),
-      )
-    });
     let main = v_flex()
       .relative()
       .flex_1()
@@ -2404,7 +2519,6 @@ impl Render for ConversationView {
       .on_drop(cx.listener(|this, dropped: &ExternalPaths, window, cx| this.attach(false, dropped.paths(), window, cx)))
       .child(header)
       .child(body)
-      .children(latest)
       .child(composer)
       .children(self.find_bar(cx));
     // IRC: a space's nick list sits on the side away from the buffer list.
@@ -2429,6 +2543,36 @@ impl Render for ConversationView {
       .children(side)
       .children(right)
   }
+}
+
+/// The pill at the bottom center of the message list that takes it to its newest messages, over the list. Only the
+/// pill takes the pointer: the list scrolls and hovers beside it.
+fn latest_pill(label: SharedString, on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static) -> AnyElement {
+  div()
+    .absolute()
+    .bottom(px(8.))
+    .left_0()
+    .right_0()
+    .flex()
+    .justify_center()
+    .child(
+      div()
+        .id("jump-latest")
+        .occlude()
+        .px_3()
+        .py_1()
+        .rounded_full()
+        .bg(rgb(ACCENT_BG))
+        .border_1()
+        .border_color(rgb(BORDER))
+        .shadow_lg()
+        .text_size(px(12.))
+        .text_color(rgb(TEXT))
+        .cursor_pointer()
+        .on_click(on_click)
+        .child(label),
+    )
+    .into_any_element()
 }
 
 /// A file the app can show a small picture of beside its name.

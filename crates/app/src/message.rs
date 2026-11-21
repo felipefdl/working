@@ -68,6 +68,8 @@ const ROW_PAD: f32 = 16.;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct ThreadInfo {
   pub count: usize,
+  /// How many of the replies are new to the user (`receipt_logic::new_replies`), which the main list's footer says.
+  pub new: usize,
   pub last: Micros,
 }
 
@@ -179,19 +181,39 @@ fn starts_run(prev: Option<&Row>, msg: &Message, dated: bool) -> bool {
   }
 }
 
-fn thread_infos(messages: &[Arc<Message>]) -> HashMap<&str, ThreadInfo> {
-  let mut infos: HashMap<&str, ThreadInfo> = HashMap::new();
-  for msg in messages.iter().filter(|m| m.is_thread_reply()) {
-    let info = infos.entry(msg.topic_id.as_str()).or_insert(ThreadInfo { count: 0, last: 0 });
-    info.count += 1;
-    info.last = info.last.max(msg.time);
-  }
-  infos
+/// Each thread's reply summary, by topic. `seen` gives the time the user is known to have been up to date in a
+/// thread, which its count of new replies starts from; `None` counts none.
+fn thread_infos<'a>(
+  messages: &'a [Arc<Message>],
+  me_id: &str,
+  seen: impl Fn(&str) -> Option<Micros>,
+) -> HashMap<&'a str, ThreadInfo> {
+  let mut replies: Vec<&Message> = messages.iter().map(AsRef::as_ref).filter(|m| m.is_thread_reply()).collect();
+  // Grouped by topic, each thread's replies in the order they came.
+  replies.sort_by(|a, b| a.topic_id.cmp(&b.topic_id));
+  replies
+    .chunk_by(|a, b| a.topic_id == b.topic_id)
+    .filter_map(|thread| {
+      let first: &'a Message = thread.first().copied()?;
+      let topic = first.topic_id.as_str();
+      let replies = thread.iter().map(|msg| receipt_logic::Reply {
+        time: msg.time,
+        own: !me_id.is_empty() && msg.sender_id == me_id,
+      });
+      let info = ThreadInfo {
+        count: thread.len(),
+        new: seen(topic).map_or(0, |seen| receipt_logic::new_replies(replies, seen)),
+        last: thread.iter().map(|msg| msg.time).max().unwrap_or_default(),
+      };
+      Some((topic, info))
+    })
+    .collect()
 }
 
-/// Rows of the main list: top-level messages only, each thread starter carrying its reply summary.
-pub fn build_rows(messages: &[Arc<Message>], me_id: &str) -> Vec<Row> {
-  let infos = thread_infos(messages);
+/// Rows of the main list: top-level messages only, each thread starter carrying its reply summary. `seen` gives, by
+/// topic, the time from which that thread's replies count as new (`None`: none do).
+pub fn build_rows(messages: &[Arc<Message>], me_id: &str, seen: impl Fn(&str) -> Option<Micros>) -> Vec<Row> {
+  let infos = thread_infos(messages, me_id, seen);
   let mut rows: Vec<Row> = Vec::with_capacity(messages.len());
   let mut prev_day = i32::MIN;
   // The local day of the last message looked at and its span: the messages of one day take no time-zone conversion.
@@ -218,7 +240,7 @@ pub fn build_rows(messages: &[Arc<Message>], me_id: &str) -> Vec<Row> {
 /// Rows of the thread panel: the starting message, then its replies oldest first. None when the starter is gone.
 pub fn build_thread_rows(messages: &[Arc<Message>], topic: &str, me_id: &str) -> Option<Vec<Row>> {
   let start = messages.iter().find(|m| m.id == topic)?;
-  let infos = thread_infos(messages);
+  let infos = thread_infos(messages, me_id, |_| None);
   let own = |msg: &Message| !me_id.is_empty() && msg.sender_id == me_id;
   let mut rows = vec![Row::new(start, None, true, own(start), infos.get(topic).copied())];
   for msg in messages.iter().filter(|m| m.is_thread_reply() && m.topic_id == topic) {
@@ -226,6 +248,20 @@ pub fn build_thread_rows(messages: &[Arc<Message>], topic: &str, me_id: &str) ->
     rows.push(Row::new(msg, None, head, own(msg), None));
   }
   Some(rows)
+}
+
+/// How many messages of someone else `messages` has after `previous`, the id of the last message before it, that
+/// show at the end of the main list: thread replies and messages still going out do not count. None do when
+/// `previous` is not among `messages`.
+pub fn arrived(messages: &[Arc<Message>], previous: &str, me_id: &str) -> usize {
+  let Some(at) = messages.iter().rposition(|m| m.id == previous) else {
+    return 0;
+  };
+  messages
+    .iter()
+    .skip(at.saturating_add(1))
+    .filter(|m| !m.pending && !m.is_thread_reply() && m.sender_id != me_id)
+    .count()
 }
 
 /// Where the New line goes among `rows`, the main list's or a thread panel's, built from `messages`: the id of the
@@ -1183,7 +1219,8 @@ fn reply_label(count: usize) -> String {
   }
 }
 
-/// `N replies · time` under a thread starter, with the small corner connector; opens the thread panel.
+/// `N replies · time` under a thread starter, with `M new` between them while replies are new to the user, and the
+/// small corner connector; opens the thread panel.
 fn thread_footer(row: &Row, info: ThreadInfo, open: Opener) -> AnyElement {
   let topic = row.id.clone();
   h_flex()
@@ -1207,6 +1244,14 @@ fn thread_footer(row: &Row, info: ThreadInfo, open: Opener) -> AnyElement {
         .rounded_bl(px(6.)),
     )
     .child(div().font_weight(FontWeight::MEDIUM).child(reply_label(info.count)))
+    .when(info.new > 0, |footer| {
+      footer.child(div().child("·")).child(
+        div()
+          .font_weight(FontWeight::SEMIBOLD)
+          .text_color(rgb(ACCENT))
+          .child(format!("{} new", info.new)),
+      )
+    })
     .child(div().child("·"))
     .child(div().child(util::rel_time(info.last)))
     .into_any_element()
@@ -2403,14 +2448,59 @@ mod tests {
         failed: false,
       })
     };
-    let rows = build_rows(
-      &[msg("t", "t", "me", 1), msg("r", "t", "you", 2), msg("n", "n", "you", 3)],
-      "me",
-    );
+    let messages = [msg("t", "t", "me", 1), msg("r", "t", "you", 2), msg("n", "n", "you", 3)];
+    let rows = build_rows(&messages, "me", |_| None);
     assert_eq!(rows.iter().map(|row| row.msg.id.as_str()).collect::<Vec<_>>(), vec!["t", "n"]);
     assert!(rows[0].own);
     assert!(!rows[1].own);
-    assert_eq!(rows[0].thread.map(|info| info.count), Some(1));
+    assert_eq!(rows[0].thread.map(|info| (info.count, info.new)), Some((1, 0)));
+    // Each thread's new replies count from its own time.
+    let seen = |topic: &str| (topic == "t").then_some(1);
+    assert_eq!(build_rows(&messages, "me", seen)[0].thread.map(|info| info.new), Some(1));
+    let caught_up = |_: &str| Some(2);
+    assert_eq!(build_rows(&messages, "me", caught_up)[0].thread.map(|info| info.new), Some(0));
+  }
+
+  #[test]
+  fn arrived_counts_what_others_appended_at_the_end_of_the_main_list() {
+    use super::arrived;
+    use gchat_core::{GroupId, Message};
+    use std::sync::Arc;
+    let msg = |id: &str, topic: &str, sender: &str, pending: bool| {
+      Arc::new(Message {
+        id: id.into(),
+        topic_id: topic.into(),
+        group: GroupId::Dm("g".into()),
+        sender_id: sender.into(),
+        sender_name: sender.into(),
+        sender_avatar: None,
+        text: id.into(),
+        spans: Vec::new(),
+        time: 0,
+        update_time: 0,
+        edited: false,
+        system: false,
+        reactions: Vec::new(),
+        attachments: Vec::new(),
+        cards: Vec::new(),
+        quote: None,
+        starred: false,
+        pending,
+        failed: false,
+      })
+    };
+    let messages = [
+      msg("a", "a", "you", false),
+      msg("b", "b", "you", false),
+      msg("c", "c", "me", false),
+      msg("r", "a", "you", false),
+      msg("d", "d", "you", true),
+      msg("e", "e", "you", false),
+    ];
+    // After `a`: `b` and `e`, not the user's own, a thread reply, or one still going out.
+    assert_eq!(arrived(&messages, "a", "me"), 2);
+    assert_eq!(arrived(&messages, "e", "me"), 0);
+    assert_eq!(arrived(&messages, "gone", "me"), 0);
   }
 
   #[test]
@@ -2451,6 +2541,7 @@ mod tests {
         Arc::new(sending),
       ],
       "me",
+      |_| None,
     );
     let reader = |id: &str, read_time: i64| ReadReceipt {
       user_id: id.into(),
