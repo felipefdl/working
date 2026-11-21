@@ -1,8 +1,9 @@
 //! The conversation list of the Messages, Rail and IRC layouts beside the open conversation. Messages lists chats
-//! with previews under a header of view buttons, filtered with chips beside the sort button and the Unread toggle;
-//! Rail lists the pane its icon column picked; IRC lists one line of the monospaced name a conversation, as WeeChat's
-//! buffer list, under a filter line, after rows that open the views. Every layout shares one Unread filter
-//! (`Store::unread_only`), combined with the pane in use.
+//! with previews under a header of view buttons, filtered with chips beside the sort button and the Unread toggle, or
+//! in a column narrower than `TITLE_MIN_WIDTH` with IRC's one-line filter; Rail lists the pane its icon column picked;
+//! IRC lists one line of the monospaced name a conversation, as WeeChat's buffer list, under a filter line, after rows
+//! that open the views. Every layout shares one Unread filter (`Store::unread_only`), combined with the pane in use.
+//! Each list scrolls to the open conversation when it changes, and IRC's also to the row of the open view.
 
 use std::ops::Range;
 
@@ -131,8 +132,8 @@ pub struct ConvList {
   store: Entity<Store>,
   scroll: UniformListScrollHandle,
   filter: Filter,
-  /// The open conversation the list last scrolled to.
-  followed: Option<GroupId>,
+  /// The view the list last scrolled to.
+  followed: Option<View>,
   _subs: [Subscription; 3],
   _clock: Task<()>,
 }
@@ -179,20 +180,16 @@ impl ConvList {
     self.scroll.scroll_to_item_strict(0, ScrollStrategy::Top);
   }
 
-  /// Scrolls to the open conversation when it changes, so stepping with the keys or the switcher keeps it in view.
-  /// `views` is how many view rows come before the conversations (IRC).
-  fn follow_open(&mut self, store: &Store, views: usize) {
-    let open = match &store.view {
-      View::Conversation(id) => Some(id),
-      View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => None,
-    };
-    if open == self.followed.as_ref() {
+  /// Scrolls to the open view's row when the view changes, so a number key, stepping with the keys, or the switcher
+  /// keeps it in view. `views` are the view rows before the conversations (IRC; none in the other layouts).
+  fn follow_open(&mut self, store: &Store, views: impl Iterator<Item = ViewRow>) {
+    if self.followed.as_ref() == Some(&store.view) {
       return;
     }
-    if let Some(ix) = open.and_then(|id| store.list.position(id)) {
-      self.scroll.scroll_to_item(views + ix, ScrollStrategy::Nearest);
+    if let Some(ix) = open_row(&store.view, views, |id| store.list.position(id)) {
+      self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
     }
-    self.followed = open.cloned();
+    self.followed = Some(store.view.clone());
   }
 
   fn rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -401,8 +398,9 @@ impl ConvList {
   }
 
   /// Messages: the title with buttons for Mentions, Starred, Calendar, Meet, Mail (with its unread count), and New
-  /// chat, then the filter chips with the sort button and the Unread toggle at their right. A column too narrow for
-  /// both drops the title and makes the buttons smaller.
+  /// chat, then the filter chips with the sort button and the Unread toggle at their right. A column narrower than
+  /// `TITLE_MIN_WIDTH` drops the title, makes the buttons smaller, and puts the one-line filter of IRC across the
+  /// column in the place of the chips and the two buttons, in the interface font, so the header never wraps.
   fn messages_header(&self, store: &Store, cx: &Context<Self>) -> Div {
     let shown = match &store.view {
       View::Shortcut(shortcut) => Some(*shortcut),
@@ -482,10 +480,16 @@ impl ConvList {
             .child("Chats"),
         )
       });
+    // Narrow: one line under the buttons in the place of the chips, so the header never wraps.
+    let filters = if narrow {
+      h_flex().w_full().px_3().pb_2().child(self.filter_line(store))
+    } else {
+      self.chip_row(store, cx)
+    };
     v_flex()
       .flex_shrink_0()
       .child(title.child(actions.flex_shrink_0().items_center()))
-      .child(self.chip_row(store, cx))
+      .child(filters)
   }
 
   /// Messages: the chips, wrapping onto more lines when the list is dragged narrower, and at their right, level with
@@ -522,8 +526,8 @@ impl ConvList {
       )
   }
 
-  /// IRC: one line, the filter in use (its menu also holds the Unread filter and the two orders) and the New chat
-  /// button. The views open from the first rows of the buffer list.
+  /// IRC: one line, the filter in use in the monospaced font (its menu also holds the Unread filter and the two
+  /// orders) and the New chat button. The views open from the first rows of the buffer list.
   fn irc_header(&self, store: &Store) -> Div {
     h_flex()
       .h(px(32.))
@@ -532,14 +536,14 @@ impl ConvList {
       .pr_1()
       .gap_1()
       .items_center()
-      .child(self.filter_line(store))
+      .child(self.filter_line(store).font_family(mono()))
       .child(new_chat_button().size(px(24.)))
   }
 
-  /// IRC: the filter in use on one line over the buffers: the pane's chip label, and with the Unread filter on
-  /// "Unread" for All or "{label}, unread" for a kind. A click opens the menu of the panes the chips offer (the one in
-  /// use checked, a kind with unread conversations followed by their count), then the Unread filter, then the two
-  /// orders.
+  /// The filter in use on one line, for the IRC header and a narrow Messages header: the pane's chip label, and with
+  /// the Unread filter on "Unread" for All or "{label}, unread" for a kind. A click opens the menu of the panes the
+  /// chips offer (the one in use checked, a kind with unread conversations followed by their count), then the Unread
+  /// filter, then the two orders. It fills the width it is given; the caller picks its font.
   fn filter_line(&self, store: &Store) -> Stateful<Div> {
     let label = chip_label(&store.pane);
     let current = match (&store.pane, store.unread_only) {
@@ -558,7 +562,6 @@ impl ConvList {
       .items_center()
       .rounded(px(4.))
       .cursor_pointer()
-      .font_family(mono())
       .text_size(px(12.))
       .text_color(rgb(MUTED))
       .hover(|s| s.bg(rgb(ROW_HOVER)))
@@ -632,6 +635,22 @@ impl ConvList {
             .child(unread_toggle(on).on_click(flip)),
         )
       })
+  }
+}
+
+/// The row of `view` in a list of the `views` rows and then `Store::list`'s rows, where `position` finds a
+/// conversation in `Store::list`: its view row, or the open conversation's row after the view rows. `None` when no
+/// row shows it.
+fn open_row(
+  view: &View,
+  mut views: impl Iterator<Item = ViewRow>,
+  position: impl FnOnce(&GroupId) -> Option<usize>,
+) -> Option<usize> {
+  match view {
+    View::Conversation(id) => position(id).map(|ix| views.count() + ix),
+    View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => {
+      views.position(|row| row.is_open(view))
+    },
   }
 }
 
@@ -849,7 +868,7 @@ impl Render for ConvList {
     };
     let store = self.store.read(cx);
     self.follow_filter(store);
-    self.follow_open(store, views);
+    self.follow_open(store, ViewRow::shown(settings).take(views));
     let header = match layout {
       Layout::Rail => self.rail_header(store, cx),
       Layout::Irc => self.irc_header(store),
@@ -904,5 +923,45 @@ impl Render for ConvList {
       .flex_shrink_0()
       .child(header)
       .child(body)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use gchat_core::{GroupId, Shortcut};
+
+  use super::{ViewRow, open_row};
+  use crate::store::View;
+
+  fn jordan() -> GroupId {
+    GroupId::Dm("jpark".into())
+  }
+
+  #[test]
+  fn an_irc_view_is_found_among_the_view_rows_shown() {
+    // Starred and Meet switched off.
+    let shown = [ViewRow::Mentions, ViewRow::Calendar, ViewRow::Mail];
+    let none = |_: &GroupId| None;
+    assert_eq!(open_row(&View::Shortcut(Shortcut::Mentions), shown.into_iter(), none), Some(0));
+    assert_eq!(open_row(&View::Calendar, shown.into_iter(), none), Some(1));
+    assert_eq!(open_row(&View::Mail, shown.into_iter(), none), Some(2));
+    assert_eq!(open_row(&View::Shortcut(Shortcut::Starred), shown.into_iter(), none), None);
+    assert_eq!(open_row(&View::Meet, shown.into_iter(), none), None);
+    assert_eq!(open_row(&View::Home, shown.into_iter(), none), None);
+  }
+
+  #[test]
+  fn a_conversation_comes_after_the_view_rows() {
+    let shown = [ViewRow::Mentions, ViewRow::Calendar, ViewRow::Mail];
+    let open = View::Conversation(jordan());
+    assert_eq!(open_row(&open, shown.into_iter(), |_| Some(4)), Some(7));
+    assert_eq!(open_row(&open, shown.into_iter(), |_| None), None);
+  }
+
+  #[test]
+  fn a_list_without_view_rows_follows_conversations_only() {
+    let open = View::Conversation(jordan());
+    assert_eq!(open_row(&open, std::iter::empty(), |_| Some(4)), Some(4));
+    assert_eq!(open_row(&View::Mail, std::iter::empty(), |_| Some(4)), None);
   }
 }

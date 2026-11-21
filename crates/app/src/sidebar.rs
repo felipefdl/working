@@ -1,6 +1,6 @@
 //! Fixed-width, virtualized sidebar: New chat, Home, Mentions, Starred, Calendar, Meet, and Mail, then the Direct
-//! messages / Apps / Spaces sections, each header with its unread count. It scrolls to the open conversation when that
-//! changes.
+//! messages / Apps / Spaces sections, each header with its unread count. It scrolls to the row of the open view (a
+//! button's row or the open conversation's) when the view changes.
 
 use std::ops::Range;
 use std::rc::Rc;
@@ -10,7 +10,7 @@ use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use gchat_core::{GroupId, Shortcut};
+use gchat_core::Shortcut;
 
 use crate::calendar::OpenCalendar;
 use crate::conv_list::{key_hint, new_chat_tip, place_tip};
@@ -32,8 +32,8 @@ const ROW_HEIGHT: f32 = 30.0;
 pub struct Sidebar {
   store: Entity<Store>,
   scroll: UniformListScrollHandle,
-  /// The open conversation the list last scrolled to.
-  followed: Option<GroupId>,
+  /// The view the list last scrolled to.
+  followed: Option<View>,
   _subs: [Subscription; 3],
 }
 
@@ -53,26 +53,16 @@ impl Sidebar {
     }
   }
 
-  /// Scrolls to the open conversation when it changes, so stepping with the keys or the switcher keeps it in view.
-  /// A conversation without a row, its section folded, scrolls nothing.
+  /// Scrolls to the open view's row when the view changes, so a number key, stepping with the keys, or the switcher
+  /// keeps it in view. A view without a row (its section folded, its button switched off) scrolls nothing.
   fn follow_open(&mut self, store: &Store) {
-    let open = match &store.view {
-      View::Conversation(id) => Some(id),
-      View::Home | View::Shortcut(_) | View::Calendar | View::Meet | View::Mail => None,
-    };
-    if open == self.followed.as_ref() {
+    if self.followed.as_ref() == Some(&store.view) {
       return;
     }
-    let row = open.and_then(|id| {
-      store
-        .sidebar
-        .iter()
-        .position(|item| matches!(item, SidebarItem::Conv(conv) if conv.g.id == *id))
-    });
-    if let Some(ix) = row {
+    if let Some(ix) = view_row(&store.sidebar, &store.view) {
       self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
     }
-    self.followed = open.cloned();
+    self.followed = Some(store.view.clone());
   }
 
   fn rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -318,6 +308,20 @@ impl Sidebar {
   }
 }
 
+/// The index in `items` of the row that shows `view`: the row of its button, or the open conversation's row. `None`
+/// when no row shows it.
+fn view_row(items: &[SidebarItem], view: &View) -> Option<usize> {
+  items.iter().position(|item| match item {
+    SidebarItem::Home => *view == View::Home,
+    SidebarItem::Shortcut(shortcut) => *view == View::Shortcut(*shortcut),
+    SidebarItem::Calendar => *view == View::Calendar,
+    SidebarItem::Meet => *view == View::Meet,
+    SidebarItem::Mail => *view == View::Mail,
+    SidebarItem::Conv(conv) => view.conversation() == Some(&conv.g.id),
+    SidebarItem::Header(_) | SidebarItem::Toggle(_) => false,
+  })
+}
+
 fn item_frame(selected: bool) -> Stateful<Div> {
   h_flex()
     .id("item")
@@ -379,5 +383,45 @@ impl Render for Sidebar {
         .w_full()
         .min_h_0(),
       )
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use gchat_core::{GroupId, Shortcut};
+
+  use super::view_row;
+  use crate::store::{Section, SidebarItem, View};
+
+  #[test]
+  fn every_view_button_is_found_at_its_row() {
+    let items = [
+      SidebarItem::Header(Section::Shortcuts),
+      SidebarItem::Home,
+      SidebarItem::Shortcut(Shortcut::Mentions),
+      SidebarItem::Shortcut(Shortcut::Starred),
+      SidebarItem::Calendar,
+      SidebarItem::Meet,
+      SidebarItem::Mail,
+      SidebarItem::Header(Section::Spaces),
+    ];
+    assert_eq!(view_row(&items, &View::Home), Some(1));
+    assert_eq!(view_row(&items, &View::Shortcut(Shortcut::Mentions)), Some(2));
+    assert_eq!(view_row(&items, &View::Shortcut(Shortcut::Starred)), Some(3));
+    assert_eq!(view_row(&items, &View::Calendar), Some(4));
+    assert_eq!(view_row(&items, &View::Meet), Some(5));
+    assert_eq!(view_row(&items, &View::Mail), Some(6));
+  }
+
+  #[test]
+  fn a_view_without_a_row_has_none() {
+    // The Shortcuts section folded: only its header is left.
+    let folded = [SidebarItem::Header(Section::Shortcuts), SidebarItem::Header(Section::Spaces)];
+    assert_eq!(view_row(&folded, &View::Home), None);
+    assert_eq!(view_row(&folded, &View::Mail), None);
+    // Starred switched off, Mentions on.
+    let no_starred = [SidebarItem::Home, SidebarItem::Shortcut(Shortcut::Mentions)];
+    assert_eq!(view_row(&no_starred, &View::Shortcut(Shortcut::Starred)), None);
+    assert_eq!(view_row(&no_starred, &View::Conversation(GroupId::Dm("jpark".into()))), None);
   }
 }
