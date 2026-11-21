@@ -511,9 +511,9 @@ impl Listing {
 /// Unpinned rows a sidebar section shows before its Show all row is clicked.
 const COLLAPSED_ROWS: usize = 8;
 
-/// Which unpinned conversations of a sidebar section get rows, in the section's order: every one while the section
-/// shows all; otherwise the first `COLLAPSED_ROWS`, and past those the ones that show as unread (`shows_unread`) and
-/// the `open` one.
+/// Which unpinned conversations of a sidebar section get rows, in the section's order (`section_order`, muted ones
+/// last): every one while the section shows all; otherwise the first `COLLAPSED_ROWS`, and past those the ones that
+/// show as unread (`shows_unread`) and the `open` one.
 fn sidebar_rows<'a>(
   unpinned: &[&'a Arc<Conv>],
   show_all: bool,
@@ -544,9 +544,10 @@ pub struct Store {
   /// `every` narrowed by those and ranked by the text, best match first. Empty in the layouts with a list beside the
   /// conversation, where Home shows none.
   pub home: Vec<Arc<Conv>>,
-  /// What the Messages, Rail, and IRC list shows: `all` narrowed by `pane` and the Unread filter, pinned first, with
-  /// the conversations older than `list_window` behind a row at the end; while there is search text, `every` narrowed
-  /// by those and the text instead, nothing held back. Empty in the Google Chat layout.
+  /// What the Messages, Rail, and IRC list shows: `all` narrowed by `pane` and the Unread filter, in the order
+  /// `list_key` gives (pinned first; in IRC by kind, each kind's muted ones last), with the conversations older than
+  /// `list_window` behind a row at the end; while there is search text, `every` narrowed by those and the text
+  /// instead, best match first, nothing held back. Empty in the Google Chat layout.
   pub list: Listing,
   /// What the chips or the Rail picked. It always fits the layout (`Pane::fits`): `sync_settings` puts it back to
   /// All when a layout change leaves one that does not.
@@ -555,7 +556,8 @@ pub struct Store {
   pub tabs: Vec<Tab>,
   /// How many conversations of each sidebar section show as unread (`shows_unread`), for the sections in `all`.
   section_unread: HashMap<Section, usize>,
-  /// The Google Chat layout's sidebar. Built only while that layout is on.
+  /// The Google Chat layout's sidebar: each section's pinned conversations, then the others in the section's order
+  /// with the muted ones last (`section_order`). Built only while that layout is on.
   pub sidebar: Vec<SidebarItem>,
   pub view: View,
   /// Views left by navigating, newest last: what Back returns to.
@@ -1307,7 +1309,9 @@ impl Store {
   }
 
   /// Home or the Messages, Rail, and IRC list, whichever the layout shows, the Rail tabs, and the sections' unread
-  /// counts.
+  /// counts. The list keeps the chosen order within the parts `list_key` makes: pinned first, and in IRC one kind
+  /// after another, each with its pinned, then the others, then the muted ones. Home, and search results, keep their
+  /// own order.
   fn rebuild_lists(&mut self) {
     let query = self.query.trim();
     // Searching finds hidden and blocked conversations too, so they can be opened, unhidden, or unblocked again.
@@ -1345,18 +1349,10 @@ impl Store {
     }
     let searching = !query.is_empty();
     if beside {
-      // Stable, in the chosen order within each: pinned first; in IRC one kind after another, each with its pinned
-      // first. Search results keep best match first.
+      // Stable, so the chosen order holds within each part. Search results keep best match first.
       if !searching {
-        let by_kind = self.layout == Layout::Irc;
-        shown.sort_by_key(|conv| {
-          let rank = if by_kind {
-            Kind::of(conv.g.kind).buffer_rank()
-          } else {
-            0
-          };
-          (rank, !conv.g.pinned)
-        });
+        let irc = self.layout == Layout::Irc;
+        shown.sort_by_key(|conv| list_key(&conv.g, irc));
       }
       self.home = Vec::new();
       self.set_list(shown, searching);
@@ -1437,8 +1433,9 @@ impl Store {
     cx.notify();
   }
 
-  /// The Google Chat layout's sidebar; the other layouts have none. Its rows depend on the open conversation
-  /// (`sidebar_rows`), so `set_view` builds it again when that changes.
+  /// The Google Chat layout's sidebar; the other layouts have none. Each section lists its pinned conversations A to
+  /// Z, then the others in the section's order with the muted ones last (`section_order`), as the web app does. Its
+  /// rows depend on the open conversation (`sidebar_rows`), so `set_view` builds it again when that changes.
   pub fn rebuild_sidebar(&mut self) {
     if self.layout != Layout::GoogleChat {
       self.sidebar = Vec::new();
@@ -1477,13 +1474,7 @@ impl Store {
       if self.collapsed.contains(&section) {
         continue;
       }
-      let (mut pinned, mut unpinned): (Vec<&Arc<Conv>>, Vec<&Arc<Conv>>) =
-        members.into_iter().partition(|c| c.g.pinned);
-      // "Group: Ana" sorts under A, as in the web app.
-      pinned.sort_by(|a, b| name_key(a).cmp(name_key(b)));
-      if self.section_sort(&section) == Sort::Alphabetical {
-        unpinned.sort_by(|a, b| name_key(a).cmp(name_key(b)));
-      }
+      let (pinned, unpinned) = section_order(members, self.section_sort(&section));
       items.extend(pinned.into_iter().map(|c| SidebarItem::Conv(c.clone())));
       let show_all = self.show_all.contains(&section);
       let rows = sidebar_rows(&unpinned, show_all, self.view.conversation());
@@ -2190,6 +2181,41 @@ fn name_key(conv: &Conv) -> &str {
   conv.lower.trim_start_matches("group: ")
 }
 
+/// Where a conversation stands within its sidebar section or IRC kind: pinned first, then the others, then the muted
+/// ones, as the web app sinks a muted conversation to the bottom of its section. A pinned muted one stays pinned.
+const fn standing(group: &Group) -> u8 {
+  if group.pinned {
+    0
+  } else if group.muted {
+    2
+  } else {
+    1
+  }
+}
+
+/// The sort key of the Messages, Rail, and IRC list, for a stable sort over the chosen order: pinned first; in IRC
+/// (`irc`) one kind after another (`Kind::buffer_rank`), each with its pinned, then the others, then the muted ones.
+const fn list_key(group: &Group, irc: bool) -> (u8, u8) {
+  if irc {
+    (Kind::of(group.kind).buffer_rank(), standing(group))
+  } else {
+    (0, if group.pinned { 0 } else { 1 })
+  }
+}
+
+/// A sidebar section's conversations, `members` newest first, in sidebar order: the pinned ones A to Z, and the
+/// others in `sort` with the muted ones after the rest, each part keeping that order.
+fn section_order(members: Vec<&Arc<Conv>>, sort: Sort) -> (Vec<&Arc<Conv>>, Vec<&Arc<Conv>>) {
+  let (mut pinned, mut unpinned): (Vec<&Arc<Conv>>, Vec<&Arc<Conv>>) = members.into_iter().partition(|c| c.g.pinned);
+  // "Group: Ana" sorts under A, as in the web app.
+  pinned.sort_by(|a, b| name_key(a).cmp(name_key(b)));
+  if sort == Sort::Alphabetical {
+    unpinned.sort_by(|a, b| name_key(a).cmp(name_key(b)));
+  }
+  unpinned.sort_by_key(|c| standing(&c.g));
+  (pinned, unpinned)
+}
+
 /// The `Conv` of a group. `me` is the signed-in user's id, empty until the core says it: their own last message is
 /// led by "You".
 fn conv(group: Group, me: &str) -> Conv {
@@ -2271,8 +2297,8 @@ mod tests {
   use std::sync::Arc;
 
   use super::{
-    Calling, Conv, DAY_MICROS, Kind, ListRow, Listing, Pane, Section, View, conv, is_older, shows, shows_mention,
-    shows_unread, sidebar_rows,
+    Calling, Conv, DAY_MICROS, Kind, ListRow, Listing, Pane, Section, View, conv, is_older, list_key, section_order,
+    shows, shows_mention, shows_unread, sidebar_rows,
   };
   use crate::settings::{Features, Layout, ListWindow, Sort};
   use gchat_core::{Group, GroupId, GroupKind, Micros, Notify, Placement};
@@ -2530,6 +2556,62 @@ mod tests {
     assert_eq!(
       names(sidebar_rows(&unpinned, true, None)),
       spaces(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11])
+    );
+  }
+
+  /// Conversations of `kind`, newest first in the order given; `pinned` and `muted` name which are.
+  fn convs(kind: GroupKind, ids: &[&str], pinned: &[&str], muted: &[&str]) -> Vec<Arc<Conv>> {
+    ids
+      .iter()
+      .enumerate()
+      .map(|(ix, id)| {
+        let mut g = chat(id, kind, Micros::try_from(ix).unwrap_or_default());
+        g.pinned = pinned.contains(id);
+        g.muted = muted.contains(id);
+        Arc::new(conv(g, ""))
+      })
+      .collect()
+  }
+
+  #[test]
+  fn a_section_lists_its_muted_conversations_after_the_others_in_its_order() {
+    let convs = convs(
+      GroupKind::Space,
+      &["launch", "design", "budget", "archive", "ops"],
+      &["ops"],
+      &["design", "archive", "ops"],
+    );
+    let members = || convs.iter().collect::<Vec<&Arc<Conv>>>();
+
+    let (pinned, unpinned) = section_order(members(), Sort::Recent);
+    // A pinned muted one stays with the pinned.
+    assert_eq!(names(pinned.into_iter()), ["ops"]);
+    assert_eq!(names(unpinned.into_iter()), ["launch", "budget", "design", "archive"]);
+
+    let (_, unpinned) = section_order(members(), Sort::Alphabetical);
+    assert_eq!(names(unpinned.into_iter()), ["budget", "launch", "archive", "design"]);
+  }
+
+  #[test]
+  fn the_irc_list_sinks_each_kinds_muted_conversations_within_that_kind() {
+    let mut shown = convs(GroupKind::Dm, &["riley", "jordan", "sam"], &[], &["riley"]);
+    shown.extend(convs(
+      GroupKind::Space,
+      &["launch", "design", "budget", "ops"],
+      &["ops"],
+      &["launch", "ops"],
+    ));
+    let mut irc = shown.clone();
+    irc.sort_by_key(|conv| list_key(&conv.g, true));
+    assert_eq!(
+      names(irc.iter()),
+      ["ops", "design", "budget", "launch", "jordan", "sam", "riley"]
+    );
+    // The lists by recency keep muted ones in place, pinned first.
+    shown.sort_by_key(|conv| list_key(&conv.g, false));
+    assert_eq!(
+      names(shown.iter()),
+      ["ops", "riley", "jordan", "sam", "launch", "design", "budget"]
     );
   }
 }
