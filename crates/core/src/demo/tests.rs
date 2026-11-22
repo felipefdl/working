@@ -1171,6 +1171,42 @@ fn archiving_takes_a_thread_out_of_the_inbox_and_back() {
   assert!(matches!(written(&drain(&events)), Some(Err(_))));
 }
 
+#[test]
+fn trashing_takes_a_thread_out_of_every_list_and_leaves_the_rest() {
+  let (mut demo, events) = demo();
+  load_mail(&mut demo, &events, &Mailbox::Inbox, false);
+  load_mail(&mut demo, &events, &Mailbox::Inbox, true);
+  let search = Mailbox::Search("launch email".into());
+  let (found, _) = load_mail(&mut demo, &events, &search, false);
+  let launch = "demo-mail-launch-copy";
+  assert!(found.iter().any(|thread| thread.id == launch));
+  demo.handle(Command::TrashMail { thread: launch.into() });
+  let out = drain(&events);
+  assert_eq!(written(&out), Some(Ok(())));
+  assert_eq!(out.iter().filter(|event| matches!(event, Event::MailWritten(_))).count(), 1);
+  let inbox = list_of(&out, &Mailbox::Inbox).unwrap();
+  assert_eq!(inbox.len(), 27);
+  assert!(!inbox.iter().any(|thread| thread.id == launch));
+  assert!(inbox.iter().any(|thread| thread.id == "demo-mail-lunch-thursday"));
+  assert!(!list_of(&out, &search).unwrap().iter().any(|thread| thread.id == launch));
+  assert_eq!(unread_of(&out), Some(4));
+  assert_eq!(label_unread(&out, "Launch"), Some(1));
+  let (all, _) = load_mail(&mut demo, &events, &Mailbox::All, false);
+  assert!(!all.iter().any(|thread| thread.id == launch));
+  let (tagged, _) = load_mail(&mut demo, &events, &Mailbox::Label("Label_2".into()), false);
+  assert!(!tagged.iter().any(|thread| thread.id == launch));
+  assert_ne!(tagged, []);
+
+  // Trashing it again changes nothing the app holds.
+  demo.handle(Command::TrashMail { thread: launch.into() });
+  let out = drain(&events);
+  assert_eq!(out.len(), 1);
+  assert_eq!(written(&out), Some(Ok(())));
+
+  demo.handle(Command::TrashMail { thread: "demo-mail-missing".into() });
+  assert_eq!(written(&drain(&events)), Some(Err("This email is no longer there.".into())));
+}
+
 fn reply_to(thread: &str, message: &str, to: &str, text: &str) -> Command {
   Command::ReplyMail(Box::new(MailReply {
     thread: thread.into(),

@@ -1,7 +1,7 @@
-//! What the Mail view changes in Gmail: a thread marked unread, archived (with an Undo bar for a moment), and a reply
-//! written in a box under the thread's emails. The core applies each change to the lists at once and answers
-//! `MailWritten`; the view keeps only the reply drafts, per thread, while the app runs. The one-letter keys (`u`, `e`,
-//! `r`, `a`) work while the view itself has the keyboard, never while a field has it.
+//! What the Mail view changes in Gmail: a thread marked unread, archived (with an Undo bar for a moment), moved to
+//! the Trash, and a reply written in a box under the thread's emails. The core applies each change to the lists at
+//! once and answers `MailWritten`; the view keeps only the reply drafts, per thread, while the app runs. The
+//! one-letter keys (`u`, `e`, `r`, `a`) work while the view itself has the keyboard, never while a field has it.
 
 use std::time::Duration;
 
@@ -97,6 +97,22 @@ impl MailView {
         .store
         .update(cx, |store, cx| store.archive_mail(archived.thread, false, cx));
     }
+  }
+
+  /// Moves the thread open to Gmail's Trash from the reading pane's head, closes it, and selects the one after it
+  /// (before it at the end) without opening it, as an archive does. Gmail empties its Trash after 30 days; nothing
+  /// here deletes for good.
+  pub(crate) fn trash(&mut self, thread: String, window: &mut Window, cx: &mut Context<Self>) {
+    self.archived = None;
+    let threads = self.threads(cx);
+    let ids: Vec<&str> = threads.iter().map(|thread| thread.id.as_str()).collect();
+    let next = after_removal(&ids, &thread);
+    if self.store.read(cx).mail.open.as_ref() == Some(&thread) {
+      self.close_thread(window, cx);
+    }
+    self.store.update(cx, |store, cx| store.trash_mail(thread, cx));
+    self.selected = next;
+    cx.notify();
   }
 
   /// Who a reply to the newest email of the thread open reaches, `(to, cc)`, and that email's id.
@@ -387,36 +403,22 @@ impl MailView {
 
   /// Mark as unread, and in the inbox Archive: on the reading pane's head and on the selected row.
   pub(crate) fn thread_actions(&self, thread: &str, cx: &Context<Self>) -> Div {
-    let button = |id: &'static str, glyph: Icon, tip: String| {
-      div()
-        .id(id)
-        .size(px(28.))
-        .flex()
-        .flex_shrink_0()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .cursor_pointer()
-        .hover(|s| s.bg(rgb(ROW_HOVER)))
-        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-        .child(icon(glyph, 15., MUTED))
-    };
     let unread = thread.to_string();
     let archived = thread.to_string();
     h_flex()
       .flex_shrink_0()
       .gap_0p5()
       .child(
-        button("mail-unread", Icon::Mail, format!("Mark as unread ({})", keys::text("u"))).on_click(cx.listener(
-          move |this, _, window, cx| {
+        action_button("mail-unread", Icon::Mail, format!("Mark as unread ({})", keys::text("u"))).on_click(
+          cx.listener(move |this, _, window, cx| {
             cx.stop_propagation();
             this.mark_unread(unread.clone(), window, cx);
-          },
-        )),
+          }),
+        ),
       )
       .when(self.mailbox == Mailbox::Inbox, |actions| {
         actions.child(
-          button("mail-archive", Icon::Archive, format!("Archive ({})", keys::text("e"))).on_click(cx.listener(
+          action_button("mail-archive", Icon::Archive, format!("Archive ({})", keys::text("e"))).on_click(cx.listener(
             move |this, _, window, cx| {
               cx.stop_propagation();
               this.archive(archived.clone(), window, cx);
@@ -424,6 +426,17 @@ impl MailView {
           )),
         )
       })
+  }
+
+  /// Move to Trash, on the reading pane's head only: it acts on the thread open, never on the selected row.
+  pub(crate) fn trash_button(thread: &str, cx: &Context<Self>) -> Stateful<Div> {
+    let thread = thread.to_string();
+    action_button("mail-trash", Icon::Trash, "Move to Trash".into()).on_click(cx.listener(
+      move |this, _, window, cx| {
+        cx.stop_propagation();
+        this.trash(thread.clone(), window, cx);
+      },
+    ))
   }
 
   /// Under the thread's emails: the reply box while it is open, else Reply and, when it reaches someone more, Reply
@@ -570,6 +583,22 @@ impl MailView {
         ),
     )
   }
+}
+
+/// A round button of a thread's actions, with its tooltip.
+fn action_button(id: &'static str, glyph: Icon, tip: String) -> Stateful<Div> {
+  div()
+    .id(id)
+    .size(px(28.))
+    .flex()
+    .flex_shrink_0()
+    .items_center()
+    .justify_center()
+    .rounded_full()
+    .cursor_pointer()
+    .hover(|s| s.bg(rgb(ROW_HOVER)))
+    .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+    .child(icon(glyph, 15., MUTED))
 }
 
 /// Gmail's signature under an email's body, as it will be sent: its plain text dimmed, four lines at most, with a

@@ -1270,9 +1270,9 @@ pub enum Event {
     /// Minutes until it starts; 0 when it starts now.
     minutes: u32,
   },
-  /// A mail write (read mark, archive, reply, or new email) finished: `Ok` once Gmail has it, or why it failed,
-  /// already safe to show. The lists and the thread it changes are sent again at once, before Gmail answers, and once
-  /// more as they were when it fails.
+  /// A mail write (read mark, archive, trash, reply, or new email) finished: `Ok` once Gmail has it, or why it
+  /// failed, already safe to show. The lists and the thread it changes are sent again at once, before Gmail answers,
+  /// and once more as they were when it fails.
   MailWritten(Result<(), String>),
   /// The signatures Gmail adds for the signed-in address: sent with the first inbox, and again when they change.
   MailSignatures {
@@ -1540,6 +1540,12 @@ pub enum Command {
     thread: String,
     /// Out of the inbox, or back into it.
     archive: bool,
+  },
+  /// Moves a thread to Gmail's Trash, as Gmail's Delete does: it leaves every list, and Gmail deletes it for good 30
+  /// days later. Answers `Event::MailWritten`.
+  TrashMail {
+    /// The thread.
+    thread: String,
   },
   /// Sends an answer into a thread, from the signed-in address. Answers `Event::MailWritten`, and
   /// `Event::MailMessages` with the thread once it is sent.

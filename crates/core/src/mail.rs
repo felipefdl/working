@@ -139,6 +139,10 @@ const OP_SEND: usize = 13;
 const LABEL_OPENED: &str = "^o";
 const LABEL_UNSEEN: &str = "^us";
 const LABEL_ARCHIVED: &str = "^a";
+/// Gmail's Trash. Moving a thread there adds it on every email and takes the inbox off, as the web client's Delete
+/// does (a captured `s` op: `[["^k"], ["^ri_hl", "^i", …, "^a", …], [every message id]]`). The thread leaves every
+/// mailbox but Trash; Gmail deletes it for good 30 days later.
+const LABEL_TRASH: &str = "^k";
 
 // A message as a send carries it (`OP_SEND`'s first entry), by slot.
 const SENT_ID: usize = 0;
@@ -395,6 +399,17 @@ impl Client {
           label_op(&[LABEL_INBOX], &[LABEL_ARCHIVED], &ids)
         };
         session.write(thread, vec![op], false).await
+      })
+      .await
+  }
+
+  /// Moves a thread to Gmail's Trash (`^k` on every email, `^i` off), as Gmail's Delete does. Nothing is deleted for
+  /// good.
+  pub async fn trash(&self, thread: &str) -> Result<()> {
+    self
+      .with_session(|session| async move {
+        let ids = session.message_ids(thread).await?;
+        session.write(thread, vec![trash_op(&ids)], false).await
       })
       .await
   }
@@ -1368,6 +1383,11 @@ fn star_op(ids: &[String], starred: bool) -> Value {
   }
 }
 
+/// Moving to Trash as Gmail's Delete does: `^k` on every one of the emails `ids`, the inbox off.
+fn trash_op(ids: &[String]) -> Value {
+  label_op(&[LABEL_TRASH], &[LABEL_INBOX], ids)
+}
+
 /// The user's labels `add` put on and `remove` taken off every one of the emails `ids`. `check_user_labels` first.
 fn labels_op(add: &[String], remove: &[String], ids: &[String]) -> Value {
   let add: Vec<&str> = add.iter().map(String::as_str).collect();
@@ -2058,13 +2078,15 @@ struct Change {
   unread: Option<bool>,
   in_inbox: Option<bool>,
   starred: Option<bool>,
+  /// Moved to Trash: out of every list.
+  trashed: bool,
   /// The tick and time it was written; `None` while it is on its way.
   written: Option<(u64, std::time::Instant)>,
 }
 
-/// The user's changes to threads (read, unread, archived, starred), laid over list answers Gmail may have made before
-/// it had them: an answer asked for before a change was written still shows the thread as it was, and its counts
-/// too.
+/// The user's changes to threads (read, unread, archived, starred, trashed), laid over list answers Gmail may have
+/// made before it had them: an answer asked for before a change was written still shows the thread as it was, and
+/// its counts too.
 #[derive(Debug, Default)]
 pub(crate) struct Changes {
   /// Counts list requests and written changes, in the order they happen.
@@ -2094,6 +2116,13 @@ impl Changes {
     change.written = None;
   }
 
+  /// The user moved `thread` to Trash.
+  pub(crate) fn note_trashed(&mut self, thread: &str) {
+    let change = self.held.entry(thread.to_string()).or_default();
+    change.trashed = true;
+    change.written = None;
+  }
+
   /// Gmail has the change of `thread`.
   pub(crate) fn written(&mut self, thread: &str) {
     self.tick = self.tick.saturating_add(1);
@@ -2108,8 +2137,9 @@ impl Changes {
   }
 
   /// Lays the changes over `page`, the answer to the request of tick `requested`: a change on its way, or written
-  /// after the request went out, shows in its threads (an archived thread leaves an inbox list), and the inbox count
-  /// moves to match. A count the answer cannot vouch for (any other list's, or labels') is left out.
+  /// after the request went out, shows in its threads (an archived thread leaves an inbox list, a trashed one every
+  /// list), and the inbox count moves to match. A count the answer cannot vouch for (any other list's, or labels')
+  /// is left out.
   pub(crate) fn apply(&mut self, page: &mut ThreadPage, inbox: bool, requested: u64) {
     self
       .held
@@ -2128,7 +2158,7 @@ impl Changes {
         return true;
       };
       let was_unread = thread.unread;
-      if inbox && change.in_inbox == Some(false) {
+      if change.trashed || (inbox && change.in_inbox == Some(false)) {
         more -= i64::from(was_unread);
         return false;
       }
@@ -3177,6 +3207,50 @@ mod tests {
     let mut fresh = inbox_page(vec![thread("a", 30, true)], 1);
     changes.apply(&mut fresh, true, late);
     assert!(!fresh.threads[0].starred, "an answer asked for after the write is Gmail's own");
+  }
+
+  #[test]
+  fn a_trashed_thread_leaves_every_answer_asked_before_it() {
+    let mut changes = Changes::default();
+    let early = changes.request();
+    changes.note_trashed("a");
+    let mut inbox = inbox_page(vec![thread("a", 30, true), thread("b", 20, true)], 2);
+    changes.apply(&mut inbox, true, early);
+    assert_eq!(ids(&inbox.threads), ["b"]);
+    assert_eq!(inbox.inbox_unread, Some(1), "the trashed thread was unread");
+    assert_eq!(inbox.labels, None, "label counts from before the trash are left out");
+    let mut other = inbox_page(vec![thread("a", 30, false), thread("c", 10, false)], 4);
+    changes.apply(&mut other, false, early);
+    assert_eq!(
+      ids(&other.threads),
+      ["c"],
+      "a trashed thread leaves Starred, Sent, labels, and searches too"
+    );
+    assert_eq!(other.inbox_unread, None);
+
+    // Asked for after the write, Gmail's answer is its own: a search of the Trash shows the thread.
+    changes.written("a");
+    let late = changes.request();
+    let mut trash = inbox_page(vec![thread("a", 30, false)], 1);
+    changes.apply(&mut trash, false, late);
+    assert_eq!(ids(&trash.threads), ["a"]);
+
+    // Gmail did not take it: answers show the thread again.
+    changes.note_trashed("b");
+    changes.forget("b");
+    let mut back = inbox_page(vec![thread("b", 20, true)], 1);
+    changes.apply(&mut back, true, late);
+    assert_eq!(ids(&back.threads), ["b"]);
+    assert_eq!(back.inbox_unread, Some(1));
+  }
+
+  #[test]
+  fn trash_puts_gmails_trash_label_on_every_email() {
+    let ids = vec!["msg-f:1".to_string(), "msg-f:2".to_string()];
+    assert_eq!(
+      trash_op(&ids),
+      json!([null, null, null, null, null, null, [["^k"], ["^i"], ["msg-f:1", "msg-f:2"]]])
+    );
   }
 
   #[test]

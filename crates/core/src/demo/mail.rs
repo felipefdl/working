@@ -847,6 +847,8 @@ struct Held {
   labels: Labels,
   /// The ids of the user's labels on it.
   label_ids: Vec<&'static str>,
+  /// In the Trash: out of every list and search, as Gmail keeps trash out of them.
+  trashed: bool,
   /// Oldest first.
   messages: Vec<MailMessage>,
 }
@@ -898,6 +900,9 @@ impl Held {
   }
 
   fn is_in(&self, mailbox: &Mailbox, me: &str) -> bool {
+    if self.trashed {
+      return false;
+    }
     match mailbox {
       Mailbox::Inbox => self.labels.inbox,
       Mailbox::Starred => self.labels.starred,
@@ -1017,6 +1022,7 @@ impl DemoMail {
         .filter(|label| label.threads.contains(&spec.id))
         .map(|label| label.id)
         .collect(),
+      trashed: false,
       messages,
     }
   }
@@ -1087,7 +1093,7 @@ impl DemoMail {
         let unread = self
           .threads
           .iter()
-          .filter(|thread| thread.unread() && thread.label_ids.contains(&label.id))
+          .filter(|thread| !thread.trashed && thread.unread() && thread.label_ids.contains(&label.id))
           .count();
         MailLabel {
           id: label.id.into(),
@@ -1188,6 +1194,19 @@ impl DemoMail {
     true
   }
 
+  /// Moves a thread to the Trash: out of the inbox and every other list, its label counts with it. Trashing it again
+  /// changes nothing. False when there is no such thread.
+  pub fn trash(&mut self, id: &str) -> bool {
+    let shown = self.shown();
+    let Some(thread) = self.threads.iter_mut().find(|thread| thread.id == id) else {
+      return false;
+    };
+    thread.labels.inbox = false;
+    thread.trashed = true;
+    self.refit(&shown);
+    true
+  }
+
   /// Avery's made-up signatures: a full one for new emails and a shorter one for replies.
   pub fn signatures(&self) -> (Option<MailSignature>, Option<MailSignature>) {
     let first = self.me.name.split_whitespace().next().unwrap_or_default();
@@ -1280,6 +1299,7 @@ impl DemoMail {
         subject: compose.subject.trim().to_string(),
         labels: Labels { inbox: to_me, starred: false },
         label_ids: Vec::new(),
+        trashed: false,
         messages: vec![MailMessage {
           id: format!("{id}-0"),
           from: self.me.clone(),
@@ -1334,7 +1354,9 @@ impl DemoMail {
       draft: false,
       attachments: Vec::new(),
     });
+    // As Gmail: a new email in a trashed thread lands in the inbox, not the Trash.
     thread.labels.inbox = true;
+    thread.trashed = false;
     let summary = thread.summary();
     self.threads.insert(0, thread);
     self.refit(&shown);

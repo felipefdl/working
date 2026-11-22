@@ -630,24 +630,26 @@ impl MailView {
   // The reading pane.
 
   /// The thread open: its subject, then each email as a card, oldest first. `narrow`: the pane stands in for the
-  /// list, so its button goes back to it.
+  /// list, so a button first in its head goes back to it; beside the list, Escape closes the thread.
   fn reader(&self, narrow: bool, cx: &Context<Self>) -> AnyElement {
     let store = self.store.read(cx);
     let mail = &store.mail;
     let thread = mail.open.as_deref().and_then(|id| find_thread(mail, &self.mailbox, id));
     let subject = thread.map_or_else(String::new, |thread| thread.subject.clone());
-    let back = div()
-      .id("mail-back")
-      .size(px(30.))
-      .flex()
-      .flex_shrink_0()
-      .items_center()
-      .justify_center()
-      .rounded_full()
-      .cursor_pointer()
-      .hover(|s| s.bg(rgb(ROW_HOVER)))
-      .on_click(cx.listener(|this, _, window, cx| this.close_thread(window, cx)))
-      .child(icon(if narrow { Icon::ArrowLeft } else { Icon::X }, 16., MUTED));
+    let back = narrow.then(|| {
+      div()
+        .id("mail-back")
+        .size(px(30.))
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .cursor_pointer()
+        .hover(|s| s.bg(rgb(ROW_HOVER)))
+        .on_click(cx.listener(|this, _, window, cx| this.close_thread(window, cx)))
+        .child(icon(Icon::ArrowLeft, 16., MUTED))
+    });
     let title = div()
       .flex_1()
       .min_w_0()
@@ -657,13 +659,12 @@ impl MailView {
       .child(emoji_font::text(subject));
     let star = thread.filter(|thread| thread.starred).map(|_| icon(Icon::Star, 16., AMBER));
     let header = h_flex().flex_shrink_0().px_4().py_3().gap_2().items_center();
-    let actions = mail.open.as_deref().map(|open| self.thread_actions(open, cx));
-    // Beside the list the button closes the thread at the end of the head; in its place it goes back, first.
-    let header = if narrow {
-      header.child(back).child(title).children(star).children(actions)
-    } else {
-      header.child(title).children(star).children(actions).child(back)
-    };
+    // Move to Trash ends the head's group only: the selected row's actions leave it out.
+    let actions = mail
+      .open
+      .as_deref()
+      .map(|open| self.thread_actions(open, cx).child(Self::trash_button(open, cx)));
+    let header = header.children(back).child(title).children(star).children(actions);
     let body = match &mail.messages {
       Some(messages) => self.cards(messages.as_slice(), cx),
       None => match &mail.error {

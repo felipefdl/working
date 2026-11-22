@@ -492,6 +492,7 @@ async fn wait_for_session(
           },
           Command::MarkMail { .. }
           | Command::ArchiveMail { .. }
+          | Command::TrashMail { .. }
           | Command::ReplyMail { .. }
           | Command::ComposeMail { .. } => {
             let _ = events.send(Event::MailWritten(Err("Sign in to start.".into())));
@@ -2108,6 +2109,7 @@ impl Engine {
       Command::WatchEvents(on) => self.watch_events(on),
       Command::MarkMail { thread, read } => self.write_mail(MailChange::Mark { thread, read }),
       Command::ArchiveMail { thread, archive } => self.write_mail(MailChange::Archive { thread, archive }),
+      Command::TrashMail { thread } => self.write_mail(MailChange::Trash { thread }),
       Command::ReplyMail(reply) => self.write_mail(MailChange::Reply(reply)),
       Command::ComposeMail(compose) => self.write_mail(MailChange::Compose {
         compose,
@@ -3488,6 +3490,10 @@ enum MailChange {
     thread: String,
     archive: bool,
   },
+  /// Move a thread to Trash.
+  Trash {
+    thread: String,
+  },
   Reply(Box<MailReply>),
   /// A new email, in the thread `thread` the engine minted for it.
   Compose {
@@ -3855,7 +3861,7 @@ impl Engine {
     }
   }
 
-  /// `MarkMail`, `ArchiveMail`, `ReplyMail`, `ComposeMail`: shows the change at once and queues it for
+  /// `MarkMail`, `ArchiveMail`, `TrashMail`, `ReplyMail`, `ComposeMail`: shows the change at once and queues it for
   /// `mail_writer`. A refusal is queued too, so every `MailWritten` comes in the order of its command.
   fn write_mail(self: &Arc<Self>, change: MailChange) {
     let job = self.mail_job(change, None).unwrap_or_else(MailJob::Refused);
@@ -4062,6 +4068,7 @@ impl Engine {
     let result = match &change {
       MailChange::Mark { thread, read } => self.mail.mark(thread, *read).await,
       MailChange::Archive { thread, archive } => self.mail.archive(thread, *archive).await,
+      MailChange::Trash { thread } => self.mail.trash(thread).await,
       MailChange::Reply(reply) => self.mail.reply(reply).await,
       MailChange::Compose { compose, thread } => self.mail.compose(compose, thread).await.map(|mine| to_me = mine),
       MailChange::Forward { forward, thread } => self.mail.forward(forward, thread).await.map(|mine| to_me = mine),
@@ -4076,6 +4083,7 @@ impl Engine {
     let thread = match &change {
       MailChange::Mark { thread, .. }
       | MailChange::Archive { thread, .. }
+      | MailChange::Trash { thread }
       | MailChange::Compose { thread, .. }
       | MailChange::Forward { thread, .. }
       | MailChange::Star { thread, .. }
@@ -4106,6 +4114,16 @@ impl Engine {
             self.show_composed(generation, to_me).await;
           },
           MailChange::Star { .. } => self.read_held_lists(generation, vec![Mailbox::Starred]).await,
+          // The inbox read again for Gmail's counts, and every search held: one of the Trash, or of every mailbox,
+          // shows the thread again.
+          MailChange::Trash { .. } => {
+            let lists = {
+              let held = self.mail_lock();
+              let searches = held.lists.keys().filter(|mailbox| matches!(mailbox, Mailbox::Search(_)));
+              std::iter::once(Mailbox::Inbox).chain(searches.cloned()).collect()
+            };
+            self.read_held_lists(generation, lists).await;
+          },
           // The label lists held read again, with every label's count; the inbox, for the counts, when none is held.
           MailChange::Label { add, remove, .. } => {
             let lists: Vec<Mailbox> = add.into_iter().chain(remove).map(Mailbox::Label).collect();
@@ -4170,6 +4188,10 @@ impl Engine {
       MailChange::Archive { thread, archive } => {
         held.changes.note(thread, None, Some(!archive));
         self.archive_held(held, &mut undo, thread, *archive);
+      },
+      MailChange::Trash { thread } => {
+        held.changes.note_trashed(thread);
+        self.trash_held(held, &mut undo, thread);
       },
       MailChange::Star { thread, starred } => {
         held.changes.note_starred(thread, *starred);
@@ -4354,6 +4376,35 @@ impl Engine {
     self.emit_mail_list(&Mailbox::Inbox, inbox);
     if unread {
       self.shift_unread(held, !archive);
+    }
+  }
+
+  /// Takes a trashed thread out of every held list, the inbox's unread count and the labels' with it.
+  fn trash_held(&self, held: &mut MailHeld, undo: &mut MailUndo, thread_id: &str) {
+    held.archived.remove(thread_id);
+    let mut inbox_unread = false;
+    for (mailbox, list) in &mut held.lists {
+      let Some(place) = list.threads.iter().position(|thread| thread.id == thread_id) else {
+        continue;
+      };
+      let thread = list.threads.remove(place);
+      if thread.unread {
+        match mailbox {
+          Mailbox::Inbox => inbox_unread = true,
+          Mailbox::Label(id) => shift_label(&mut held.labels, id, false),
+          _ => {},
+        }
+      }
+      undo.removed.push((mailbox.clone(), place, thread));
+      self.emit_mail_list(mailbox, list);
+    }
+    if inbox_unread {
+      self.shift_unread(held, false);
+    }
+    if held.labels != undo.labels
+      && let Some(labels) = &held.labels
+    {
+      self.emit(Event::MailLabels(Arc::new(labels.clone())));
     }
   }
 

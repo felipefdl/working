@@ -338,7 +338,8 @@ pub struct MeetData {
 /// A write sent to Gmail, by what its answer is for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MailWrite {
-  /// A thread marked read or unread, archived or put back: a failure shows where Mail shows failures.
+  /// A thread marked read or unread, archived or put back, or moved to the Trash: a failure shows where Mail shows
+  /// failures.
   Change,
   /// A reply: its box hears how it went.
   Reply,
@@ -1052,7 +1053,7 @@ impl Store {
             Ok(()) => {},
             Err(message) => {
               tracing::warn!("mail: {message}");
-              // A send that did not go says why in its box; a mark or an archive, where Mail shows failures.
+              // A send that did not go says why in its box; a mark, an archive, or a trash, where Mail shows failures.
               if send {
                 self.mail.send_error = Some(message);
               } else {
@@ -1997,6 +1998,15 @@ impl Store {
   pub fn archive_mail(&mut self, thread: String, archive: bool, cx: &mut Context<Self>) {
     if self.features.mail {
       self.core.send(Command::ArchiveMail { thread, archive });
+      self.mail.writes.push_back(MailWrite::Change);
+      cx.notify();
+    }
+  }
+
+  /// Moves a thread to Gmail's Trash. The core takes it out of the lists at once and answers `MailWritten`.
+  pub fn trash_mail(&mut self, thread: String, cx: &mut Context<Self>) {
+    if self.features.mail {
+      self.core.send(Command::TrashMail { thread });
       self.mail.writes.push_back(MailWrite::Change);
       cx.notify();
     }

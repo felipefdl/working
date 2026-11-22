@@ -349,6 +349,7 @@ impl Demo {
       Command::WatchEvents(on) => self.watch_events(on),
       Command::MarkMail { thread, read } => self.write_mail(|mail| mail.mark(&thread, read)),
       Command::ArchiveMail { thread, archive } => self.write_mail(|mail| mail.archive(&thread, archive)),
+      Command::TrashMail { thread } => self.write_mail(|mail| mail.trash(&thread)),
       Command::ReplyMail(reply) => self.reply_mail(&reply),
       Command::ComposeMail(compose) => self.compose_mail(&compose),
       Command::SetTyping { .. } | Command::SetPresence(_) => {},
@@ -470,7 +471,7 @@ impl Demo {
     }
   }
 
-  /// `Command::MarkMail` and `ArchiveMail`: the change, what it touched, then `MailWritten`.
+  /// `Command::MarkMail`, `ArchiveMail`, and `TrashMail`: the change, what it touched, then `MailWritten`.
   fn write_mail(&mut self, write: impl FnOnce(&mut mail::DemoMail) -> bool) {
     let before = self.mail.snapshot();
     if write(&mut self.mail) {
