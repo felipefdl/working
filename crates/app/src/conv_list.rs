@@ -1,11 +1,12 @@
 //! The conversation list of the Messages, Rail and IRC layouts beside the open conversation. Messages lists chats
 //! with previews under a header of view buttons, filtered with chips beside the sort button and the Unread toggle, or
 //! in a column narrower than `TITLE_MIN_WIDTH` with IRC's one-line filter, whose menu opens under it; Rail lists the
-//! pane its icon column picked. In a Messages or Rail column narrower than `TITLE_MIN_WIDTH` the rows are stacked: the
-//! time ends the name's line and the marks end the preview's. IRC lists one line of the monospaced name a
-//! conversation, as WeeChat's buffer list, under a filter line, after rows that open the views. Every layout shares one
-//! Unread filter (`Store::unread_only`), combined with the pane in use. Each list scrolls to the open conversation when
-//! it changes, and IRC's also to the row of the open view.
+//! pane its icon column picked, and in a column narrower than `TITLE_MIN_WIDTH` keeps its title beside the small sort
+//! button and Unread toggle of the Messages chips. In a Messages or Rail column narrower than `TITLE_MIN_WIDTH` the
+//! rows are stacked: the time ends the name's line and the marks end the preview's. IRC lists one line of the
+//! monospaced name a conversation, as WeeChat's buffer list, under a filter line, after rows that open the views.
+//! Every layout shares one Unread filter (`Store::unread_only`), combined with the pane in use. Each list scrolls to
+//! the open conversation whenever a view is asked for or changes, and IRC's also to the row of the open view.
 
 use std::cell::Cell;
 use std::ops::Range;
@@ -36,10 +37,12 @@ const LIST_ROW_HEIGHT: f32 = ROW_HEIGHT + 4.0;
 const PREFETCH_ROWS: usize = 8;
 /// An IRC buffer row: one line of the monospaced name.
 const BUFFER_ROW_HEIGHT: f32 = 24.0;
-/// Narrowest a list column keeps the Messages title and chips and one line of marks on its rows; a narrower Messages
-/// header drops the title for the one-line filter, and the Messages and Rail rows are stacked (`RowMarks::stacked`).
+/// Narrowest a list column keeps the Messages title and chips, the Rail header's sort button and Unread switch, and
+/// one line of marks on its rows; a narrower Messages header drops the title for the one-line filter, a narrower Rail
+/// header takes the small buttons of the Messages chips, and the Messages and Rail rows are stacked
+/// (`RowMarks::stacked`).
 const TITLE_MIN_WIDTH: f32 = 300.0;
-/// Height of a filter chip, and of the sort and Unread buttons beside the Messages chips.
+/// Height of a filter chip, and of the sort and Unread buttons beside the Messages chips and in a narrow Rail header.
 const CHIP_HEIGHT: f32 = 22.;
 /// Space between the one-line filter and the top of the menu it opens under it.
 const MENU_GAP: f32 = 4.;
@@ -139,8 +142,8 @@ pub struct ConvList {
   store: Entity<Store>,
   scroll: UniformListScrollHandle,
   filter: Filter,
-  /// The view the list last scrolled to.
-  followed: Option<View>,
+  /// The view the list last scrolled to, and `Store::view_asks` then.
+  followed: Option<(View, u64)>,
   _subs: [Subscription; 3],
   _clock: Task<()>,
 }
@@ -187,16 +190,21 @@ impl ConvList {
     self.scroll.scroll_to_item_strict(0, ScrollStrategy::Top);
   }
 
-  /// Scrolls to the open view's row when the view changes, so a number key, stepping with the keys, or the switcher
-  /// keeps it in view. `views` are the view rows before the conversations (IRC; none in the other layouts).
+  /// Scrolls to the open view's row whenever a view is asked for (`Store::view_asks`), also the one already on
+  /// screen, and when the view changes, so a number key, stepping with the keys, or the switcher keeps it in view.
+  /// `views` are the view rows before the conversations (IRC; none in the other layouts).
   fn follow_open(&mut self, store: &Store, views: impl Iterator<Item = ViewRow>) {
-    if self.followed.as_ref() == Some(&store.view) {
+    if self
+      .followed
+      .as_ref()
+      .is_some_and(|(view, asks)| *view == store.view && *asks == store.view_asks)
+    {
       return;
     }
     if let Some(ix) = open_row(&store.view, views, |id| store.list.position(id)) {
       self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
     }
-    self.followed = Some(store.view.clone());
+    self.followed = Some((store.view.clone(), store.view_asks));
   }
 
   fn rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -504,8 +512,6 @@ impl ConvList {
   /// Messages: the chips, wrapping onto more lines when the list is dragged narrower, and at their right, level with
   /// their first line, the sort button and the Unread toggle with the count of every unread conversation.
   fn chip_row(&self, store: &Store, cx: &Context<Self>) -> Div {
-    let on = store.unread_only;
-    let unread = store.pane_unread(&Pane::All);
     h_flex()
       .w_full()
       .px_4()
@@ -513,25 +519,29 @@ impl ConvList {
       .gap_2()
       .items_start()
       .child(chips(&self.store, store).flex_1().min_w_0())
+      .child(Self::filter_buttons(store.unread_only, store.pane_unread(&Pane::All), cx))
+  }
+
+  /// The 22px sort button and Unread toggle, at the right of the Messages chips and of a narrow Rail header. `on`
+  /// paints the toggle as in use; `badge` is the count at its top-right corner, none while 0.
+  fn filter_buttons(on: bool, badge: usize, cx: &Context<Self>) -> Div {
+    h_flex()
+      .flex_shrink_0()
+      .gap_1()
+      .items_center()
       .child(
-        h_flex()
-          .flex_shrink_0()
-          .gap_1()
-          .items_center()
-          .child(
-            icon_button("sort-list", Icon::ArrowDownAZ, false, CHIP_HEIGHT, 14.)
-              .tooltip(hint("Sort"))
-              .on_mouse_down(MouseButton::Left, sort_menu(cx)),
-          )
-          .child(
-            icon_button("unread-only", Icon::ListFilter, on, CHIP_HEIGHT, 14.)
-              .relative()
-              .tooltip(hint("Unread only"))
-              .on_click(cx.listener(move |this, _, _, cx| this.set_only_unread(!on, cx)))
-              .when(unread > 0, |button| {
-                button.child(count_badge(unread).absolute().top(px(-4.)).right(px(-6.)))
-              }),
-          ),
+        icon_button("sort-list", Icon::ArrowDownAZ, false, CHIP_HEIGHT, 14.)
+          .tooltip(hint("Sort"))
+          .on_mouse_down(MouseButton::Left, sort_menu(cx)),
+      )
+      .child(
+        icon_button("unread-only", Icon::ListFilter, on, CHIP_HEIGHT, 14.)
+          .relative()
+          .tooltip(hint("Unread only"))
+          .on_click(cx.listener(move |this, _, _, cx| this.set_only_unread(!on, cx)))
+          .when(badge > 0, |button| {
+            button.child(count_badge(badge).absolute().top(px(-4.)).right(px(-6.)))
+          }),
       )
   }
 
@@ -625,14 +635,17 @@ impl ConvList {
       })
   }
 
-  /// Rail: the title of the pane and, for conversations, the Unread switch.
+  /// Rail: the title of the pane and, for conversations, the sort button and the Unread switch. A column narrower than
+  /// `TITLE_MIN_WIDTH` narrows the padding and puts the small sort button and Unread toggle of the Messages chips in
+  /// their place, without a count (the Rail's tabs carry the counts), so the title keeps its room.
   fn rail_header(&self, store: &Store, cx: &Context<Self>) -> Div {
     let on = store.unread_only;
+    let narrow = is_narrow(cx.global::<Settings>().column_width(Layout::Rail));
     h_flex()
       .h(px(56.))
       .flex_shrink_0()
-      .px_5()
-      .gap_3()
+      .when(narrow, |header| header.px_3().gap_2())
+      .when(!narrow, |header| header.px_5().gap_3())
       .items_center()
       .justify_between()
       .child(
@@ -645,6 +658,9 @@ impl ConvList {
           .child(pane_title(&store.pane).to_string()),
       )
       .when(!matches!(store.pane, Pane::Shortcut(_)), |header| {
+        if narrow {
+          return header.child(Self::filter_buttons(on, 0, cx));
+        }
         let flip = cx.listener(move |this, _, _, cx| this.set_only_unread(!on, cx));
         header.child(
           h_flex()

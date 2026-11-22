@@ -1,6 +1,6 @@
 //! Fixed-width, virtualized sidebar: New chat, Home, Mentions, Starred, Calendar, Meet, and Mail, then the Direct
 //! messages / Apps / Spaces sections, each header with its unread count. It scrolls to the row of the open view (a
-//! button's row or the open conversation's) when the view changes.
+//! button's row or the open conversation's) whenever a view is asked for or changes.
 
 use std::ops::Range;
 use std::rc::Rc;
@@ -32,8 +32,8 @@ const ROW_HEIGHT: f32 = 30.0;
 pub struct Sidebar {
   store: Entity<Store>,
   scroll: UniformListScrollHandle,
-  /// The view the list last scrolled to.
-  followed: Option<View>,
+  /// The view the list last scrolled to, and `Store::view_asks` then.
+  followed: Option<(View, u64)>,
   _subs: [Subscription; 3],
 }
 
@@ -53,16 +53,21 @@ impl Sidebar {
     }
   }
 
-  /// Scrolls to the open view's row when the view changes, so a number key, stepping with the keys, or the switcher
-  /// keeps it in view. A view without a row (its section folded, its button switched off) scrolls nothing.
+  /// Scrolls to the open view's row whenever a view is asked for (`Store::view_asks`), also the one already on
+  /// screen, and when the view changes, so a number key, stepping with the keys, or the switcher keeps it in view. A
+  /// view without a row (its section folded, its button switched off) scrolls nothing.
   fn follow_open(&mut self, store: &Store) {
-    if self.followed.as_ref() == Some(&store.view) {
+    if self
+      .followed
+      .as_ref()
+      .is_some_and(|(view, asks)| *view == store.view && *asks == store.view_asks)
+    {
       return;
     }
     if let Some(ix) = view_row(&store.sidebar, &store.view) {
       self.scroll.scroll_to_item(ix, ScrollStrategy::Nearest);
     }
-    self.followed = Some(store.view.clone());
+    self.followed = Some((store.view.clone(), store.view_asks));
   }
 
   fn rows(&mut self, range: Range<usize>, cx: &mut Context<Self>) -> Vec<AnyElement> {

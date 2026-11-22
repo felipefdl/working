@@ -560,6 +560,10 @@ pub struct Store {
   /// with the muted ones last (`section_order`). Built only while that layout is on.
   pub sidebar: Vec<SidebarItem>,
   pub view: View,
+  /// How many times a view was asked for (`open`, `go_home`, `open_shortcut`, `open_calendar`, `open_meet`,
+  /// `open_mail`), also the one already on screen: each ask brings its row into view in the lists, which compare it
+  /// with the count they last followed.
+  pub view_asks: u64,
   /// Views left by navigating, newest last: what Back returns to.
   back: Vec<View>,
   /// Views left by Back, newest last: what Forward reopens. Navigating anywhere else clears it.
@@ -640,6 +644,7 @@ impl Store {
         SidebarItem::Mail,
       ],
       view: View::Home,
+      view_asks: 0,
       back: Vec::new(),
       forward: Vec::new(),
       moving: false,
@@ -1716,10 +1721,12 @@ impl Store {
     let Some(group) = self.groups.get(&id).map(|c| c.g.clone()) else {
       return;
     };
+    self.ask_view();
     if self.is_open(&id) {
       if let Some(view) = &self.conv {
         view.update(cx, |view, cx| view.focus_composer(window, cx));
       }
+      cx.notify();
       return;
     }
     if !self.query.is_empty() {
@@ -1763,6 +1770,11 @@ impl Store {
     if reopened {
       self.rebuild_sidebar();
     }
+  }
+
+  /// Counts an ask for a view, so the lists bring its row into view even when it is the one on screen.
+  const fn ask_view(&mut self) {
+    self.view_asks = self.view_asks.wrapping_add(1);
   }
 
   /// Returns to the view before this one. With nothing recorded, a conversation or a shortcut goes home.
@@ -1821,6 +1833,7 @@ impl Store {
   }
 
   pub fn go_home(&mut self, cx: &mut Context<Self>) {
+    self.ask_view();
     if self.view != View::Home {
       self.core.send(Command::Close);
     }
@@ -1833,6 +1846,7 @@ impl Store {
 
   /// Shows Mentions or Starred, loading its newest messages again.
   pub fn open_shortcut(&mut self, shortcut: Shortcut, cx: &mut Context<Self>) {
+    self.ask_view();
     if matches!(self.view, View::Conversation(_)) {
       self.core.send(Command::Close);
     }
@@ -1847,6 +1861,7 @@ impl Store {
     if !self.features.calendar {
       return;
     }
+    self.ask_view();
     if matches!(self.view, View::Conversation(_)) {
       self.core.send(Command::Close);
     }
@@ -1861,6 +1876,7 @@ impl Store {
     if !self.features.meet {
       return;
     }
+    self.ask_view();
     if matches!(self.view, View::Conversation(_)) {
       self.core.send(Command::Close);
     }
@@ -1877,6 +1893,7 @@ impl Store {
     if !self.features.mail {
       return;
     }
+    self.ask_view();
     if matches!(self.view, View::Conversation(_)) {
       self.core.send(Command::Close);
     }
