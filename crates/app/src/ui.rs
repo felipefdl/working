@@ -456,14 +456,19 @@ pub fn person_status(group: &Group, cx: &App) -> Option<PersonStatus> {
   cx.try_global::<People>()?.0.get(person).copied()
 }
 
-/// A person's status as a small mark in a line of text: green when active, a hollow ring when away, red for do not
-/// disturb.
+/// A person's status as a small mark in a line of text, the avatar badge's shapes: green when active, a hollow ring
+/// when away, red with a bar for do not disturb.
 pub fn status_dot(status: PersonStatus) -> Div {
-  let dot = div().size(px(7.)).flex_shrink_0().rounded_full();
+  let dot = div().size(px(9.)).flex_shrink_0().rounded_full();
   match status {
     PersonStatus::Active => dot.bg(rgb(GREEN)),
     PersonStatus::Away => dot.border(px(1.5)).border_color(rgb(MUTED)),
-    PersonStatus::DoNotDisturb => dot.bg(rgb(RED)),
+    PersonStatus::DoNotDisturb => dot
+      .bg(rgb(RED))
+      .flex()
+      .items_center()
+      .justify_center()
+      .child(div().w(px(5.)).h(px(1.5)).rounded_full().bg(rgb(WHITE))),
   }
 }
 
