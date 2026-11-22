@@ -17,7 +17,6 @@
 )]
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,7 +26,7 @@ use regex::Regex;
 use reqwest::cookie::Jar;
 use serde_json::{Value, json};
 
-use crate::http::{SessionCookie, USER_AGENT, read_cookies};
+use crate::http::{ServiceSession, SessionCookie, USER_AGENT, asks_sign_in, read_cookies};
 use crate::model::{
   MailAddress, MailAttachment, MailCompose, MailDraft, MailForward, MailLabel, MailMessage, MailReply, MailSignature,
   MailThread, Mailbox, Micros,
@@ -284,15 +283,15 @@ pub struct ThreadPage {
 
 /// Gmail for the session in `cookies.json`. Cheap to make: the session opens on the first call.
 pub struct Client {
-  cookie_path: PathBuf,
+  signed: ServiceSession,
   session: tokio::sync::Mutex<Option<Arc<Session>>>,
 }
 
 impl Client {
-  /// A client for the session saved at `cookie_path`.
-  pub fn new(cookie_path: PathBuf) -> Self {
+  /// A client for the session `signed` names.
+  pub fn new(signed: ServiceSession) -> Self {
     Self {
-      cookie_path,
+      signed,
       session: tokio::sync::Mutex::new(None),
     }
   }
@@ -303,7 +302,7 @@ impl Client {
       return Ok(session.clone());
     }
     let started = std::time::Instant::now();
-    let session = Arc::new(Session::open(&self.cookie_path).await?);
+    let session = Arc::new(self.signed.opened(Session::open(&self.signed).await)?);
     tracing::debug!("Gmail session opened: {} ms", started.elapsed().as_millis());
     *held = Some(session.clone());
     Ok(session)
@@ -605,8 +604,8 @@ struct Session {
 }
 
 impl Session {
-  async fn open(cookie_path: &std::path::Path) -> Result<Self> {
-    let cookies = read_cookies(cookie_path)?;
+  async fn open(signed: &ServiceSession) -> Result<Self> {
+    let cookies = read_cookies(signed.cookie_path())?;
     let http = reqwest::Client::builder()
       .user_agent(USER_AGENT)
       .cookie_provider(Arc::new(jar(&cookies)))
@@ -625,10 +624,13 @@ impl Session {
       .send()
       .await
       .map_err(|error| too_slow(error, READ_TIMEOUT))?;
+    if asks_sign_in(response.url()) {
+      return Err(signed.refused());
+    }
     let host = response.url().host_str().unwrap_or_default().to_string();
     let page = response.text().await?;
     if host != "mail.google.com" {
-      bail!("Gmail asks to sign in again");
+      bail!("Gmail did not open");
     }
     let config = PageConfig::parse(&page)?;
     let offset_ms = i64::from(chrono::Local::now().offset().local_minus_utc()) * 1000;

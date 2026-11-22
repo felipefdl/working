@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use gchat_core::{Command, SessionCookie};
+use gchat_core::SessionCookie;
 use gpui_kit::component::input::Escape;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -205,7 +205,7 @@ impl WelcomeView {
             this.web = None;
             this.phase = Phase::Welcome;
             this.connecting = true;
-            this.store.read(cx).core.send(Command::Connect);
+            this.store.update(cx, Store::connect);
             cx.notify();
           },
           Err(message) => {
@@ -331,7 +331,7 @@ impl WelcomeView {
       .read(cx)
       .signed_out
       .as_deref()
-      .filter(|text| text.contains("expired"))
+      .filter(|text| text.contains("expired") || text.contains("sign in again"))
       .map(SharedString::from)
   }
 }
@@ -351,10 +351,17 @@ fn chat_signed_in(url: &str) -> bool {
   rest.is_empty() || rest.starts_with('/') || rest.starts_with('?') || rest.starts_with('#')
 }
 
+/// Whether the cookies are a whole Google session: the account's own (`SID` and its kin), and the ones
+/// `accounts.google.com` keeps (`LSID` and its kin), which Gmail and Google Calendar are let in by. Chat alone
+/// opens without the second kind, and the rest of the app would then ask to sign in again.
 fn session_looks_complete(cookies: &[SessionCookie]) -> bool {
-  cookies
+  let account = cookies
     .iter()
-    .any(|cookie| cookie.name == "SID" || cookie.name == "SAPISID" || cookie.name.ends_with("PSID"))
+    .any(|cookie| cookie.name == "SID" || cookie.name == "SAPISID" || cookie.name.ends_with("PSID"));
+  let sign_in = cookies
+    .iter()
+    .any(|cookie| cookie.domain == "accounts.google.com" && cookie.name.ends_with("LSID"));
+  account && sign_in
 }
 
 impl Render for WelcomeView {
@@ -400,10 +407,17 @@ mod tests {
   }
 
   #[test]
-  fn session_needs_a_google_sid() {
+  fn session_needs_the_account_and_the_sign_in_cookies() {
+    let lsid = cookie("__Host-1PLSID", "accounts.google.com");
     assert!(!session_looks_complete(&[]));
-    assert!(!session_looks_complete(&[cookie("NID", ".google.com")]));
-    assert!(session_looks_complete(&[cookie("SAPISID", ".google.com")]));
-    assert!(session_looks_complete(&[cookie("__Secure-1PSID", ".google.com")]));
+    assert!(!session_looks_complete(&[cookie("NID", ".google.com"), lsid.clone()]));
+    // What Chat alone opens with: Gmail and Calendar would ask to sign in again.
+    assert!(!session_looks_complete(&[cookie("SAPISID", ".google.com")]));
+    assert!(!session_looks_complete(&[
+      cookie("SID", ".google.com"),
+      cookie("LSID", ".google.com")
+    ]));
+    assert!(session_looks_complete(&[cookie("SAPISID", ".google.com"), lsid.clone()]));
+    assert!(session_looks_complete(&[cookie("__Secure-1PSID", ".google.com"), lsid]));
   }
 }

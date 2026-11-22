@@ -21,7 +21,9 @@ agent-browser --session "$session" open "https://accounts.google.com/" >/dev/nul
 agent-browser --session "$session" cookies --json >"$tmp/accounts.json"
 agent-browser --session "$session" close >/dev/null 2>&1 || true
 
-python3 - "$tmp/chat.json" "$tmp/accounts.json" >"$dir/cookies.json" <<'EOF'
+# A session without the accounts.google.com sign-in cookies opens Chat alone: Gmail and Google Calendar would ask
+# to sign in again, so it is not saved.
+python3 - "$tmp/chat.json" "$tmp/accounts.json" >"$tmp/cookies.json" <<'EOF' || { rm -rf "$tmp"; exit 1; }
 import json, sys
 keep = {}
 for path in sys.argv[1:]:
@@ -31,7 +33,10 @@ for path in sys.argv[1:]:
       keep[(c["domain"], c["name"], path_attr)] = {
         "name": c["name"], "value": c["value"], "domain": c["domain"], "path": path_attr,
       }
+if not any(domain == "accounts.google.com" and name.endswith("LSID") for domain, name, _ in keep):
+  sys.exit("Google did not finish signing in: the session has no sign-in cookies. Nothing was saved; run it again.")
 json.dump(list(keep.values()), sys.stdout, indent=1)
 EOF
+mv "$tmp/cookies.json" "$dir/cookies.json"
 rm -rf "$tmp"
 echo "Saved $dir/cookies.json"

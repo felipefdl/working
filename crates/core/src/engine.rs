@@ -32,7 +32,7 @@ use tokio::sync::{Notify as Wake, Semaphore};
 use crate::cache::{Cache, HistoryCache, MailCache, WorldCache};
 use crate::channel::{Channel, ChannelEvent};
 use crate::convert::{self, Users};
-use crate::http::{Http, SignedOut, request_header};
+use crate::http::{Http, ServiceSession, SignedOut, request_header};
 use crate::markup;
 use crate::mcp;
 use crate::model::{
@@ -564,6 +564,10 @@ async fn run(
     ..Default::default()
   };
   let (mail_writes, mail_jobs) = tokio::sync::mpsc::unbounded_channel();
+  let cookie_path = crate::config_dir().join("cookies.json");
+  let calendar =
+    crate::calendar::Client::new(ServiceSession::new("Google Calendar", cookie_path.clone(), events.clone()));
+  let mail = crate::mail::Client::new(ServiceSession::new("Gmail", cookie_path, events.clone()));
   let engine = Arc::new(Engine {
     http,
     channel: Channel::new(),
@@ -573,12 +577,12 @@ async fn run(
     readonly: std::env::var("WORKING_READONLY").is_ok_and(|value| value == "1"),
     mcp: tokio::sync::Mutex::new(None),
     presence: Mutex::new(None),
-    calendar: crate::calendar::Client::new(crate::config_dir().join("cookies.json")),
+    calendar,
     calendar_range: Mutex::new(None),
     event_watch: Mutex::new(None),
     events_written: Wake::new(),
     mail_writes,
-    mail: crate::mail::Client::new(crate::config_dir().join("cookies.json")),
+    mail,
     mail_held: Mutex::new(MailHeld::default()),
     unsaved: Mutex::new(HashMap::new()),
     history_queued: Wake::new(),
@@ -3667,7 +3671,7 @@ impl MailList {
 }
 
 /// Gmail, read only: lists answer with `Event::MailThreads`, threads with `Event::MailMessages`, and every failure
-/// with `Event::MailFailed` (a signed-out Gmail too: Chat may still work).
+/// with `Event::MailFailed`. A Gmail that asks to sign in again signs the whole app out (`ServiceSession`).
 impl Engine {
   fn mail_lock(&self) -> std::sync::MutexGuard<'_, MailHeld> {
     self.mail_held.lock().unwrap_or_else(std::sync::PoisonError::into_inner)

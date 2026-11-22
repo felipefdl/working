@@ -13,7 +13,6 @@
 )]
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -24,7 +23,7 @@ use reqwest::Method;
 use reqwest::cookie::Jar;
 use serde_json::{Map, Value, json};
 
-use crate::http::{SessionCookie, USER_AGENT, read_cookies};
+use crate::http::{ServiceSession, SessionCookie, USER_AGENT, asks_sign_in, read_cookies};
 use crate::model::{
   Calendar, CalendarAccess, CalendarEvent, EditScope, EventDraft, EventKind, Guest, Micros, Reminder, Repeat, Rsvp,
   Visibility,
@@ -76,7 +75,7 @@ impl std::error::Error for Refused {}
 
 /// Google Calendar for the session in `cookies.json`. Cheap to make: the session opens on the first call.
 pub struct Client {
-  cookie_path: PathBuf,
+  signed: ServiceSession,
   session: tokio::sync::Mutex<Option<Arc<Session>>>,
   /// The calendars last listed, which `events` reads.
   calendars: Mutex<Vec<Calendar>>,
@@ -86,9 +85,9 @@ pub struct Client {
 }
 
 impl Client {
-  pub fn new(cookie_path: PathBuf) -> Self {
+  pub fn new(signed: ServiceSession) -> Self {
     Self {
-      cookie_path,
+      signed,
       session: tokio::sync::Mutex::new(None),
       calendars: Mutex::new(Vec::new()),
       default_reminders: Mutex::new(HashMap::new()),
@@ -100,7 +99,7 @@ impl Client {
     if let Some(session) = held.as_ref() {
       return Ok(session.clone());
     }
-    let session = Arc::new(Session::open(&self.cookie_path).await?);
+    let session = Arc::new(self.signed.opened(Session::open(&self.signed).await)?);
     *held = Some(session.clone());
     Ok(session)
   }
@@ -237,8 +236,8 @@ struct Session {
 }
 
 impl Session {
-  async fn open(cookie_path: &std::path::Path) -> Result<Self> {
-    let cookies = read_cookies(cookie_path)?;
+  async fn open(signed: &ServiceSession) -> Result<Self> {
+    let cookies = read_cookies(signed.cookie_path())?;
     let apisids = apisids(&cookies);
     if apisids.is_empty() {
       bail!("the Google session has no SAPISID cookie; sign in again");
@@ -250,10 +249,13 @@ impl Session {
       .timeout(Duration::from_secs(45))
       .build()?;
     let response = http.get(PAGE).send().await.context("Google Calendar did not answer")?;
+    if asks_sign_in(response.url()) {
+      return Err(signed.refused());
+    }
     let host = response.url().host_str().unwrap_or_default().to_string();
     let page = response.text().await?;
     if host != "calendar.google.com" {
-      bail!("Google Calendar asks to sign in again");
+      bail!("Google Calendar did not open");
     }
     let mut session = Self {
       http,

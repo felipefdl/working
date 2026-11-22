@@ -719,7 +719,8 @@ impl Store {
           changed = true;
         },
         Event::Connection(connection) => {
-          self.signed_out = None;
+          // A sign-out stays until the user signs in again (`connect`): Chat can still be up when Gmail or
+          // Google Calendar refused the session, and its stream coming back is not a sign-in.
           // The schedules can change in Google Chat while this was away.
           if connection == Connection::Online && self.connection != Connection::Online {
             self.core.send(Command::LoadDnd);
@@ -1241,7 +1242,10 @@ impl Store {
     let body = message.preview();
     let sound = cx.global::<crate::settings::Settings>().sound.resolved();
     let space = (!direct).then_some(conv.g.name.as_str());
-    crate::notify::post(&message.id, &message.group.key(), &message.sender_name, space, &body, sound);
+    // A signed-out app says nothing, also while Chat still answers (Gmail or Calendar refused the session).
+    if self.signed_out.is_none() {
+      crate::notify::post(&message.id, &message.group.key(), &message.sender_name, space, &body, sound);
+    }
     self.notified.entry(message.group.clone()).or_default().push(message.id.clone());
   }
 
@@ -1830,6 +1834,14 @@ impl Store {
       View::Conversation(id) => self.open(id, window, cx),
     }
     self.moving = false;
+  }
+
+  /// Opens the session the sign-in just saved. The sign-out ends here; the core says so again when Google
+  /// refuses this session too.
+  pub fn connect(&mut self, cx: &mut Context<Self>) {
+    self.signed_out = None;
+    self.core.send(Command::Connect);
+    cx.notify();
   }
 
   pub fn go_home(&mut self, cx: &mut Context<Self>) {

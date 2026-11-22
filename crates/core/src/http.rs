@@ -170,6 +170,89 @@ impl std::fmt::Display for SignedOut {
 
 impl std::error::Error for SignedOut {}
 
+/// Whether `url` is Google's sign-in page, where a service sends a session it does not take.
+pub(crate) fn asks_sign_in(url: &reqwest::Url) -> bool {
+  let path = url.path();
+  url.host_str() == Some("accounts.google.com")
+    && ["/ServiceLogin", "/InteractiveLogin", "/signin", "/v3/signin"]
+      .iter()
+      .any(|page| path.starts_with(page))
+}
+
+/// Adds a line to `session.log`, beside the session file at `cookie_path`: when `who` refused the session, and how
+/// long ago the session file was written. A file written moments ago was refused while fresh, an old one may only
+/// have gone stale. Never a cookie's name or value.
+fn log_refusal(cookie_path: &std::path::Path, who: &str) {
+  let written = std::fs::metadata(cookie_path)
+    .and_then(|file| file.modified())
+    .ok()
+    .and_then(|at| at.elapsed().ok())
+    .map_or_else(|| "at an unknown time".to_string(), |age| format!("{} s before", age.as_secs()));
+  let line = format!(
+    "{} {who} refused the session; the session file was written {written}\n",
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+  );
+  tracing::warn!("{}", line.trim_end());
+  let log = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(cookie_path.with_file_name("session.log"));
+  if let Ok(mut log) = log {
+    let _ = std::io::Write::write_all(&mut log, line.as_bytes());
+  }
+}
+
+/// What Gmail or Google Calendar does when Google sends its session to the sign-in page: the app is signed out as
+/// a whole, as when Chat is refused, rather than left running with one service dead. One sign-in serves them all,
+/// so a session one of them refuses is not a whole session.
+pub(crate) struct ServiceSession {
+  service: &'static str,
+  cookie_path: std::path::PathBuf,
+  events: flume::Sender<crate::model::Event>,
+  /// The refusal is in `session.log` already, until the session opens again.
+  logged: AtomicBool,
+}
+
+impl ServiceSession {
+  pub(crate) const fn new(
+    service: &'static str,
+    cookie_path: std::path::PathBuf,
+    events: flume::Sender<crate::model::Event>,
+  ) -> Self {
+    Self {
+      service,
+      cookie_path,
+      events,
+      logged: AtomicBool::new(false),
+    }
+  }
+
+  pub(crate) fn cookie_path(&self) -> &std::path::Path {
+    &self.cookie_path
+  }
+
+  /// The error of a session that asked to sign in again.
+  pub(crate) fn refused(&self) -> anyhow::Error {
+    SignedOut(format!("{} asks you to sign in again.", self.service)).into()
+  }
+
+  /// Takes the answer of opening the service's session: a refusal signs the app out and is logged once.
+  pub(crate) fn opened<T>(&self, result: Result<T>) -> Result<T> {
+    match &result {
+      Ok(_) => self.logged.store(false, Ordering::Relaxed),
+      Err(error) => {
+        if let Some(SignedOut(reason)) = error.downcast_ref::<SignedOut>() {
+          if !self.logged.swap(true, Ordering::Relaxed) {
+            log_refusal(&self.cookie_path, self.service);
+          }
+          let _ = self.events.send(crate::model::Event::SignedOut(reason.clone()));
+        }
+      },
+    }
+    result
+  }
+}
+
 pub struct Http {
   /// Short requests: API calls and downloads.
   client: reqwest::Client,
@@ -307,30 +390,12 @@ impl Http {
     result
   }
 
-  /// Google refused the session, with the saved cookies too. `session.log`, beside the session file, gets a line
-  /// with when, and how long ago the session file was written: a file written moments ago was refused by Google
-  /// while fresh, an old one may only have gone stale. Never a cookie's name or value.
+  /// Google refused the session, with the saved cookies too: `session.log` gets a line, once.
   fn note_refused(&self) {
     if self.refused.swap(true, Ordering::Relaxed) {
       return;
     }
-    let written = std::fs::metadata(&self.cookie_path)
-      .and_then(|file| file.modified())
-      .ok()
-      .and_then(|at| at.elapsed().ok())
-      .map_or_else(|| "at an unknown time".to_string(), |age| format!("{} s before", age.as_secs()));
-    let line = format!(
-      "{} Google refused the session; the session file was written {written}\n",
-      chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
-    );
-    tracing::warn!("{}", line.trim_end());
-    let log = std::fs::OpenOptions::new()
-      .create(true)
-      .append(true)
-      .open(self.cookie_path.with_file_name("session.log"));
-    if let Ok(mut log) = log {
-      let _ = std::io::Write::write_all(&mut log, line.as_bytes());
-    }
+    log_refusal(&self.cookie_path, "Google");
   }
 
   async fn read_bootstrap(&self) -> Result<String> {
@@ -640,7 +705,19 @@ mod tests {
   use reqwest::cookie::CookieStore;
   use reqwest::header::HeaderValue;
 
-  use super::{SessionJar, set_cookie};
+  use super::{SessionJar, asks_sign_in, set_cookie};
+
+  #[test]
+  fn only_the_sign_in_page_asks_to_sign_in() {
+    let asks = |url: &str| asks_sign_in(&url.parse().expect("url"));
+    assert!(asks("https://accounts.google.com/ServiceLogin?service=mail&passive=1"));
+    assert!(asks("https://accounts.google.com/v3/signin/identifier?continue=x"));
+    assert!(asks("https://accounts.google.com/InteractiveLogin"));
+    // A service the account does not have is not a refused session.
+    assert!(!asks("https://accounts.google.com/ServiceNotAllowed?service=mail"));
+    assert!(!asks("https://mail.google.com/mail/u/0/"));
+    assert!(!asks("https://accounts.example.com/ServiceLogin"));
+  }
 
   fn from(host: &str, header: &str) -> Option<(String, String, String, String)> {
     let url = format!("https://{host}/u/0/").parse().expect("url");
