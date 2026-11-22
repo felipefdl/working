@@ -99,19 +99,21 @@ impl MailView {
     }
   }
 
-  /// Moves the thread open to Gmail's Trash from the reading pane's head, closes it, and selects the one after it
-  /// (before it at the end) without opening it, as an archive does. Gmail empties its Trash after 30 days; nothing
-  /// here deletes for good.
+  /// Moves the thread open to Gmail's Trash from the reading pane's head and opens the one after it (before it at
+  /// the end), closing the pane only when the list has no other. Gmail empties its Trash after 30 days; nothing here
+  /// deletes for good.
   pub(crate) fn trash(&mut self, thread: String, window: &mut Window, cx: &mut Context<Self>) {
     self.archived = None;
     let threads = self.threads(cx);
     let ids: Vec<&str> = threads.iter().map(|thread| thread.id.as_str()).collect();
     let next = after_removal(&ids, &thread);
-    if self.store.read(cx).mail.open.as_ref() == Some(&thread) {
-      self.close_thread(window, cx);
-    }
     self.store.update(cx, |store, cx| store.trash_mail(thread, cx));
-    self.selected = next;
+    if let Some(next) = next {
+      self.open_thread(next, window, cx);
+    } else {
+      self.close_thread(window, cx);
+      self.selected = None;
+    }
     cx.notify();
   }
 
