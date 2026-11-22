@@ -60,6 +60,11 @@ Updates keep your shortcuts as they are: the Start Menu shortcut is renewed, and
 
 - In Mail, an email scrolled partly out of the reading pane keeps drawing past the pane, over the Mail toolbar and the thread list. gpui-webview cannot clip a webview to a scrolling pane on Windows, where it has no window composition surface.
 
+## Known limits on every system
+
+- After a menu closes, the list row that was under the chosen item can keep its hover color once the pointer has moved away, until the pointer passes over the list again ([gpui-kit#4072](https://github.com/longbridge/gpui-kit/issues/4072)).
+- A button's tooltip can show over the menu the button opened, when the button is pressed before its tooltip appears. It goes away on the next pointer move ([gpui-kit#4073](https://github.com/longbridge/gpui-kit/issues/4073)).
+
 ## Mail
 
 Each email's HTML renders in the system web view: WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. The page runs none of the email's scripts, frames, or forms, and its links open in the default browser. Notifications for new mail and the unread count follow each system's notes above, and on Windows an email can draw past the reading pane (see Windows, Known limits).
