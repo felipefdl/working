@@ -381,8 +381,13 @@ impl MailView {
 
   // Keys.
 
-  /// Moves the selection one thread down or up the list, and shows it.
+  /// Moves the selection one thread down or up the list, and shows it; the pick of the labels popover while it is
+  /// open, as the arrows reach the view from its filter field.
   fn select_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+    if self.labels_open {
+      self.step_label(forward, cx);
+      return;
+    }
     let threads = self.threads(cx);
     let current = self
       .selected
@@ -1041,6 +1046,6 @@ impl Render for MailView {
       }))
       .child(self.toolbar(cx))
       .child(div().flex_1().min_h_0().border_t_1().border_color(rgb(BORDER)).child(body))
-      .children(self.labels_popover(cx))
+      .children(self.labels_backdrop(cx))
   }
 }

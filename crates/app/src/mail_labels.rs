@@ -1,5 +1,5 @@
 //! The Mail view's label browser: a control beside the mailbox switcher that names the label on screen, and the
-//! popover it opens over the view, with a filter field and the user's labels as a tree (`mail_logic::label_rows`):
+//! popover it opens under itself, with a filter field and the user's labels as a tree (`mail_logic::label_rows`):
 //! each with its color, its name, and its unread count, parents folding what is under them. The arrows move the pick,
 //! Enter or a click shows that label's threads, Escape closes it; `keys::MAIL_LABELS` opens it from the Mail view.
 //! While it is open the emails' webviews hide (`MailView::apply_cover`), since they are native views drawn over it.
@@ -13,7 +13,6 @@ use gpui_kit::component::v_flex;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
-use crate::calendar::TOOLBAR_HEIGHT;
 use crate::keys;
 use crate::mail::MailView;
 use crate::mail_logic::{LabelRow, label_rows, leaf_name, step};
@@ -24,6 +23,10 @@ use crate::ui::{Icon, count_badge, icon};
 
 /// Width of the popover.
 const POPOVER_WIDTH: f32 = 320.0;
+/// Space between the control and the popover under it.
+const POPOVER_GAP: f32 = 6.0;
+/// The least the popover keeps from the window's edges, where it moves to stay inside.
+const WINDOW_MARGIN: f32 = 8.0;
 /// The tallest the popover gets; its list scrolls past that.
 const POPOVER_MAX_HEIGHT: f32 = 440.0;
 /// Height of a label's row.
@@ -72,8 +75,8 @@ impl MailView {
     }
   }
 
-  /// Moves the pick one row down or up.
-  fn step_label(&mut self, forward: bool, cx: &mut Context<Self>) {
+  /// Moves the pick one row down or up: the Mail view's arrow keys while the popover is open.
+  pub(crate) fn step_label(&mut self, forward: bool, cx: &mut Context<Self>) {
     let rows = self.shown_labels(cx).len();
     self.label_pick = step(self.label_pick, rows, forward);
     cx.notify();
@@ -101,8 +104,9 @@ impl MailView {
   }
 
   /// The control beside the switcher: `Labels`, or the label on screen by its own name, selected as the switcher's
-  /// entries are, with its whole path in the tooltip. Absent while the account has no labels.
-  pub(crate) fn labels_control(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
+  /// entries are, with its whole path in the tooltip, and the popover under it while it is open. Absent while the
+  /// account has no labels.
+  pub(crate) fn labels_control(&self, cx: &Context<Self>) -> Option<Div> {
     let labels = &self.store.read(cx).mail.labels;
     if labels.is_empty() {
       return None;
@@ -115,40 +119,46 @@ impl MailView {
     let name = picked.map_or_else(|| "Labels".to_string(), |label| leaf_name(&label.name).to_string());
     let path = picked.map_or("Labels", |label| label.name.as_str());
     let tip: SharedString = format!("{path} ({})", keys::text(keys::MAIL_LABELS)).into();
+    let control = h_flex()
+      .id("mail-labels")
+      .flex_shrink_0()
+      .max_w(px(200.))
+      .h(px(30.))
+      .px_3()
+      .gap_1p5()
+      .items_center()
+      .rounded(px(9.))
+      .text_size(px(12.))
+      .text_color(rgb(if selected { TEXT } else { MUTED }))
+      .cursor_pointer()
+      .border_1()
+      .border_color(if selected {
+        rgb(ACCENT)
+      } else {
+        transparent_black().into()
+      })
+      .bg(if selected {
+        rgb(ACCENT_BG)
+      } else {
+        control_fill()
+      })
+      .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
+      .on_click(cx.listener(|this, _, window, cx| this.toggle_labels(window, cx)))
+      .child(icon(Icon::Tag, 13., if selected { TEXT } else { MUTED }))
+      .child(div().min_w_0().truncate().child(name))
+      .child(icon(Icon::ChevronDown, 12., MUTED));
     Some(
-      h_flex()
-        .id("mail-labels")
+      div()
+        .relative()
         .flex_shrink_0()
-        .max_w(px(200.))
-        .h(px(30.))
-        .px_3()
-        .gap_1p5()
-        .items_center()
-        .rounded(px(9.))
-        .text_size(px(12.))
-        .text_color(rgb(if selected { TEXT } else { MUTED }))
-        .cursor_pointer()
-        .border_1()
-        .border_color(if selected {
-          rgb(ACCENT)
-        } else {
-          transparent_black().into()
-        })
-        .bg(if selected {
-          rgb(ACCENT_BG)
-        } else {
-          control_fill()
-        })
-        .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx))
-        .on_click(cx.listener(|this, _, window, cx| this.toggle_labels(window, cx)))
-        .child(icon(Icon::Tag, 13., if selected { TEXT } else { MUTED }))
-        .child(div().min_w_0().truncate().child(name))
-        .child(icon(Icon::ChevronDown, 12., MUTED)),
+        .child(control)
+        .children(self.labels_popover(cx)),
     )
   }
 
-  /// The popover, over the view under the toolbar, while it is open: a press outside it closes it.
-  pub(crate) fn labels_popover(&self, cx: &Context<Self>) -> Option<AnyElement> {
+  /// The popover, drawn over the view from the control's bottom left corner and kept inside the window, while it is
+  /// open.
+  fn labels_popover(&self, cx: &Context<Self>) -> Option<Div> {
     if !self.labels_open {
       return None;
     }
@@ -183,9 +193,6 @@ impl MailView {
       );
     let panel = v_flex()
       .id("mail-labels-popover")
-      .absolute()
-      .top(px(TOOLBAR_HEIGHT - 6.))
-      .left(px(16.))
       .w(px(POPOVER_WIDTH))
       .max_h(px(POPOVER_MAX_HEIGHT))
       .p_1p5()
@@ -196,41 +203,35 @@ impl MailView {
       .bg(rgb(POPOVER))
       .shadow_lg()
       .occlude()
-      // The field has the keyboard: the arrows move the pick from it.
-      .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
-        let forward = match event.keystroke.key.as_str() {
-          "down" => true,
-          "up" => false,
-          _ => return,
-        };
-        this.step_label(forward, cx);
-        cx.stop_propagation();
-      }))
       .child(field)
-      .child(div().id("mail-labels-list").flex_1().min_h_0().overflow_y_scroll().child(list));
-    let backdrop = div()
-      .id("mail-labels-backdrop")
-      .absolute()
-      .top_0()
-      .left_0()
-      .size_full()
-      .on_mouse_down(
-        MouseButton::Left,
-        cx.listener(|this, _, window, cx| {
-          this.close_labels(window, cx);
-        }),
-      );
+      .child(div().id("mail-labels-list").flex_1().min_h_0().overflow_y_scroll().child(list))
+      .focus_trap("mail-labels-trap", &self.labels_focus);
     Some(
       div()
+        .absolute()
+        .top_full()
+        .left_0()
+        .mt(px(POPOVER_GAP))
+        .child(deferred(anchored().snap_to_window_with_margin(px(WINDOW_MARGIN)).child(panel)).with_priority(1)),
+    )
+  }
+
+  /// Under the popover, over the whole view while it is open: a press outside the popover closes it.
+  pub(crate) fn labels_backdrop(&self, cx: &Context<Self>) -> Option<Stateful<Div>> {
+    self.labels_open.then(|| {
+      div()
+        .id("mail-labels-backdrop")
         .absolute()
         .top_0()
         .left_0()
         .size_full()
-        .child(backdrop)
-        .child(panel)
-        .focus_trap("mail-labels-trap", &self.labels_focus)
-        .into_any_element(),
-    )
+        .on_mouse_down(
+          MouseButton::Left,
+          cx.listener(|this, _, window, cx| {
+            this.close_labels(window, cx);
+          }),
+        )
+    })
   }
 
   /// One label: its fold toggle when it is a parent in the tree, its color, its name (bold while it has unread
