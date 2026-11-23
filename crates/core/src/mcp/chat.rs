@@ -1,7 +1,7 @@
-//! The chat server (`/mcp/chat`): Google Chat, with tools shaped so a model does not have to think: few of them,
-//! one per thing a person would ask for; a conversation is named the way a person names it (the server finds it);
-//! answers are plain text with names, local times and the exact value to pass to the next call; and a mistake is
-//! answered with what to do instead.
+//! The chat tools: Google Chat, with tools shaped so a model does not have to think: few of them, one per thing a
+//! person would ask for; a conversation is named the way a person names it (the tool finds it); answers are plain
+//! text with names, local times and the exact value to pass to the next call; and a mistake is answered with what to
+//! do instead.
 #![allow(
   clippy::too_many_lines,
   clippy::as_conversions,
@@ -33,15 +33,26 @@ use crate::engine::{Engine, Page};
 use crate::fuzzy::Fuzzy;
 use crate::model::{AttachmentKind, Group, GroupId, GroupKind, Message, Micros, Notify};
 
-/// The server's name.
-pub(super) const NAME: &str = "working-chat";
-
-/// System prompt for MCP clients of this server: how to name conversations and that reads do not mark messages read.
-pub(super) const INSTRUCTIONS: &str = "Google Chat of the person signed in to the Working app on this computer. \
-Catch up with inbox. To answer someone the user did not name, start with recent_activity. Find a chat with find_conversations, read it with read_conversation, and find a word or \
+/// The chat part of the server's instructions: how to name conversations and that reads do not mark messages read.
+pub(super) const INSTRUCTIONS: &str = "Google Chat: catch up with inbox. To answer someone the user did not name, \
+start with recent_activity. Find a chat with find_conversations, read it with read_conversation, and find a word or \
 topic across every chat with search_messages. Wherever a `conversation` is asked for, a name (\"Jordan Park\"), \
-part of one, or an id (dm/…, space/…) works. Times are this computer's local time. Reading changes nothing: \
-messages stay unread.";
+part of one, or an id (dm/…, space/…) works. Reading changes nothing: messages stay unread.";
+
+/// Every chat tool `call` runs, `send_message` included (it refuses while sending is off).
+const TOOLS: [&str; 6] = [
+  "inbox",
+  "recent_activity",
+  "find_conversations",
+  "read_conversation",
+  "search_messages",
+  "send_message",
+];
+
+/// `call` runs a tool of this name.
+pub(super) fn owns(name: &str) -> bool {
+  TOOLS.contains(&name)
+}
 
 const MINUTE: Micros = 60_000_000;
 /// How far back `recent_activity` looks.

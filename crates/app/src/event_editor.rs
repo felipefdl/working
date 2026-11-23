@@ -23,10 +23,8 @@ use crate::calendar_layout::{day_start, event_days, local};
 use crate::conv_list::hint;
 use crate::menu::{self, MenuItem};
 use crate::store::Store;
-use crate::theme::{
-  ACCENT, ACCENT_BG, BG, BORDER, MUTED, POPOVER, RED, ROW_HOVER, TEXT, control_fill, data_color, rgb,
-};
-use crate::ui::{Icon, icon, switch};
+use crate::theme::{ACCENT, ACCENT_BG, BORDER, MUTED, POPOVER, RED, ROW_HOVER, TEXT, control_fill, data_color, rgb};
+use crate::ui::{Icon, icon, plain_button, primary_button, switch};
 
 const WIDTH: f32 = 580.0;
 /// People offered under the guests field.
@@ -881,41 +879,10 @@ impl EventEditor {
             .child(div().text_size(px(13.)).text_color(rgb(TEXT)).child("Email guests")),
         )
       })
+      .child(plain_button("event-cancel", "Cancel").on_click(cx.listener(|_, _, _, cx| cx.emit(EditorEvent::Close))))
       .child(
-        div()
-          .id("event-cancel")
-          .h(px(32.))
-          .px_3()
-          .flex()
-          .items_center()
-          .rounded_full()
-          .text_size(px(13.))
-          .text_color(rgb(TEXT))
-          .cursor_pointer()
-          .hover(|style| style.bg(rgb(ROW_HOVER)))
-          .on_click(cx.listener(|_, _, _, cx| cx.emit(EditorEvent::Close)))
-          .child("Cancel"),
-      )
-      .child(
-        div()
-          .id("event-save")
-          .h(px(32.))
-          .px_4()
-          .flex()
-          .items_center()
-          .rounded_full()
-          .bg(rgb(ACCENT))
-          .text_size(px(13.))
-          .font_weight(FontWeight::MEDIUM)
-          .text_color(rgb(BG))
-          .when(self.saving, |save| save.opacity(0.6))
-          .when(!self.saving, |save| {
-            save
-              .cursor_pointer()
-              .hover(|style| style.opacity(0.9))
-              .on_click(cx.listener(|this, _, _, cx| this.save(cx)))
-          })
-          .child(label),
+        primary_button("event-save", label, !self.saving)
+          .when(!self.saving, |save| save.on_click(cx.listener(|this, _, _, cx| this.save(cx)))),
       )
   }
 }

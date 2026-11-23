@@ -1197,7 +1197,7 @@ impl Demo {
 fn mcp_status(config: Option<&McpConfig>) -> McpStatus {
   match config {
     Some(config) if config.chat || config.mail || config.calendar || config.meet => {
-      McpStatus::Failed("Agents are off in demo mode.".into())
+      McpStatus::Failed("Agents are off in demo mode".into())
     },
     _ => McpStatus::Off,
   }

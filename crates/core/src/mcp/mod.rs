@@ -1,15 +1,15 @@
-//! The MCP servers: one per product, for AI agents on this computer.
+//! The MCP server, `working`, for AI agents on this computer.
 //!
-//! They let agents use the signed-in account through a few tools, each server switched on by itself in the app: chat
-//! (`/mcp/chat`), mail (`/mcp/mail`), calendar (`/mcp/calendar`), and Meet (`/mcp/meet`). Each is a whole MCP
-//! endpoint with its own name, instructions, and tools.
+//! It lets agents use the signed-in account through a few tools, in groups the user switches on one by one in the
+//! app: chat, mail, calendar, and Meet. The server lists and runs only the tools of the groups that are on, and its
+//! instructions speak only of those.
 //!
-//! They speak two MCP revisions over Streamable HTTP, both without sessions: each request is one POST answered
-//! with one JSON object. Revision 2026-07-28 has no handshake and carries its protocol version in every
-//! request; revision 2025-11-25 opens with `initialize`. One listener on loopback serves them all, and wants the
-//! secret of [`token`] on every request, either as a bearer header on the server's path or as the next part of the
-//! path (`/mcp/mail/<token>`), so one link is enough. A server that is off, the bare `/mcp`, and unknown names answer
-//! 404 before the secret is looked at.
+//! It speaks two MCP revisions over Streamable HTTP, both without sessions: each request is one POST answered with
+//! one JSON object. Revision 2026-07-28 has no handshake and carries its protocol version in every request; revision
+//! 2025-11-25 opens with `initialize`. It listens at the address and port the user set (loopback, 127.0.0.1:3021, by
+//! default), path `/mcp`, and wants the secret of [`token`] on every request on any address, either as a bearer header
+//! or as the next part of the path (`/mcp/<token>`), so one link is enough. Any other path answers 404 before the
+//! secret is looked at, and a request from a web page that is not on loopback is refused before that.
 #![allow(
   clippy::indexing_slicing,
   reason = "JSON-RPC envelopes are objects with known keys after validation"
@@ -21,7 +21,7 @@ mod mail;
 mod meet;
 mod shared;
 
-use std::net::Ipv4Addr;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -43,37 +43,27 @@ pub const PROTOCOL_VERSION: &str = "2026-07-28";
 /// The revision with the `initialize` handshake, for clients that do not speak the one above yet.
 const LEGACY_VERSION: &str = "2025-11-25";
 
-/// One of the servers, by the name in its path.
+/// The name the server tells clients.
+const NAME: &str = "working";
+
+/// What the instructions say before the parts of the groups that are on.
+const OPENING: &str = "Tools for the Google account of the person signed in to the Working app on this computer. \
+Times are this computer's local time.";
+
+/// A group of tools, switched on by itself in [`McpConfig`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Server {
+enum Group {
   Chat,
   Mail,
   Calendar,
   Meet,
 }
 
-impl Server {
-  /// The server at `/mcp/<name>`.
-  fn named(name: &str) -> Option<Self> {
-    match name {
-      "chat" => Some(Self::Chat),
-      "mail" => Some(Self::Mail),
-      "calendar" => Some(Self::Calendar),
-      "meet" => Some(Self::Meet),
-      _ => None,
-    }
-  }
+impl Group {
+  /// Every group, in the order their tools are listed.
+  const ALL: [Self; 4] = [Self::Chat, Self::Mail, Self::Calendar, Self::Meet];
 
-  /// The name it tells clients.
-  const fn name(self) -> &'static str {
-    match self {
-      Self::Chat => chat::NAME,
-      Self::Mail => mail::NAME,
-      Self::Calendar => calendar::NAME,
-      Self::Meet => meet::NAME,
-    }
-  }
-
+  /// Its part of the server's instructions.
   const fn instructions(self) -> &'static str {
     match self {
       Self::Chat => chat::INSTRUCTIONS,
@@ -102,6 +92,41 @@ impl Server {
       Self::Meet => meet::list(),
     }
   }
+
+  /// It runs a tool of this name (a write tool too, which refuses while its write switch is off).
+  fn owns(self, name: &str) -> bool {
+    match self {
+      Self::Chat => chat::owns(name),
+      Self::Mail => mail::owns(name),
+      Self::Calendar => calendar::owns(name),
+      Self::Meet => meet::owns(name),
+    }
+  }
+
+  /// The groups that are on, in order.
+  fn on_in(config: &McpConfig) -> impl Iterator<Item = Self> + '_ {
+    Self::ALL.into_iter().filter(|group| group.on(config))
+  }
+
+  /// The group that is on and runs the tool `name`.
+  fn owner(config: &McpConfig, name: &str) -> Option<Self> {
+    Self::on_in(config).find(|group| group.owns(name))
+  }
+}
+
+/// The tools of every group that is on, in order.
+fn tools(config: &McpConfig) -> Vec<Value> {
+  Group::on_in(config).flat_map(|group| group.tools(config)).collect()
+}
+
+/// The opening, then the part of each group that is on.
+fn instructions(config: &McpConfig) -> String {
+  let mut text = OPENING.to_string();
+  for group in Group::on_in(config) {
+    text.push_str("\n\n");
+    text.push_str(group.instructions());
+  }
+  text
 }
 
 /// No request of this server comes near this size.
@@ -146,13 +171,17 @@ pub fn rotate_token() -> std::io::Result<String> {
 struct Context {
   engine: Arc<Engine>,
   config: McpConfig,
-  /// What agents read on the chat server since the last send; every client shares it, as the server keeps no
+  /// The instructions for the groups that are on, made once: the settings do not change while the server runs.
+  instructions: String,
+  /// What agents read with the chat tools since the last send; every client shares it, as the server keeps no
   /// sessions.
   reads: chat::Reads,
 }
 
 /// The running server.
 pub(crate) struct Running {
+  /// The address it is bound to.
+  pub address: SocketAddr,
   stop: oneshot::Sender<()>,
   task: JoinHandle<()>,
 }
@@ -166,9 +195,11 @@ impl Running {
 }
 
 pub(crate) async fn serve(engine: Arc<Engine>, config: McpConfig) -> std::io::Result<Running> {
-  let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, config.port)).await?;
+  let listener = tokio::net::TcpListener::bind((config.address, config.port)).await?;
+  let address = listener.local_addr()?;
   let context = Arc::new(Context {
     engine,
+    instructions: instructions(&config),
     config,
     reads: chat::Reads::default(),
   });
@@ -182,54 +213,63 @@ pub(crate) async fn serve(engine: Arc<Engine>, config: McpConfig) -> std::io::Re
       tracing::warn!("the MCP server stopped: {error}");
     }
   });
-  Ok(Running { stop, task })
+  Ok(Running { address, stop, task })
 }
 
 async fn handle(State(context): State<Arc<Context>>, request: Request) -> Response {
   let (parts, body) = request.into_parts();
-  let server = match admit(parts.uri.path(), &parts.headers, &context.config) {
-    Ok(server) => server,
+  match admit(parts.uri.path(), &parts.headers, &context.config.token) {
+    Ok(()) => {},
     Err(StatusCode::UNAUTHORIZED) => return (StatusCode::UNAUTHORIZED, [(WWW_AUTHENTICATE, "Bearer")]).into_response(),
     Err(status) => return status.into_response(),
-  };
+  }
   if parts.method != Method::POST {
     return (StatusCode::METHOD_NOT_ALLOWED, [(ALLOW, "POST")]).into_response();
   }
   let Ok(body) = axum::body::to_bytes(body, MAX_BODY).await else {
     return StatusCode::PAYLOAD_TOO_LARGE.into_response();
   };
-  match respond(&context, server, &parts.headers, &body).await {
+  match respond(&context, &parts.headers, &body).await {
     (status, Some(message)) => (status, [(CONTENT_TYPE, "application/json")], message.to_string()).into_response(),
     (status, None) => status.into_response(),
   }
 }
 
-/// Which server a request is for, or the status that turns it away: 403 for a web page's origin (checked first),
-/// 404 for an unknown path or a server that is off (before the secret is looked at), 401 without the secret.
-fn admit(path: &str, headers: &HeaderMap, config: &McpConfig) -> Result<Server, StatusCode> {
+/// Lets a request in, or answers the status that turns it away: 403 for a web page's origin (checked first), 404 for
+/// a path that is not the server's (before the secret is looked at), 401 without the secret.
+fn admit(path: &str, headers: &HeaderMap, token: &str) -> Result<(), StatusCode> {
   // A web page reaching for a local server (DNS rebinding) announces itself with its origin.
   if !origin_allowed(headers) {
     return Err(StatusCode::FORBIDDEN);
   }
-  let (server, rest) = route(path).ok_or(StatusCode::NOT_FOUND)?;
-  if !server.on(config) {
-    return Err(StatusCode::NOT_FOUND);
-  }
-  let presented = match rest {
-    "" | "/" => bearer(headers),
-    rest => rest.strip_prefix('/'),
+  let presented = match route(path).ok_or(StatusCode::NOT_FOUND)? {
+    Route::Bare => bearer(headers),
+    Route::Token(segment) => Some(segment),
   };
-  if !presented.is_some_and(|presented| same_secret(presented, &config.token)) {
+  if !presented.is_some_and(|presented| same_secret(presented, token)) {
     return Err(StatusCode::UNAUTHORIZED);
   }
-  Ok(server)
+  Ok(())
 }
 
-/// The server of `/mcp/<name>` and what follows its name (empty, `/`, or `/<token>`).
-fn route(path: &str) -> Option<(Server, &str)> {
-  let rest = path.strip_prefix("/mcp/")?;
-  let (name, rest) = rest.find('/').map_or((rest, ""), |slash| rest.split_at(slash));
-  Some((Server::named(name)?, rest))
+/// A path of the server.
+#[derive(Debug, PartialEq, Eq)]
+enum Route<'a> {
+  /// `/mcp` or `/mcp/`: the secret comes in a header.
+  Bare,
+  /// `/mcp/<token>`: the secret is the segment after `/mcp`.
+  Token(&'a str),
+}
+
+/// The server's path `path` is, if it is one: `/mcp`, `/mcp/`, or `/mcp/<one segment>`.
+fn route(path: &str) -> Option<Route<'_>> {
+  match path.strip_prefix("/mcp")? {
+    "" | "/" => Some(Route::Bare),
+    rest => {
+      let segment = rest.strip_prefix('/')?;
+      (!segment.contains('/')).then_some(Route::Token(segment))
+    },
+  }
 }
 
 fn origin_allowed(headers: &HeaderMap) -> bool {
@@ -303,7 +343,7 @@ impl Refusal {
   }
 }
 
-async fn respond(context: &Context, server: Server, headers: &HeaderMap, body: &[u8]) -> (StatusCode, Option<Value>) {
+async fn respond(context: &Context, headers: &HeaderMap, body: &[u8]) -> (StatusCode, Option<Value>) {
   let Ok(message) = serde_json::from_slice::<Value>(body) else {
     return Refusal::bad(PARSE_ERROR, "The body is not JSON").answer(None);
   };
@@ -318,11 +358,11 @@ async fn respond(context: &Context, server: Server, headers: &HeaderMap, body: &
   };
   let params = message.get("params").unwrap_or(&Value::Null);
   let result = match legacy(headers, method, params) {
-    Ok(true) => dispatch_legacy(context, server, method, params).await,
+    Ok(true) => dispatch_legacy(context, method, params).await,
     Ok(false) => match validate(headers, method, params) {
-      Ok(()) => dispatch(context, server, method, params).await.map(|mut result| {
+      Ok(()) => dispatch(context, method, params).await.map(|mut result| {
         result["resultType"] = json!("complete");
-        result["_meta"] = json!({ (META_SERVER): { "name": server.name(), "version": env!("CARGO_PKG_VERSION") } });
+        result["_meta"] = json!({ (META_SERVER): { "name": NAME, "version": env!("CARGO_PKG_VERSION") } });
         result
       }),
       Err(refusal) => Err(refusal),
@@ -352,18 +392,18 @@ fn legacy(headers: &HeaderMap, method: &str, params: &Value) -> Result<bool, Ref
 }
 
 /// Revision 2025-11-25: the handshake, then plain requests. Its errors travel with status 200.
-async fn dispatch_legacy(context: &Context, server: Server, method: &str, params: &Value) -> Result<Value, Refusal> {
+async fn dispatch_legacy(context: &Context, method: &str, params: &Value) -> Result<Value, Refusal> {
   match method {
     // Whatever version the client asks for, this is the one it gets.
     "initialize" => Ok(json!({
       "protocolVersion": LEGACY_VERSION,
       "capabilities": { "tools": {} },
-      "serverInfo": { "name": server.name(), "version": env!("CARGO_PKG_VERSION") },
-      "instructions": server.instructions(),
+      "serverInfo": { "name": NAME, "version": env!("CARGO_PKG_VERSION") },
+      "instructions": context.instructions,
     })),
     "ping" => Ok(json!({})),
-    "tools/list" => Ok(json!({ "tools": server.tools(&context.config) })),
-    "tools/call" => dispatch(context, server, method, params).await,
+    "tools/list" => Ok(json!({ "tools": tools(&context.config) })),
+    "tools/call" => dispatch(context, method, params).await,
     _ => Err(Refusal::new(
       StatusCode::OK,
       METHOD_NOT_FOUND,
@@ -424,22 +464,23 @@ fn header_text(value: &str) -> Option<String> {
   }
 }
 
-async fn dispatch(context: &Context, server: Server, method: &str, params: &Value) -> Result<Value, Refusal> {
+async fn dispatch(context: &Context, method: &str, params: &Value) -> Result<Value, Refusal> {
   match method {
     "server/discover" => Ok(json!({
       "supportedVersions": [PROTOCOL_VERSION],
       "capabilities": { "tools": {} },
-      "instructions": server.instructions(),
+      "instructions": context.instructions,
       "ttlMs": 3_600_000,
       "cacheScope": "public",
     })),
-    // A list changes only when the user changes the settings, which restarts the servers.
-    "tools/list" => Ok(json!({ "tools": server.tools(&context.config), "ttlMs": 60_000, "cacheScope": "public" })),
+    // The list changes only when the user changes the settings, which restarts the server.
+    "tools/list" => Ok(json!({ "tools": tools(&context.config), "ttlMs": 60_000, "cacheScope": "public" })),
     "tools/call" => {
       let name = params["name"].as_str().unwrap_or_default();
-      let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
       let unknown = || Refusal::new(StatusCode::OK, INVALID_PARAMS, format!("Unknown tool: {name}"));
-      call(context, server, name, arguments).await.ok_or_else(unknown)
+      let group = Group::owner(&context.config, name).ok_or_else(unknown)?;
+      let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
+      call(context, group, name, arguments).await.ok_or_else(unknown)
     },
     _ => Err(Refusal::new(
       StatusCode::NOT_FOUND,
@@ -449,149 +490,184 @@ async fn dispatch(context: &Context, server: Server, method: &str, params: &Valu
   }
 }
 
-/// Runs a tool of `server`. `None` when it has no tool of that name.
-async fn call(context: &Context, server: Server, name: &str, arguments: Value) -> Option<Value> {
+/// Runs a tool of `group`. `None` when it has no tool of that name.
+async fn call(context: &Context, group: Group, name: &str, arguments: Value) -> Option<Value> {
   let engine = &context.engine;
-  match server {
-    Server::Chat => chat::call(engine, &context.reads, context.config.allow_send, name, arguments).await,
-    Server::Mail => mail::call(engine, context.config.mail_write, name, arguments).await,
-    Server::Calendar => calendar::call(engine, context.config.calendar_write, name, arguments).await,
-    Server::Meet => meet::call(engine, name, arguments).await,
+  match group {
+    Group::Chat => chat::call(engine, &context.reads, context.config.allow_send, name, arguments).await,
+    Group::Mail => mail::call(engine, context.config.mail_write, name, arguments).await,
+    Group::Calendar => calendar::call(engine, context.config.calendar_write, name, arguments).await,
+    Group::Meet => meet::call(engine, name, arguments).await,
   }
 }
 
 #[cfg(test)]
 mod tests {
-  use super::{Server, admit, bearer, header_text, origin_allowed, route, same_secret};
+  use super::{Group, Route, admit, bearer, header_text, instructions, origin_allowed, route, same_secret, tools};
   use crate::model::McpConfig;
   use axum::http::header::{AUTHORIZATION, ORIGIN};
   use axum::http::{HeaderMap, StatusCode};
   use base64::Engine as _;
 
-  /// The settings with the servers `on` switched on.
-  fn config(on: &[Server]) -> McpConfig {
+  /// The settings with the groups `on` switched on and every write switch off.
+  fn config(on: &[Group]) -> McpConfig {
     McpConfig {
+      address: std::net::Ipv4Addr::LOCALHOST.into(),
       port: 3021,
       token: "wk_secret".into(),
-      chat: on.contains(&Server::Chat),
+      chat: on.contains(&Group::Chat),
       allow_send: false,
-      mail: on.contains(&Server::Mail),
+      mail: on.contains(&Group::Mail),
       mail_write: false,
-      calendar: on.contains(&Server::Calendar),
+      calendar: on.contains(&Group::Calendar),
       calendar_write: false,
-      meet: on.contains(&Server::Meet),
+      meet: on.contains(&Group::Meet),
     }
   }
 
-  const ALL: [Server; 4] = [Server::Chat, Server::Mail, Server::Calendar, Server::Meet];
+  fn names(config: &McpConfig) -> Vec<String> {
+    tools(config)
+      .iter()
+      .filter_map(|tool| tool["name"].as_str().map(str::to_string))
+      .collect()
+  }
+
+  const MAIL_READS: [&str; 5] = [
+    "mail_inbox",
+    "mail_search",
+    "mail_read_thread",
+    "mail_labels",
+    "mail_attachment",
+  ];
 
   #[test]
-  fn paths_name_one_server_each() {
-    assert_eq!(route("/mcp/chat"), Some((Server::Chat, "")));
-    assert_eq!(route("/mcp/mail/"), Some((Server::Mail, "/")));
-    assert_eq!(route("/mcp/calendar/wk_secret"), Some((Server::Calendar, "/wk_secret")));
-    assert_eq!(route("/mcp/meet"), Some((Server::Meet, "")));
-    assert_eq!(route("/mcp"), None);
-    assert_eq!(route("/mcp/"), None);
-    assert_eq!(route("/mcp/wk_secret"), None);
-    assert_eq!(route("/mcp/drive"), None);
-    assert_eq!(route("/other/chat"), None);
+  fn the_server_answers_at_mcp_only() {
+    assert_eq!(route("/mcp"), Some(Route::Bare));
+    assert_eq!(route("/mcp/"), Some(Route::Bare));
+    assert_eq!(route("/mcp/wk_secret"), Some(Route::Token("wk_secret")));
+    assert_eq!(route("/mcp/wk_secret/"), None);
+    assert_eq!(route("/mcp/wk_secret/more"), None);
+    assert_eq!(route("/mcpx"), None);
+    assert_eq!(route("/"), None);
+    assert_eq!(route("/other/mcp"), None);
   }
 
   #[test]
-  fn a_server_answers_only_when_on_and_with_the_secret() {
+  fn a_request_needs_the_path_then_the_secret() {
     let mut bearer_headers = HeaderMap::new();
     bearer_headers.insert(AUTHORIZATION, "Bearer wk_secret".parse().unwrap());
     let none = HeaderMap::new();
-    let only_mail = config(&[Server::Mail]);
-    assert_eq!(admit("/mcp/mail", &bearer_headers, &only_mail), Ok(Server::Mail));
-    assert_eq!(admit("/mcp/mail/wk_secret", &none, &only_mail), Ok(Server::Mail));
-    assert_eq!(admit("/mcp/mail", &none, &only_mail), Err(StatusCode::UNAUTHORIZED));
-    assert_eq!(admit("/mcp/mail/wk_wrong", &none, &only_mail), Err(StatusCode::UNAUTHORIZED));
-    for off in ["/mcp/chat", "/mcp/calendar/wk_secret", "/mcp/meet"] {
-      assert_eq!(
-        admit(off, &bearer_headers, &only_mail),
-        Err(StatusCode::NOT_FOUND),
-        "{off} is off"
-      );
-      assert_eq!(
-        admit(off, &none, &only_mail),
-        Err(StatusCode::NOT_FOUND),
-        "404 before the secret"
-      );
-    }
-    assert_eq!(admit("/mcp", &bearer_headers, &only_mail), Err(StatusCode::NOT_FOUND));
-    assert_eq!(admit("/mcp/wk_secret", &none, &only_mail), Err(StatusCode::NOT_FOUND));
-    let all = config(&ALL);
-    for (path, server) in [
-      ("/mcp/chat/wk_secret", Server::Chat),
-      ("/mcp/calendar/wk_secret", Server::Calendar),
-      ("/mcp/meet/wk_secret", Server::Meet),
-    ] {
-      assert_eq!(admit(path, &none, &all), Ok(server));
-    }
+    assert_eq!(admit("/mcp", &bearer_headers, "wk_secret"), Ok(()));
+    assert_eq!(admit("/mcp/", &bearer_headers, "wk_secret"), Ok(()));
+    assert_eq!(admit("/mcp/wk_secret", &none, "wk_secret"), Ok(()));
+    assert_eq!(admit("/mcp", &none, "wk_secret"), Err(StatusCode::UNAUTHORIZED));
+    assert_eq!(admit("/mcp/wk_wrong", &none, "wk_secret"), Err(StatusCode::UNAUTHORIZED));
+    assert_eq!(
+      admit("/mcp/wk_wrong", &bearer_headers, "wk_secret"),
+      Err(StatusCode::UNAUTHORIZED),
+      "a secret in the path is the one looked at"
+    );
+    assert_eq!(
+      admit("/other", &none, "wk_secret"),
+      Err(StatusCode::NOT_FOUND),
+      "404 before the secret"
+    );
+    assert_eq!(
+      admit("/mcp/wk_secret/more", &bearer_headers, "wk_secret"),
+      Err(StatusCode::NOT_FOUND)
+    );
     let mut page = bearer_headers.clone();
     page.insert(ORIGIN, "https://evil.example".parse().unwrap());
-    assert_eq!(admit("/mcp/drive", &page, &all), Err(StatusCode::FORBIDDEN), "the origin first");
+    assert_eq!(
+      admit("/other", &page, "wk_secret"),
+      Err(StatusCode::FORBIDDEN),
+      "the origin first"
+    );
+    assert_eq!(admit("/mcp", &page, "wk_secret"), Err(StatusCode::FORBIDDEN));
   }
 
   #[test]
-  fn servers_have_their_own_names_and_tools() {
-    let mut all = config(&ALL);
-    let names = |server: Server, config: &McpConfig| -> Vec<String> {
-      server
-        .tools(config)
-        .iter()
-        .filter_map(|tool| tool["name"].as_str().map(str::to_string))
-        .collect()
-    };
-    assert_eq!(Server::Chat.name(), "working-chat");
-    assert_eq!(Server::Mail.name(), "working-mail");
-    assert_eq!(Server::Calendar.name(), "working-calendar");
-    assert_eq!(Server::Meet.name(), "working-meet");
-    assert!(!names(Server::Chat, &all).contains(&"send_message".to_string()));
-    assert!(!names(Server::Calendar, &all).contains(&"calendar_create_event".to_string()));
-    assert_eq!(
-      names(Server::Mail, &all),
-      [
-        "mail_inbox",
-        "mail_search",
-        "mail_read_thread",
-        "mail_labels",
-        "mail_attachment"
-      ]
-    );
+  fn the_list_follows_the_group_and_write_switches() {
+    assert_eq!(names(&config(&[])), Vec::<String>::new());
+    assert_eq!(names(&config(&[Group::Mail])), MAIL_READS);
+    assert_eq!(names(&config(&[Group::Meet])), ["meet_create_meeting", "meet_upcoming"]);
+
+    let mut all = config(&Group::ALL);
+    let listed = names(&all);
+    assert!(!listed.contains(&"send_message".to_string()));
+    assert!(!listed.contains(&"mail_send".to_string()));
+    assert!(!listed.contains(&"calendar_create_event".to_string()));
+    // Chat first, then mail, calendar, and Meet.
+    assert_eq!(listed.first().map(String::as_str), Some("inbox"));
+    let at = |name: &str| listed.iter().position(|listed| listed == name).unwrap();
+    assert!(at("search_messages") < at("mail_inbox"));
+    assert!(at("mail_attachment") < at("calendar_list"));
+    assert!(at("calendar_get_event") < at("meet_create_meeting"));
+
     all.allow_send = true;
-    all.calendar_write = true;
     all.mail_write = true;
-    assert!(names(Server::Chat, &all).contains(&"send_message".to_string()));
-    assert!(names(Server::Calendar, &all).contains(&"calendar_create_event".to_string()));
+    all.calendar_write = true;
+    let listed = names(&all);
+    for write in [
+      "send_message",
+      "mail_send",
+      "mail_label",
+      "calendar_create_event",
+      "calendar_respond",
+    ] {
+      assert!(listed.contains(&write.to_string()), "{write} is listed");
+    }
+
+    let mut only_mail = config(&[Group::Mail]);
+    only_mail.allow_send = true;
+    only_mail.calendar_write = true;
     assert_eq!(
-      names(Server::Mail, &all),
-      [
-        "mail_inbox",
-        "mail_search",
-        "mail_read_thread",
-        "mail_labels",
-        "mail_attachment",
-        "mail_send",
-        "mail_reply",
-        "mail_forward",
-        "mail_draft",
-        "mail_send_draft",
-        "mail_archive",
-        "mail_mark",
-        "mail_star",
-        "mail_label"
-      ]
+      names(&only_mail),
+      MAIL_READS,
+      "a write switch lists nothing of a group that is off"
     );
-    assert_eq!(names(Server::Meet, &all), ["meet_create_meeting", "meet_upcoming"]);
-    let chat = names(Server::Chat, &all);
-    assert!(
-      chat
-        .iter()
-        .all(|name| !name.starts_with("mail_") && !name.starts_with("calendar_"))
-    );
+  }
+
+  #[test]
+  fn a_tool_runs_only_in_a_group_that_is_on() {
+    let only_mail = config(&[Group::Mail]);
+    assert_eq!(Group::owner(&only_mail, "mail_inbox"), Some(Group::Mail));
+    for name in ["inbox", "send_message", "calendar_events", "meet_upcoming", "drive_files", ""] {
+      assert_eq!(Group::owner(&only_mail, name), None, "{name} is unknown");
+    }
+    let all = config(&Group::ALL);
+    assert_eq!(Group::owner(&all, "inbox"), Some(Group::Chat));
+    assert_eq!(Group::owner(&all, "calendar_events"), Some(Group::Calendar));
+    assert_eq!(Group::owner(&all, "meet_create_meeting"), Some(Group::Meet));
+    assert_eq!(Group::owner(&config(&[]), "inbox"), None);
+  }
+
+  #[test]
+  fn each_tool_belongs_to_the_one_group_that_lists_it() {
+    let mut all = config(&Group::ALL);
+    all.allow_send = true;
+    all.mail_write = true;
+    all.calendar_write = true;
+    for group in Group::ALL {
+      for tool in group.tools(&all) {
+        let name = tool["name"].as_str().unwrap();
+        let owners: Vec<_> = Group::ALL.into_iter().filter(|other| other.owns(name)).collect();
+        assert_eq!(owners, [group], "{name}");
+      }
+    }
+  }
+
+  #[test]
+  fn instructions_speak_only_of_the_groups_that_are_on() {
+    let only_mail = instructions(&config(&[Group::Mail]));
+    assert!(only_mail.contains("mail_inbox"));
+    assert!(!only_mail.contains("read_conversation"));
+    assert!(!only_mail.contains("calendar_events"));
+    assert!(!only_mail.contains("meet_upcoming"));
+    let all = instructions(&config(&Group::ALL));
+    for name in ["read_conversation", "mail_inbox", "calendar_events", "meet_upcoming"] {
+      assert!(all.contains(name), "{name}");
+    }
   }
 
   #[test]

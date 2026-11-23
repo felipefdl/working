@@ -517,20 +517,23 @@ pub enum Connection {
   Offline,
 }
 
-/// How the MCP servers for AI agents run.
+/// How the MCP server for AI agents runs.
 ///
-/// One listener on loopback at `port`, for requests that carry `token`, with one server per product at its own path
-/// (`/mcp/chat`, `/mcp/mail`, `/mcp/calendar`, `/mcp/meet`). Each is on or off by itself; a path whose server is off
-/// answers as if it were not there.
+/// One server at `address` and `port`, path `/mcp`, for requests that carry `token`. Loopback (127.0.0.1:3021) is the
+/// default; another address, such as one on the local network, is the user's choice. Its tools come in groups, each
+/// on or off by itself (`chat`, `mail`, `calendar`, `meet`); the server lists and runs only the tools of the groups
+/// that are on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[expect(
   clippy::struct_excessive_bools,
   reason = "each flag is one switch of the MCP settings"
 )]
 pub struct McpConfig {
-  /// Loopback port.
+  /// Address to bind to.
+  pub address: std::net::IpAddr,
+  /// Port to bind to.
   pub port: u16,
-  /// Bearer (or path) secret, shared by every server.
+  /// Bearer (or path) secret.
   pub token: String,
   /// Serve the chat tools.
   pub chat: bool,
@@ -644,10 +647,10 @@ pub enum McpStatus {
   /// Not running.
   #[default]
   Off,
-  /// Listening on this loopback port.
+  /// Listening at this address.
   Running {
-    /// Bound port.
-    port: u16,
+    /// The address actually bound.
+    address: std::net::SocketAddr,
   },
   /// It could not start (the port is taken, usually).
   Failed(String),

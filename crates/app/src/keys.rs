@@ -128,6 +128,9 @@ fn table() -> Vec<(&'static str, Box<dyn Action>, Option<&'static str>)> {
     ("escape", Box::new(Escape), Some("Overlay")),
     // The event editor closes on Escape from any of its controls, not only its text fields.
     ("escape", Box::new(Escape), Some("EventEditor")),
+    // And so do the MCP server's address and agent dialogs in Settings.
+    ("escape", Box::new(Escape), Some("ListenDialog")),
+    ("escape", Box::new(Escape), Some("AgentDialog")),
     // The Mail view's list: the arrows move the selection, Enter opens it, Escape goes back to the list. Its search
     // field is a text field, whose "Input" context is deeper and keeps these keys for itself.
     ("down", Box::new(SelectNextThread), Some("Mail")),

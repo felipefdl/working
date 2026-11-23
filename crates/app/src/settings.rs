@@ -2,6 +2,7 @@
 //! read them are redrawn when they change.
 
 use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock, PoisonError};
 
@@ -12,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::theme::{self, ACCENT, ACCENT_BG, BORDER, MUTED, POPOVER, ROW_HOVER, ROW_SELECTED, TEXT, THEMES, rgb};
 
-/// Where the MCP server listens unless `mcp_port` in the settings file says otherwise.
+/// Where the MCP server listens unless the Address and Port fields in Settings, Agents say otherwise.
+const MCP_ADDRESS: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const MCP_PORT: u16 = 3021;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,7 +368,7 @@ impl From<Shortcut> for Place {
 }
 
 /// Which of Calendar, Meet, and Mail are on (`Settings::features`). A feature that is off is gone everywhere: no
-/// button, key, menu entry, view, notification, MCP server, or core traffic of its own.
+/// button, key, menu entry, view, notification, MCP tools, or core traffic of its own.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Features {
   pub calendar: bool,
@@ -392,7 +394,8 @@ impl Features {
   }
 }
 
-/// Which MCP servers and write tools run, from their switches and the features (`Settings::mcp_servers`).
+/// Which tool groups and write tools the MCP server runs, from their switches and the features
+/// (`Settings::mcp_servers`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct McpServers {
   pub chat: bool,
@@ -405,7 +408,7 @@ pub struct McpServers {
 }
 
 impl McpServers {
-  /// Whether any server runs.
+  /// Whether any tool group runs, and so the server.
   pub const fn any(self) -> bool {
     self.chat || self.mail || self.calendar || self.meet
   }
@@ -433,13 +436,13 @@ pub struct Settings {
   /// The Starred button of every layout. Off removes only the button: the view still opens from anywhere else.
   pub show_starred: bool,
   /// Google Calendar, a feature (`Features`). Off removes it everywhere: its view and buttons, its key and Go menu
-  /// entry, its event reminders, and its MCP server.
+  /// entry, its event reminders, and its MCP tools.
   pub calendar: bool,
   /// Google Meet, a feature (`Features`). Off removes its view and buttons, its key and Go menu entry, the call window
-  /// (meetings open in the browser), and its MCP server.
+  /// (meetings open in the browser), and its MCP tools.
   pub meet: bool,
   /// Gmail, a feature (`Features`). Off, Working does not read Gmail at all: no view, buttons, key, or Go menu entry,
-  /// no new-mail notifications, no mail in the Dock number, and no MCP server.
+  /// no new-mail notifications, no mail in the Dock number, and no MCP tools.
   pub mail: bool,
   /// A notification for each unread email that reaches the inbox, while `mail` is on.
   pub mail_notify: bool,
@@ -473,22 +476,24 @@ pub struct Settings {
   pub hours_start: u16,
   pub hours_end: u16,
   pub sound: Sound,
-  /// Serve the chat tools to AI agents on this computer, at `/mcp/chat`.
+  /// Serve the chat tools to AI agents on this computer, on the MCP server at `/mcp`.
   pub mcp_chat: bool,
-  /// The port every MCP server listens on.
+  /// The address the MCP server listens on. A loopback one is this computer only.
+  pub mcp_address: IpAddr,
+  /// The port the MCP server listens on.
   pub mcp_port: u16,
   /// Agents may send chat messages, not only read.
   pub mcp_send: bool,
-  /// Serve the mail tools, at `/mcp/mail`. They are served only while `mail` is on.
+  /// Serve the mail tools on the MCP server. They are served only while `mail` is on.
   pub mcp_mail: bool,
   /// Agents may send new emails and replies, forward, save drafts, archive, mark read, star, and label, not only read.
   /// Only while `mcp_mail` is on.
   pub mcp_mail_write: bool,
-  /// Serve the calendar tools, at `/mcp/calendar`, while `calendar` is on.
+  /// Serve the calendar tools on the MCP server while `calendar` is on.
   pub mcp_calendar: bool,
   /// Agents may create, change, delete, and answer events, not only read.
   pub mcp_calendar_write: bool,
-  /// Serve the Meet tools, at `/mcp/meet`, while `meet` is on.
+  /// Serve the Meet tools on the MCP server while `meet` is on.
   pub mcp_meet: bool,
   /// The status button's "Set as away". Stays until Automatic is chosen, whatever the activity status says.
   #[serde(default)]
@@ -557,6 +562,7 @@ impl Default for Settings {
       hours_end: 18 * 60,
       sound: Sound::default(),
       mcp_chat: false,
+      mcp_address: MCP_ADDRESS,
       mcp_port: MCP_PORT,
       mcp_send: false,
       mcp_mail: false,
@@ -702,7 +708,7 @@ impl Settings {
       .clamp(COLUMN_MIN_WIDTH, COLUMN_MAX_WIDTH)
   }
 
-  /// Whether any MCP server switch is on.
+  /// Whether any MCP tool group switch is on.
   pub const fn any_mcp(&self) -> bool {
     self.mcp_chat || self.mcp_mail || self.mcp_calendar || self.mcp_meet
   }
@@ -716,8 +722,8 @@ impl Settings {
     }
   }
 
-  /// Which servers and write tools run: a server whose feature is off does not, whatever its switch says, and a
-  /// write flag holds only while its server runs.
+  /// Which tool groups and write tools the MCP server runs: a group whose feature is off does not, whatever its
+  /// switch says, and a write flag holds only while its group runs.
   pub const fn mcp_servers(&self) -> McpServers {
     let mail = self.mail && self.mcp_mail;
     let calendar = self.calendar && self.mcp_calendar;
@@ -732,29 +738,41 @@ impl Settings {
     }
   }
 
-  /// How the MCP servers should run: `None` while none is served.
+  /// How the MCP server should run: `None` while no tool group is served.
   fn mcp_config(&self) -> Option<McpConfig> {
-    let servers = self.mcp_servers();
-    if !servers.any() {
+    let served = self.mcp_servers();
+    if !served.any() {
       return None;
     }
     match gchat_core::mcp::token() {
       Ok(token) => Some(McpConfig {
+        address: self.mcp_address,
         port: self.mcp_port,
         token,
-        chat: servers.chat,
-        allow_send: servers.allow_send,
-        mail: servers.mail,
-        mail_write: servers.mail_write,
-        calendar: servers.calendar,
-        calendar_write: servers.calendar_write,
-        meet: servers.meet,
+        chat: served.chat,
+        allow_send: served.allow_send,
+        mail: served.mail,
+        mail_write: served.mail_write,
+        calendar: served.calendar,
+        calendar_write: served.calendar_write,
+        meet: served.meet,
       }),
       Err(error) => {
         tracing::warn!("could not store the MCP token: {error}");
         None
       },
     }
+  }
+
+  /// Where an agent on this computer reaches the MCP server, for its link and Claude Code command: the address and
+  /// port it listens on, with 127.0.0.1 for an unspecified address (0.0.0.0 or ::), which is not one to connect to.
+  pub const fn mcp_reach(&self) -> SocketAddr {
+    let address = if self.mcp_address.is_unspecified() {
+      IpAddr::V4(Ipv4Addr::LOCALHOST)
+    } else {
+      self.mcp_address
+    };
+    SocketAddr::new(address, self.mcp_port)
   }
 
   /// Whether windows show the light theme: the chosen appearance, or the system's.
@@ -846,8 +864,9 @@ pub fn keep_mcp(core: Core, cx: &mut App) {
   let mut follow = move |cx: &mut App| {
     let settings = cx.global::<Settings>();
     let rotations = cx.try_global::<TokenRotations>().map_or(0, |rotations| rotations.0);
-    // The servers as they would run: a feature or a switch going on or off restarts them.
-    let ask = (settings.mcp_servers(), settings.mcp_port, rotations);
+    // The tool groups as they would run, and where: a feature or a switch going on or off, or a new address or
+    // port, restarts the server.
+    let ask = (settings.mcp_servers(), settings.mcp_address, settings.mcp_port, rotations);
     if asked == Some(ask) {
       return;
     }
@@ -1153,7 +1172,7 @@ mod mcp_tests {
   use super::Settings;
 
   #[test]
-  fn every_mcp_server_starts_off() {
+  fn every_mcp_tool_group_starts_off() {
     let settings: Settings = serde_json::from_str("{}").expect("empty object uses Default");
     assert!(!settings.mcp_chat && !settings.mcp_send);
     assert!(!settings.mcp_mail && !settings.mcp_mail_write);
@@ -1164,7 +1183,7 @@ mod mcp_tests {
   }
 
   #[test]
-  fn each_mcp_server_keeps_its_own_switch() {
+  fn each_mcp_tool_group_keeps_its_own_switch() {
     let settings = Settings {
       mcp_mail: true,
       mcp_calendar: true,
@@ -1179,7 +1198,7 @@ mod mcp_tests {
   }
 
   #[test]
-  fn mail_writes_need_the_mail_server() {
+  fn mail_writes_need_the_mail_tools() {
     let settings: Settings = serde_json::from_str(r#"{"mcp_mail_write":true}"#).expect("deserialize");
     assert!(settings.mcp_mail_write);
     assert!(!settings.mcp_servers().mail_write);
@@ -1195,7 +1214,7 @@ mod mcp_tests {
   }
 
   #[test]
-  fn a_feature_that_is_off_serves_no_mcp_server() {
+  fn a_feature_that_is_off_serves_no_mcp_tools() {
     let all = Settings {
       mcp_chat: true,
       mcp_send: true,
@@ -1206,19 +1225,19 @@ mod mcp_tests {
       mcp_meet: true,
       ..Settings::default()
     };
-    let servers = all.mcp_servers();
-    assert!(servers.mail && servers.mail_write && servers.calendar && servers.calendar_write && servers.meet);
+    let served = all.mcp_servers();
+    assert!(served.mail && served.mail_write && served.calendar && served.calendar_write && served.meet);
     let off = Settings {
       mail: false,
       calendar: false,
       meet: false,
       ..all.clone()
     };
-    let servers = off.mcp_servers();
-    assert!(!servers.mail && !servers.mail_write);
-    assert!(!servers.calendar && !servers.calendar_write);
-    assert!(!servers.meet);
-    assert!(servers.chat && servers.allow_send && servers.any());
+    let served = off.mcp_servers();
+    assert!(!served.mail && !served.mail_write);
+    assert!(!served.calendar && !served.calendar_write);
+    assert!(!served.meet);
+    assert!(served.chat && served.allow_send && served.any());
     let only_mail = Settings {
       mail: false,
       mcp_chat: false,
@@ -1227,5 +1246,23 @@ mod mcp_tests {
       ..all
     };
     assert!(!only_mail.mcp_servers().any());
+  }
+
+  #[test]
+  fn agents_reach_an_unspecified_address_at_loopback() {
+    let at = |address: &str| {
+      Settings {
+        mcp_address: address.parse().expect("an address"),
+        mcp_port: 4000,
+        ..Settings::default()
+      }
+      .mcp_reach()
+      .to_string()
+    };
+    assert_eq!(Settings::default().mcp_reach().to_string(), "127.0.0.1:3021");
+    assert_eq!(at("0.0.0.0"), "127.0.0.1:4000");
+    assert_eq!(at("::"), "127.0.0.1:4000");
+    assert_eq!(at("192.168.1.20"), "192.168.1.20:4000");
+    assert_eq!(at("::1"), "[::1]:4000");
   }
 }

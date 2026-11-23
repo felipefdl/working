@@ -31,6 +31,7 @@
 )]
 
 mod about;
+mod agent_dialog;
 mod calendar;
 mod calendar_grid;
 mod calendar_layout;
@@ -69,6 +70,7 @@ mod format_logic;
 mod home;
 mod images;
 mod keys;
+mod listen_dialog;
 mod mail;
 mod mail_body;
 mod mail_compose;

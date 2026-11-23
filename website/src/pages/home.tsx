@@ -181,7 +181,7 @@ const parts: Part[] = [
   {
     id: "agents",
     title: "AI agents",
-    lede: "Working serves optional MCP servers to AI agents on your computer, one each for Chat, Mail, Calendar, and Meet. Each is off until you turn it on in Settings, listens on your computer only, and needs a token. Turning Calendar, Meet, or Mail off in Settings, Features turns its server off too.",
+    lede: "Working serves an optional MCP server to AI agents, with a group of tools each for Chat, Mail, Calendar, and Meet. Each group is off until you turn it on in Settings. By default the server listens on your computer only, and Settings can give it another address. It always needs a token. Turning Calendar, Meet, or Mail off in Settings, Features turns its tools off too.",
     stops: [],
     features: [
       [
@@ -259,7 +259,7 @@ const questions = [
   ],
   [
     "Can AI agents read my Google Chat and Gmail through Working?",
-    "Only if you turn it on. Working has optional MCP servers, one per product, each with its own switch. They listen on your computer only and need a token. Sending messages, sending and changing mail, and changing events are each a separate switch.",
+    "Only if you turn it on. Working has an optional MCP server, with a switch for each group of tools: Chat, Mail, Calendar, and Meet. By default it listens on your computer only, and Settings can give it another address. It always needs a token. Sending messages, sending and changing mail, and changing events are each a separate switch.",
   ],
 ] as const;
 

@@ -6,7 +6,7 @@ use gpui_kit::*;
 
 use crate::emoji_font;
 use crate::images::Images;
-use crate::theme::{ACCENT, BG, FIELD, GREEN, MUTED, RED, TEXT, Tone, WHITE, rgb, switch_off};
+use crate::theme::{ACCENT, BG, FIELD, GREEN, MUTED, RED, ROW_HOVER, TEXT, Tone, WHITE, rgb, switch_off};
 use crate::util;
 
 /// Lucide icons embedded as SVG so no asset bundle is needed at runtime.
@@ -326,6 +326,41 @@ pub fn switch(on: bool, height: f32) -> Div {
     .rounded_full()
     .bg(if on { rgb(ACCENT) } else { switch_off() })
     .child(div().size(px(height * 0.75)).rounded_full().bg(rgb(WHITE)))
+}
+
+/// A dialog footer's plain button, such as Cancel or Close. The caller adds what a click does.
+pub fn plain_button(id: impl Into<ElementId>, label: impl Into<SharedString>) -> Stateful<Div> {
+  div()
+    .id(id)
+    .h(px(32.))
+    .px_3()
+    .flex()
+    .items_center()
+    .rounded_full()
+    .text_size(px(13.))
+    .text_color(rgb(TEXT))
+    .cursor_pointer()
+    .hover(|style| style.bg(rgb(ROW_HOVER)))
+    .child(label.into())
+}
+
+/// A dialog footer's accent button, the one that does what the dialog is for. While it cannot act it is dimmed: the
+/// caller adds a click only while `enabled`.
+pub fn primary_button(id: impl Into<ElementId>, label: impl Into<SharedString>, enabled: bool) -> Stateful<Div> {
+  div()
+    .id(id)
+    .h(px(32.))
+    .px_4()
+    .flex()
+    .items_center()
+    .rounded_full()
+    .bg(rgb(ACCENT))
+    .text_size(px(13.))
+    .font_weight(FontWeight::MEDIUM)
+    .text_color(rgb(BG))
+    .when(!enabled, |button| button.opacity(0.6))
+    .when(enabled, |button| button.cursor_pointer().hover(|style| style.opacity(0.9)))
+    .child(label.into())
 }
 
 /// An unread count on an accent pill, `99+` past 99, as the Rail's buttons carry it over their glyph. The caller

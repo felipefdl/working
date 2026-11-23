@@ -1,4 +1,4 @@
-//! What every server's tools share: loose argument parsing, the tool result, and words for times and text.
+//! What every tool group shares: loose argument parsing, the tool result, and words for times and text.
 #![allow(
   clippy::as_conversions,
   clippy::cast_possible_truncation,

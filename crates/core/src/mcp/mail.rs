@@ -1,5 +1,5 @@
-//! The mail server (`/mcp/mail`): the signed-in account's Gmail. Reading is always offered; the tools that send,
-//! reply, draft, archive, mark, star, and label are listed and run only when the user let agents write mail
+//! The mail tools: the signed-in account's Gmail. Reading is always offered; the tools that send, reply, draft,
+//! archive, mark, star, and label are listed and run only when the user let agents write mail
 //! (`McpConfig::mail_write`), and never under `WORKING_READONLY=1`. Every tool answers only while Mail is on in the
 //! app (`Engine::mail_on`); otherwise it answers that Mail is off, without contacting Gmail.
 #![allow(clippy::too_many_lines, reason = "tool schemas are verbose JSON")]
@@ -23,19 +23,15 @@ use crate::model::{
   MailThread, Mailbox,
 };
 
-/// The server's name.
-pub(super) const NAME: &str = "working-mail";
-
-/// System prompt for MCP clients of this server: what every tool shares, said once.
-pub(super) const INSTRUCTIONS: &str = "Gmail of the person signed in to the Working app on this computer. The tools \
-answer only while Mail is on in Working. Times are this computer's local time. mail_inbox lists a mailbox or one of \
-the user's labels and mail_search finds threads with Gmail's own search words, both 50 threads a page; \
-mail_read_thread reads a thread's emails, mail_attachment opens a file of one, and mail_labels names the labels. \
-Reading changes nothing: threads stay unread. When the user allowed it, the other tools write: mail_send sends a new \
-email, mail_reply answers in a thread, mail_forward sends an email of a thread on to others (without its files), \
-mail_draft saves an email in Gmail's Drafts and mail_send_draft sends it, and mail_archive, mail_mark, mail_star, and \
-mail_label change threads. Writes are real and show in Gmail at once, and a sent email reaches its recipients at \
-once: send only what the user asked for.";
+/// The mail part of the server's instructions: what every mail tool shares, said once.
+pub(super) const INSTRUCTIONS: &str = "Gmail: the mail tools answer only while Mail is on in Working. mail_inbox \
+lists a mailbox or one of the user's labels and mail_search finds threads with Gmail's own search words, both 50 \
+threads a page; mail_read_thread reads a thread's emails, mail_attachment opens a file of one, and mail_labels names \
+the labels. Reading changes nothing: threads stay unread. When the user allowed it, the other mail tools write: \
+mail_send sends a new email, mail_reply answers in a thread, mail_forward sends an email of a thread on to others \
+(without its files), mail_draft saves an email in Gmail's Drafts and mail_send_draft sends it, and mail_archive, \
+mail_mark, mail_star, and mail_label change threads. Writes are real and show in Gmail at once, and a sent email \
+reaches its recipients at once: send only what the user asked for.";
 
 /// The tools that read, each answering only while Mail is on (`Engine::mail_on`).
 const TOOLS: [&str; 5] = [
@@ -58,6 +54,11 @@ const WRITE_TOOLS: [&str; 9] = [
   "mail_star",
   "mail_label",
 ];
+
+/// `call` runs a tool of this name, a write tool too (it refuses while writing mail is off).
+pub(super) fn owns(name: &str) -> bool {
+  TOOLS.contains(&name) || WRITE_TOOLS.contains(&name)
+}
 
 /// What a tool answers while Mail is off. Nothing contacts Gmail then.
 const MAIL_OFF: &str = "Mail is turned off in Working.";

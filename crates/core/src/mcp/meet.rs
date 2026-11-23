@@ -1,5 +1,5 @@
-//! The Meet server (`/mcp/meet`): what the core can do with Google Meet: make a new meeting of its own (Meet's "New
-//! meeting", `Command::CreateMeeting`), and find the user's next events that have a Meet link, from the calendar.
+//! The Meet tools: what the core can do with Google Meet: make a new meeting of its own (Meet's "New meeting",
+//! `Command::CreateMeeting`), and find the user's next events that have a Meet link, from the calendar.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -12,14 +12,18 @@ use super::shared::{answer, loose_count, no_arguments, now_line, parse, read_onl
 use crate::engine::Engine;
 use crate::model::CalendarEvent;
 
-/// The server's name.
-pub(super) const NAME: &str = "working-meet";
+/// The Meet part of the server's instructions.
+pub(super) const INSTRUCTIONS: &str = "Google Meet: meet_create_meeting makes a new meeting and answers its link, to \
+share with whoever should join; it is in no chat and on no calendar. meet_upcoming lists the user's next calendar \
+events that have a Meet link.";
 
-/// System prompt for MCP clients of this server.
-pub(super) const INSTRUCTIONS: &str = "Google Meet for the person signed in to the Working app on this computer. \
-meet_create_meeting makes a new meeting and answers its link, to share with whoever should join; it is in no chat and \
-on no calendar. meet_upcoming lists the user's next calendar events that have a Meet link. Times are this computer's \
-local time.";
+/// Every Meet tool.
+const TOOLS: [&str; 2] = ["meet_create_meeting", "meet_upcoming"];
+
+/// `call` runs a tool of this name.
+pub(super) fn owns(name: &str) -> bool {
+  TOOLS.contains(&name)
+}
 
 /// Days `meet_upcoming` looks ahead.
 const UPCOMING_DAYS: i64 = 7;

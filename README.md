@@ -65,7 +65,7 @@ Pick the layout that fits how you work, switch any time in Settings, and keep Ca
 - **Notifications and presence.** System notifications for messages, new mail, and event reminders, an unread badge, do-not-disturb schedules, and a custom status.
 - **Rewrite a draft.** `Cmd+Shift+R` rewrites your message through the Claude Code or Codex CLI you already have.
 - **28 themes and your own fonts.** One theme for light, one for dark.
-- **MCP servers.** Optional and local, one per product: see [MCP servers](#mcp-servers).
+- **MCP server.** Optional and local, with a switch for each group of tools: see [MCP server](#mcp-server).
 - **Updates itself.**
 
 Shortcuts are written the macOS way; on Linux and Windows, Ctrl takes the place of Cmd.
@@ -81,11 +81,11 @@ Mail is Gmail, through the session you signed in with: there is no second sign-i
 - **Changes.** Archive from the Inbox with an Undo bar, and Mark as unread. A thread you open is marked read.
 - **New mail.** The inbox's first page shows from disk before Gmail answers. Working checks the inbox every minute, posts a notification for each unread email that arrives, and adds unread inbox threads to the unread badge.
 
-The Mail view does not forward, star, label, or delete; an agent you allow can forward, star, and label through the [mail tools](#mcp-servers). `just run-readonly` refuses every change. What differs on each system is in [docs/platforms.md](docs/platforms.md#mail).
+The Mail view does not forward, star, label, or delete; an agent you allow can forward, star, and label through the [mail tools](#mcp-server). `just run-readonly` refuses every change. What differs on each system is in [docs/platforms.md](docs/platforms.md#mail).
 
 ## Features
 
-Settings opens on Features, with one switch each for Calendar, Meet, and Mail. A feature that is off is gone everywhere: its view, its buttons and number key, its notifications (for Mail also its count in the Dock), and its MCP server, whatever that server's own switch says. While Mail is off, Working does not read Gmail. While Meet is off, meeting links open in the browser. Under Layout, View buttons shows or hides the Mentions and Starred buttons.
+Settings opens on Features, with one switch each for Calendar, Meet, and Mail. A feature that is off is gone everywhere: its view, its buttons and number key, its notifications (for Mail also its count in the Dock), and its MCP tools, whatever their own switch says. While Mail is off, Working does not read Gmail. While Meet is off, meeting links open in the browser. Under Layout, View buttons shows or hides the Mentions and Starred buttons.
 
 ## Install
 
@@ -102,16 +102,16 @@ Download a build from the [Releases](https://github.com/felipefdl/working/releas
 
 Requirements, known limits, shortcuts, and file locations for each system are in [docs/platforms.md](docs/platforms.md).
 
-## MCP servers
+## MCP server
 
-Working serves one MCP server per product from one listener on `127.0.0.1`. Each has its own switch in Settings, under Agents, and is off until you turn it on; a server that is off answers 404. The Calendar, Meet, and Mail servers also need their feature on in [Features](#features). Every server takes the token in the `mcp-token` file beside the settings, as a bearer header or as one more path segment, and Settings copies each one's link and Claude Code command.
+Working serves one MCP server, named `working`, by default at `http://127.0.0.1:3021/mcp`, for this computer only. In Settings, under Agents, the Address row's Change button sets its address and port; another address, such as `0.0.0.0`, shares it with your network, and the token and the refusal of requests from web pages still apply. Agents also has a switch for each group of tools, and each is off until you turn it on; the server lists and runs only the tools of the groups that are on, and with every group off it does not listen. The Calendar, Meet, and Mail tools also need their feature on in [Features](#features). The server takes the token in the `mcp-token` file beside the settings, as a bearer header or as one more path segment (`/mcp/<token>`). Settings copies its link and token, and **Add to an agent** copies the setup for Claude Code, Codex, Grok, Pi, omp, Hermes, OpenClaw, or Antigravity, for every project.
 
-| Server | Address and name | Tools |
-|---|---|---|
-| Chat | `http://127.0.0.1:3021/mcp/chat`, `working-chat` | `inbox`, `recent_activity`, `find_conversations`, `read_conversation`, `search_messages`; `send_message` only with **Let agents send messages** |
-| Mail | `/mcp/mail`, `working-mail` | `mail_inbox`, `mail_search`, `mail_read_thread`, `mail_labels`, `mail_attachment`; with **Let agents send and change mail**, also `mail_send`, `mail_reply`, `mail_forward`, `mail_draft`, `mail_send_draft`, `mail_archive`, `mail_mark`, `mail_star`, `mail_label` |
-| Calendar | `/mcp/calendar`, `working-calendar` | `calendar_list`, `calendar_events`, `calendar_get_event`; with **Let agents change events**, also `calendar_create_event`, `calendar_update_event`, `calendar_delete_event`, `calendar_respond` |
-| Meet | `/mcp/meet`, `working-meet` | `meet_create_meeting`, `meet_upcoming` |
+| Tool group | Tools |
+|---|---|
+| Chat | `inbox`, `recent_activity`, `find_conversations`, `read_conversation`, `search_messages`; `send_message` only with **Let agents send messages** |
+| Mail | `mail_inbox`, `mail_search`, `mail_read_thread`, `mail_labels`, `mail_attachment`; with **Let agents send and change mail**, also `mail_send`, `mail_reply`, `mail_forward`, `mail_draft`, `mail_send_draft`, `mail_archive`, `mail_mark`, `mail_star`, `mail_label` |
+| Calendar | `calendar_list`, `calendar_events`, `calendar_get_event`; with **Let agents change events**, also `calendar_create_event`, `calendar_update_event`, `calendar_delete_event`, `calendar_respond` |
+| Meet | `meet_create_meeting`, `meet_upcoming` |
 
 What an agent sends is real: a chat message or an email reaches its recipients at once, as you. `mail_send` takes `to`, `cc`, and `bcc`. `mail_reply` answers the thread's newest email from someone else, or the one its `message` names (an id `mail_read_thread` shows), and addresses it the way Gmail's Reply and Reply all do; the agent does not pick the recipients. `mail_forward` sends an email on as a new email on a thread of its own, with `Fwd:` before the subject and the email quoted under what the agent writes; the email's attached files are not sent with it, and pictures inside it that need your Gmail session do not show for the recipient. `mail_draft` saves a new email or a reply in your Gmail Drafts without sending it, for you to look over; `mail_send_draft` sends it exactly as saved, until Working restarts, and after that you send it from Gmail's Drafts. `mail_star` and `mail_label` star threads and put on or take off your own labels; making a label is left to Gmail. `mail_attachment` saves an email's file in Working's own folder, which Working empties when it starts, and refuses files over 25 MB. Reading leaves chats and mail unread. Under `just run-readonly` every tool that sends or changes something refuses.
 
@@ -132,7 +132,7 @@ just run
 | `just run-readonly` | Run without writing anything to the Google account |
 | `just check` | Quality gate: format, lints, supply chain, tests |
 
-The app is `crates/app` (GPUI). The Google Chat protocol and realtime stream, the Gmail and Google Calendar clients, the cache, and the MCP servers are in `crates/core`.
+The app is `crates/app` (GPUI). The Google Chat protocol and realtime stream, the Gmail and Google Calendar clients, the cache, and the MCP server are in `crates/core`.
 
 ## Contributing
 

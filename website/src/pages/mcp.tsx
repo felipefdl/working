@@ -3,14 +3,14 @@ import { Code } from "../components";
 import { Article, type Page } from "../layout";
 import { href } from "../site";
 
-type Server = {
+type Group = {
   id: string;
   title: string;
   lede: string;
   tools: (readonly [string, string])[];
 };
 
-const servers: Server[] = [
+const groups: Group[] = [
   {
     id: "chat",
     title: "Chat",
@@ -116,30 +116,23 @@ const servers: Server[] = [
 ];
 
 const claude =
-  'claude mcp add --scope user --transport http working-mail http://127.0.0.1:3021/mcp/mail --header "Authorization: Bearer <contents of mcp-token>"';
+  'claude mcp add --scope user --transport http working http://127.0.0.1:3021/mcp --header "Authorization: Bearer <contents of mcp-token>"';
 
 const client = `{
   "mcpServers": {
-    "working-chat": {
+    "working": {
       "type": "http",
-      "url": "http://127.0.0.1:3021/mcp/chat",
-      "headers": { "Authorization": "Bearer <contents of mcp-token>" }
-    },
-    "working-mail": {
-      "type": "http",
-      "url": "http://127.0.0.1:3021/mcp/mail",
+      "url": "http://127.0.0.1:3021/mcp",
       "headers": { "Authorization": "Bearer <contents of mcp-token>" }
     }
   }
 }`;
 
-function Tools({ server }: { server: Server }): VNode {
+function Tools({ group }: { group: Group }): VNode {
   return (
     <section>
-      <h3 id={server.id}>
-        {server.title}: <code>/mcp/{server.id}</code>
-      </h3>
-      <p>{server.lede}</p>
+      <h3 id={group.id}>{group.title}</h3>
+      <p>{group.lede}</p>
       <table>
         <thead>
           <tr>
@@ -148,7 +141,7 @@ function Tools({ server }: { server: Server }): VNode {
           </tr>
         </thead>
         <tbody>
-          {server.tools.map(([name, text]) => (
+          {group.tools.map(([name, text]) => (
             <tr>
               <td>
                 <code>{name}</code>
@@ -165,26 +158,26 @@ function Tools({ server }: { server: Server }): VNode {
 function Mcp(): VNode {
   return (
     <Article
-      crumb="MCP servers"
-      title="MCP servers for Google Chat, Gmail, Calendar, and Meet"
-      lede="Working serves one MCP server per product, so AI agents on your computer can catch up on your Google Chat, read and answer your Gmail, check your calendar, and make Meet links. Each server has its own switch and is off until you turn it on."
+      crumb="MCP server"
+      title="An MCP server for Google Chat, Gmail, Calendar, and Meet"
+      lede="Working serves one MCP server, so AI agents on your computer can catch up on your Google Chat, read and answer your Gmail, check your calendar, and make Meet links. Each group of tools has its own switch and is off until you turn it on."
     >
       <section>
-        <h2>Turn one on</h2>
+        <h2>Turn it on</h2>
         <ol>
           <li>
             Install Working for <a href={href("/mac/")}>Mac</a>, <a href={href("/linux/")}>Linux</a>
             , or <a href={href("/windows/")}>Windows</a>, and sign in.
           </li>
           <li>
-            Open Settings, then Agents, and turn on the servers you want. Sending chat messages,
-            sending and changing mail, and changing events each have a second switch under their
-            server. The Calendar, Meet, and Mail servers also need their feature on in Settings,
-            Features.
+            Open Settings, then Agents, and turn on the tool groups you want: Chat, Mail, Calendar,
+            and Meet. Sending chat messages, sending and changing mail, and changing events each
+            have a second switch under their group. The Calendar, Meet, and Mail tools also need
+            their feature on in Settings, Features.
           </li>
           <li>
-            Copy a server's Claude Code command or its link from the same place, and give it to your
-            agent.
+            Choose Add to an agent in the same place, pick your agent, and copy its setup. Copy link
+            and Copy token are there too.
           </li>
         </ol>
       </section>
@@ -192,31 +185,35 @@ function Mcp(): VNode {
       <section>
         <h2>Connect an agent</h2>
         <p>
-          The servers share one address on your computer, <code>http://127.0.0.1:3021</code>, each
-          under its own path, and one token. Set <code>mcp_port</code> in the settings file for
-          another port. They speak MCP over HTTP. With Claude Code:
+          By default the server listens on your computer only, at{" "}
+          <code>http://127.0.0.1:3021/mcp</code>, and takes one token. Change, on the Address row in
+          Settings, Agents, sets where it listens: an address such as <code>0.0.0.0</code> shares it
+          with your network. It speaks MCP over HTTP. With Claude Code:
         </p>
         <Code>{claude}</Code>
-        <p>Many other clients take a block like this one, with one entry for each server:</p>
+        <p>
+          Add to an agent in Settings, Agents has the setup for Codex, Grok, Pi, omp, Hermes,
+          OpenClaw, and Antigravity too, for every project. Many other clients take a block like
+          this one:
+        </p>
         <Code>{client}</Code>
         <p>
           The token can also be the last part of the path, as in{" "}
-          <code>http://127.0.0.1:3021/mcp/chat/&lt;token&gt;</code>, for an agent that only takes a
-          URL. It is in <code>~/.config/working/mcp-token</code> on macOS and Linux, and in{" "}
+          <code>http://127.0.0.1:3021/mcp/&lt;token&gt;</code>, for an agent that only takes a URL.
+          It is in <code>~/.config/working/mcp-token</code> on macOS and Linux, and in{" "}
           <code>%APPDATA%\working\mcp-token</code> on Windows. It is a secret: anyone who has it can
-          use every server you turned on. Settings replaces it with a new one.
+          use every tool you turned on. Settings replaces it with a new one.
         </p>
       </section>
 
       <section>
         <h2>What an agent can do</h2>
         <p>
-          Each server tells the agent its own name (<code>working-chat</code>,{" "}
-          <code>working-mail</code>, <code>working-calendar</code>, or <code>working-meet</code>)
-          and lists only its own tools.
+          The server tells the agent its name, <code>working</code>, and lists the tools of the
+          groups that are on. A tool of a group that is off is not listed.
         </p>
-        {servers.map((server) => (
-          <Tools server={server} />
+        {groups.map((group) => (
+          <Tools group={group} />
         ))}
       </section>
 
@@ -224,11 +221,14 @@ function Mcp(): VNode {
         <h2>What keeps it safe</h2>
         <ul>
           <li>
-            Every server is off until you turn it on, and one that is off answers 404. Turning
-            Calendar, Meet, or Mail off in Settings, Features turns its server off too, whatever its
-            own switch says.
+            Every tool group is off until you turn it on, and with every group off the server does
+            not listen. Turning Calendar, Meet, or Mail off in Settings, Features turns its tools
+            off too, whatever their own switch says.
           </li>
-          <li>They listen on your computer only, never on the network.</li>
+          <li>
+            By default it listens on your computer only. Another address in Settings, Agents makes
+            it reachable from your network.
+          </li>
           <li>
             Every request needs the token, and a request from a web page on another address is
             refused.
@@ -255,9 +255,9 @@ function Mcp(): VNode {
 
 export const mcp: Page = {
   path: "/mcp/",
-  crumb: "MCP servers",
-  title: "Google Chat, Gmail, and Calendar MCP servers | Working",
+  crumb: "MCP server",
+  title: "MCP server for Google Chat, Gmail, and Calendar | Working",
   description:
-    "Working serves local MCP servers for Google Chat, Gmail, Google Calendar, and Meet. Each has its own switch, and sending and changing things are separate.",
+    "Working serves a local MCP server for Google Chat, Gmail, Google Calendar, and Meet. Each tool group has its own switch, and sending and changing are separate.",
   body: Mcp,
 };

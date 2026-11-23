@@ -1,6 +1,6 @@
-//! The calendar server (`/mcp/calendar`): the signed-in account's Google Calendar. It reads straight from Google
-//! (the app need not have opened Calendar); the tools that change events are listed and run only when the user let
-//! agents change the calendar, and never under `WORKING_READONLY=1`.
+//! The calendar tools: the signed-in account's Google Calendar. They read straight from Google (the app need not
+//! have opened Calendar); the tools that change events are listed and run only when the user let agents change the
+//! calendar, and never under `WORKING_READONLY=1`.
 #![allow(clippy::too_many_lines, reason = "tool schemas are verbose JSON")]
 
 use std::fmt::Write as _;
@@ -20,16 +20,15 @@ use crate::model::{
   Calendar, CalendarAccess, CalendarEvent, EditScope, EventDraft, EventKind, Micros, Reminder, Rsvp, Visibility,
 };
 
-/// The server's name.
-pub(super) const NAME: &str = "working-calendar";
+/// The calendar part of the server's instructions.
+pub(super) const INSTRUCTIONS: &str = "Google Calendar: calendar_events lists events in a date range (today and the \
+next 7 days unless asked otherwise), calendar_get_event reads one, and calendar_list names the calendars. Times are \
+written like 2026-11-20T14:30. When the user allowed it, calendar_create_event, calendar_update_event, \
+calendar_delete_event, and calendar_respond change events; guests are emailed only when `notify` is true, and an \
+event that repeats needs `scope` (\"this\" or \"all\").";
 
-/// System prompt for MCP clients of this server.
-pub(super) const INSTRUCTIONS: &str = "Google Calendar of the person signed in to the Working app on this computer. \
-calendar_events lists events in a date range (today and the next 7 days unless asked otherwise), calendar_get_event \
-reads one, and calendar_list names the calendars. Times are this computer's local time, written like \
-2026-11-20T14:30. When the user allowed it, calendar_create_event, calendar_update_event, calendar_delete_event, and \
-calendar_respond change events; guests are emailed only when `notify` is true, and an event that repeats needs \
-`scope` (\"this\" or \"all\").";
+/// The tools that read.
+const TOOLS: [&str; 3] = ["calendar_list", "calendar_events", "calendar_get_event"];
 
 /// The tools that change events: listed and run only with `calendar_write`.
 const WRITE_TOOLS: [&str; 4] = [
@@ -38,6 +37,11 @@ const WRITE_TOOLS: [&str; 4] = [
   "calendar_delete_event",
   "calendar_respond",
 ];
+
+/// `call` runs a tool of this name, a write tool too (it refuses while changing the calendar is off).
+pub(super) fn owns(name: &str) -> bool {
+  TOOLS.contains(&name) || WRITE_TOOLS.contains(&name)
+}
 
 const HOUR: Micros = 3_600_000_000;
 /// Events `calendar_events` shows at most.

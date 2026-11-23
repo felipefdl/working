@@ -14,6 +14,7 @@
 )]
 
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use gchat_core::{Command, Core, Event};
@@ -32,14 +33,14 @@ fn main() {
   if let Some(query) = std::env::args().nth(2) {
     core.send(Command::Search(query));
   }
-  // `WORKING_MCP_PORT=<port>` also serves every MCP server for the run, at `/mcp/chat`, `/mcp/mail`, `/mcp/calendar`,
-  // and `/mcp/meet` (sending, mail changes, and calendar changes are offered, and still refused under
-  // `WORKING_READONLY=1`).
+  // `WORKING_MCP_PORT=<port>` also serves the MCP server for the run at `/mcp`, with every tool group on (sending,
+  // mail changes, and calendar changes are offered, and still refused under `WORKING_READONLY=1`).
   let mut mcp: Option<(u16, String)> = None;
   if let Some(port) = std::env::var("WORKING_MCP_PORT").ok().and_then(|port| port.parse().ok()) {
     let token = gchat_core::mcp::token().expect("the MCP token can be stored");
     mcp = Some((port, token.clone()));
     core.send(Command::SetMcp(Some(gchat_core::McpConfig {
+      address: Ipv4Addr::LOCALHOST.into(),
       port,
       token,
       chat: true,
@@ -89,8 +90,8 @@ fn main() {
   let mut mail_opened = false;
   let mut label_listed = false;
   // `WORKING_PROBE_MAIL_WRITE=1` (without `WORKING_READONLY`): on the test thread only, found by its exact subject,
-  // mark unread, mark read, archive, and move back to the inbox. With `WORKING_MCP_PORT` too, then through the mail
-  // MCP server's tools: star and unstar the test thread, save a reply draft in it and send it (only when it goes to
+  // mark unread, mark read, archive, and move back to the inbox. With `WORKING_MCP_PORT` too, then through the MCP
+  // server's mail tools: star and unstar the test thread, save a reply draft in it and send it (only when it goes to
   // the signed-in address alone), and save a new email to the signed-in address as a draft and send it (subject
   // `MCP_SUBJECT`). Prints step names and results only.
   const MCP_SUBJECT: &str = "Working MCP mail check";
@@ -545,7 +546,7 @@ fn main() {
   );
 }
 
-/// The mail MCP server's write tools on the test thread `thread` and the signed-in address `me`: star, unstar, a reply
+/// The MCP server's mail write tools on the test thread `thread` and the signed-in address `me`: star, unstar, a reply
 /// draft sent, and a new email's draft sent. Prints each step's name and whether it worked, never an answer's text.
 fn mcp_mail_checks(port: u16, token: &str, thread: &str, me: &str, subject: &str) {
   if me.is_empty() {
@@ -605,8 +606,8 @@ fn only_to(text: &str, me: &str) -> bool {
       .all(|line| line.matches('@').count() == line.matches(me.as_str()).count())
 }
 
-/// One `tools/call` on the probe's own mail MCP server (revision 2025-11-25, which needs no handshake), over plain
-/// HTTP/1.1 on loopback: whether it worked, and its answer's text.
+/// One `tools/call` of a mail tool on the probe's own MCP server (revision 2025-11-25, which needs no handshake), over
+/// plain HTTP/1.1 on loopback: whether it worked, and its answer's text.
 fn call_mail_tool(port: u16, token: &str, name: &str, arguments: &serde_json::Value) -> (bool, String) {
   use std::io::{Read, Write};
   let body = serde_json::json!({
@@ -621,7 +622,7 @@ fn call_mail_tool(port: u16, token: &str, name: &str, arguments: &serde_json::Va
   };
   let _ = stream.set_read_timeout(Some(Duration::from_secs(90)));
   let request = format!(
-    "POST /mcp/mail HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: \
+    "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer {token}\r\nContent-Type: \
      application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
     body.len()
   );

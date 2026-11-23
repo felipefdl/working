@@ -3005,15 +3005,15 @@ impl Engine {
     if let Some(previous) = running.take() {
       previous.stop().await;
     }
-    // Nothing to serve when every server is off: the port stays free.
+    // Nothing to serve when every tool group is off: the port stays free.
     let Some(config) = config.filter(|config| config.chat || config.mail || config.calendar || config.meet) else {
       return self.emit(Event::Mcp(McpStatus::Off));
     };
-    let port = config.port;
     match mcp::serve(self.clone(), config).await {
       Ok(server) => {
+        let address = server.address;
         *running = Some(server);
-        self.emit(Event::Mcp(McpStatus::Running { port }));
+        self.emit(Event::Mcp(McpStatus::Running { address }));
       },
       Err(error) => self.emit(Event::Mcp(McpStatus::Failed(error.to_string()))),
     }

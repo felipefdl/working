@@ -24,7 +24,7 @@ const nav = [
   { path: "/mac/", label: "Mac" },
   { path: "/linux/", label: "Linux" },
   { path: "/windows/", label: "Windows" },
-  { path: "/mcp/", label: "MCP servers" },
+  { path: "/mcp/", label: "MCP server" },
 ];
 
 const app = {
@@ -138,7 +138,7 @@ function Footer(): VNode {
         <a href={href("/mac/")}>Google Chat and Gmail for Mac</a>
         <a href={href("/linux/")}>Google Chat and Gmail for Linux</a>
         <a href={href("/windows/")}>Google Chat and Gmail for Windows</a>
-        <a href={href("/mcp/")}>MCP servers for AI agents</a>
+        <a href={href("/mcp/")}>MCP server for AI agents</a>
         <a href={site.repo}>Source on GitHub</a>
         <a href={`${site.repo}/issues`}>Report a problem</a>
       </nav>

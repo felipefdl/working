@@ -1,5 +1,6 @@
 //! The Settings modal over the main window: sections on the left, their options on the right.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -12,7 +13,9 @@ use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use crate::agent_dialog::{AgentDialog, AgentEvent};
 use crate::keys;
+use crate::listen_dialog::{ListenDialog, ListenEvent};
 #[cfg(target_os = "macos")]
 use crate::notify;
 #[cfg(target_os = "macos")]
@@ -124,27 +127,17 @@ impl Section {
   }
 }
 
-/// One of the MCP servers, each switched on by itself and reached at a path of its own under `/mcp`.
+/// One group of the MCP server's tools, each switched on by itself.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Server {
+enum Tools {
   Chat,
   Mail,
   Calendar,
   Meet,
 }
 
-impl Server {
-  /// The last part of its address, and of its name in Claude Code (`working-chat`).
-  const fn path(self) -> &'static str {
-    match self {
-      Self::Chat => "chat",
-      Self::Mail => "mail",
-      Self::Calendar => "calendar",
-      Self::Meet => "meet",
-    }
-  }
-
-  /// Its place among the servers, for the ids of its copy buttons.
+impl Tools {
+  /// Its place among the groups, for the ids of its switches.
   const fn ix(self) -> usize {
     match self {
       Self::Chat => 0,
@@ -155,30 +148,22 @@ impl Server {
   }
 }
 
-/// What an agent's settings need to reach an MCP server, each copied by a button of its own.
+/// What an agent's settings need to reach the MCP server, each copied by a button of its own. The setup for a
+/// particular agent is in `agent_dialog`.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Access {
   /// One address with the token in it.
   Link,
-  /// The shell command that adds the server to Claude Code for every project of the user.
-  ClaudeCode,
-  /// The token every server shares.
+  /// The token the server takes.
   Token,
 }
 
 impl Access {
-  fn text(self, port: u16, server: Server) -> std::io::Result<String> {
+  /// The text, for an agent reaching the server at `reach` (`Settings::mcp_reach`).
+  fn text(self, reach: SocketAddr) -> std::io::Result<String> {
     let token = gchat_core::mcp::token()?;
-    let path = server.path();
-    let endpoint = format!("http://127.0.0.1:{port}/mcp/{path}");
     Ok(match self {
-      Self::Link => format!("{endpoint}/{token}"),
-      Self::ClaudeCode => {
-        format!(
-          "claude mcp add --scope user --transport http working-{path} {endpoint} --header \"Authorization: Bearer \
-           {token}\""
-        )
-      },
+      Self::Link => format!("http://{reach}/mcp/{token}"),
       Self::Token => token,
     })
   }
@@ -206,7 +191,11 @@ pub struct SettingsView {
   #[cfg(target_os = "macos")]
   allowed: Allowed,
   /// What was just copied: its button says so for a moment.
-  copied: Option<(Server, Access)>,
+  copied: Option<Access>,
+  /// The dialog that changes the MCP server's address and port, while it is open.
+  listen: Option<(Entity<ListenDialog>, Subscription)>,
+  /// The dialog that adds the MCP server to an agent, while it is open.
+  agent: Option<(Entity<AgentDialog>, Subscription)>,
   /// The do-not-disturb schedule whose days and times are open for changing.
   editing: Option<usize>,
   rewrite_instruction: Entity<TextareaState>,
@@ -345,6 +334,8 @@ impl SettingsView {
       #[cfg(target_os = "macos")]
       allowed: Self::read_allowed(),
       copied: None,
+      listen: None,
+      agent: None,
       editing: None,
       rewrite_instruction,
       reset_armed: false,
@@ -391,15 +382,15 @@ impl SettingsView {
     view
   }
 
-  fn copy(&mut self, server: Server, access: Access, cx: &mut Context<Self>) {
-    match access.text(cx.global::<Settings>().mcp_port, server) {
+  fn copy(&mut self, access: Access, cx: &mut Context<Self>) {
+    match access.text(cx.global::<Settings>().mcp_reach()) {
       Ok(text) => cx.write_to_clipboard(ClipboardItem::new_string(text)),
       Err(error) => {
         tracing::warn!("could not read the MCP token: {error}");
         return;
       },
     }
-    self.copied = Some((server, access));
+    self.copied = Some(access);
     self._copied_reset = Some(cx.spawn(async move |this, cx| {
       cx.background_executor().timer(Duration::from_millis(1500)).await;
       this
@@ -409,6 +400,31 @@ impl SettingsView {
         })
         .ok();
     }));
+    cx.notify();
+  }
+
+  /// Opens the dialog that adds the MCP server to an agent. Closing it gives the keyboard back to the settings.
+  fn open_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let reach = cx.global::<Settings>().mcp_reach();
+    let dialog = cx.new(|cx| AgentDialog::new(reach, window, cx));
+    let sub = cx.subscribe_in(&dialog, window, |this, _, _: &AgentEvent, window, cx| {
+      this.agent = None;
+      window.focus(&this.focus, cx);
+      cx.notify();
+    });
+    self.agent = Some((dialog, sub));
+    cx.notify();
+  }
+
+  /// Opens the dialog that changes where the MCP server listens. Closing it gives the keyboard back to the settings.
+  fn open_listen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let dialog = cx.new(|cx| ListenDialog::new(window, cx));
+    let sub = cx.subscribe_in(&dialog, window, |this, _, _: &ListenEvent, window, cx| {
+      this.listen = None;
+      window.focus(&this.focus, cx);
+      cx.notify();
+    });
+    self.listen = Some((dialog, sub));
     cx.notify();
   }
 
@@ -1919,23 +1935,20 @@ impl SettingsView {
   fn agents(&self, settings: Settings, cx: &mut Context<Self>) -> Div {
     let out = v_flex()
       .gap_5()
-      .child(
-        self.server_group(
-          &settings,
-          Server::Chat,
-          "Chat",
-          "Agents catch up on unread conversations and your recent activity, and find, read, and search conversations."
-            .into(),
-          Some((
-            "Let agents send messages",
-            "Adds a tool that posts as you. Without it agents only read.",
-          )),
-          cx,
-        ),
-      )
-      .child(self.server_group(
+      .child(Self::tools_group(
         &settings,
-        Server::Mail,
+        Tools::Chat,
+        "Chat",
+        "Agents catch up on unread conversations and your recent activity, and find, read, and search conversations."
+          .into(),
+        Some((
+          "Let agents send messages",
+          "Adds a tool that posts as you. Without it agents only read.",
+        )),
+      ))
+      .child(Self::tools_group(
+        &settings,
+        Tools::Mail,
         "Mail",
         "Agents list, search, and read your mail and labels. They change nothing unless you let them below.".into(),
         Some((
@@ -1943,168 +1956,158 @@ impl SettingsView {
           "Adds tools that send new emails, replies, and forwards from your address, save drafts, archive, mark read, \
            star, and label. What they send is real email. Without it agents only read.",
         )),
-        cx,
       ))
-      .child(self.server_group(
+      .child(Self::tools_group(
         &settings,
-        Server::Calendar,
+        Tools::Calendar,
         "Calendar",
         "Agents list your calendars and read their events.".into(),
         Some((
           "Let agents change events",
           "Adds tools that create, change, and delete events and answer invitations. Without it agents only read.",
         )),
-        cx,
       ))
-      .child(self.server_group(
+      .child(Self::tools_group(
         &settings,
-        Server::Meet,
+        Tools::Meet,
         "Meet",
         "Agents make new meetings and list your events with a Meet link in the next 7 days.".into(),
         None,
-        cx,
       ));
     if !settings.any_mcp() {
       return out;
     }
 
     let (color, state) = match &cx.global::<McpState>().0 {
-      McpStatus::Running { port } => (
+      McpStatus::Running { address } => (
         GREEN,
-        format!("Running at http://127.0.0.1:{port}/mcp, for this computer only."),
+        if address.ip().is_loopback() {
+          format!("Running at http://{address}/mcp, for this computer only.")
+        } else {
+          format!("Running at http://{address}/mcp.")
+        },
       ),
-      McpStatus::Failed(error) => {
-        let port = settings.mcp_port;
-        (
-          RED,
-          format!(
-            "Could not listen on port {port}: {error}. Set another \"mcp_port\" in {}.",
-            gchat_core::config_dir().join("settings.json").display()
-          ),
-        )
-      },
+      McpStatus::Failed(error) => (
+        RED,
+        format!(
+          "Could not listen on {}: {error}. Change the address or port below.",
+          SocketAddr::new(settings.mcp_address, settings.mcp_port)
+        ),
+      ),
       McpStatus::Off => (MUTED, "Starts once you are signed in.".to_string()),
     };
-    let token = Self::pill(
-      "copy-token",
-      if self.copied.is_some_and(|(_, access)| access == Access::Token) {
-        "Copied"
-      } else {
-        "Copy token"
-      },
-    )
-    .on_click(cx.listener(|this, _, _, cx| this.copy(Server::Chat, Access::Token, cx)));
+    let listen = SocketAddr::new(settings.mcp_address, settings.mcp_port);
+    let listen = if settings.mcp_address.is_loopback() {
+      format!("{listen}. This computer only.")
+    } else {
+      listen.to_string()
+    };
+    let reach = settings.mcp_reach();
+    let copy = |access: Access, id: &'static str, label: &'static str, cx: &mut Context<Self>| {
+      Self::pill(
+        id,
+        if self.copied == Some(access) {
+          "Copied"
+        } else {
+          label
+        },
+      )
+      .on_click(cx.listener(move |this, _, _, cx| this.copy(access, cx)))
+    };
     let status = Self::card()
       .child(Self::row("Status", state, true).child(div().size(px(8.)).flex_shrink_0().rounded_full().bg(rgb(color))))
       .child(
+        Self::row("Address", listen, false).child(Self::pill("change-listen", "Change").on_click(cx.listener(
+          |this, _, window, cx| {
+            this.open_listen(window, cx);
+          },
+        ))),
+      )
+      .child(
         Self::row(
-          "Token",
-          "Every server takes it, for an agent that takes the address and an Authorization: Bearer header.",
+          "Link",
+          format!("http://{reach}/mcp with the token inside, for an agent that only takes a URL."),
           false,
         )
-        .child(token),
+        .child(copy(Access::Link, "copy-link", "Copy link", cx)),
+      )
+      .child(
+        Self::row(
+          "Add to an agent",
+          "The command or settings that add the server to an agent, for every project.",
+          false,
+        )
+        .child(Self::pill("add-agent", "Choose").on_click(cx.listener(|this, _, window, cx| {
+          this.open_agent(window, cx);
+        }))),
+      )
+      .child(
+        Self::row(
+          "Token",
+          "The server takes it, for an agent that takes the address and an Authorization: Bearer header.",
+          false,
+        )
+        .child(copy(Access::Token, "copy-token", "Copy token", cx)),
       )
       .child(
         Self::row("New token", "Cuts off every agent that has the current one.", false)
           .child(Self::pill("new-token", "Replace").on_click(|_, _, cx| settings::replace_mcp_token(cx))),
       );
-    out.child(Self::group("Servers", status))
+    out.child(Self::group("Server", status))
   }
 
-  /// One MCP server: its switch with what agents get, its write switch when it has one (off while the server is),
-  /// and while it is on, its link and its Claude Code command.
-  fn server_group(
-    &self,
+  /// One group of the MCP server's tools: its switch with what agents get, and its write switch when it has one
+  /// (off while the group is).
+  fn tools_group(
     settings: &Settings,
-    server: Server,
+    tools: Tools,
     title: &'static str,
     detail: String,
     write: Option<(&'static str, &'static str)>,
-    cx: &mut Context<Self>,
   ) -> Div {
-    let on = match server {
-      Server::Chat => settings.mcp_chat,
-      Server::Mail => settings.mcp_mail,
-      Server::Calendar => settings.mcp_calendar,
-      Server::Meet => settings.mcp_meet,
+    let on = match tools {
+      Tools::Chat => settings.mcp_chat,
+      Tools::Mail => settings.mcp_mail,
+      Tools::Calendar => settings.mcp_calendar,
+      Tools::Meet => settings.mcp_meet,
     };
-    // A server whose feature is off is not served, whatever its switches say.
-    let feature = match server {
-      Server::Chat => true,
-      Server::Mail => settings.mail,
-      Server::Calendar => settings.calendar,
-      Server::Meet => settings.meet,
+    // A group whose feature is off is not served, whatever its switches say.
+    let feature = match tools {
+      Tools::Chat => true,
+      Tools::Mail => settings.mail,
+      Tools::Calendar => settings.calendar,
+      Tools::Meet => settings.meet,
     };
     let detail = if feature {
       detail
     } else {
       format!("{detail} {}", feature_off(title))
     };
-    let flip = move |settings: &mut Settings| match server {
-      Server::Chat => settings.mcp_chat.toggle(),
-      Server::Mail => settings.mcp_mail.toggle(),
-      Server::Calendar => settings.mcp_calendar.toggle(),
-      Server::Meet => settings.mcp_meet.toggle(),
+    let flip = move |settings: &mut Settings| match tools {
+      Tools::Chat => settings.mcp_chat.toggle(),
+      Tools::Mail => settings.mcp_mail.toggle(),
+      Tools::Calendar => settings.mcp_calendar.toggle(),
+      Tools::Meet => settings.mcp_meet.toggle(),
     };
-    let mut card = Self::card().child(Self::row(format!("{title} server"), detail, true).child(Self::gated_toggle(
-      ("mcp-server", server.ix()),
+    let mut card = Self::card().child(Self::row(format!("{title} tools"), detail, true).child(Self::gated_toggle(
+      ("mcp-tools", tools.ix()),
       on,
       feature,
       flip,
     )));
     if let Some((label, what)) = write {
-      let allowed = match server {
-        Server::Calendar => settings.mcp_calendar_write,
-        Server::Mail => settings.mcp_mail_write,
+      let allowed = match tools {
+        Tools::Calendar => settings.mcp_calendar_write,
+        Tools::Mail => settings.mcp_mail_write,
         _ => settings.mcp_send,
       };
-      // Off while its server is, or its feature: there is nothing to allow.
-      let switch = Self::gated_toggle(
-        ("mcp-write", server.ix()),
-        allowed,
-        on && feature,
-        move |settings| match server {
-          Server::Calendar => settings.mcp_calendar_write.toggle(),
-          Server::Mail => settings.mcp_mail_write.toggle(),
-          _ => settings.mcp_send.toggle(),
-        },
-      );
+      // Off while its group is, or its feature: there is nothing to allow.
+      let switch = Self::gated_toggle(("mcp-write", tools.ix()), allowed, on && feature, move |settings| match tools {
+        Tools::Calendar => settings.mcp_calendar_write.toggle(),
+        Tools::Mail => settings.mcp_mail_write.toggle(),
+        _ => settings.mcp_send.toggle(),
+      });
       card = card.child(Self::row(label, what, false).child(switch));
-    }
-    let on = on && feature;
-    if on {
-      let copy = |access: Access, id: &'static str, label: &'static str, cx: &mut Context<Self>| {
-        Self::pill(
-          (id, server.ix()),
-          if self.copied == Some((server, access)) {
-            "Copied"
-          } else {
-            label
-          },
-        )
-        .on_click(cx.listener(move |this, _, _, cx| this.copy(server, access, cx)))
-      };
-      card = card
-        .child(
-          Self::row(
-            "Link",
-            format!(
-              "http://127.0.0.1:{}/mcp/{} with the token inside, for an agent that only takes a URL.",
-              settings.mcp_port,
-              server.path()
-            ),
-            false,
-          )
-          .child(copy(Access::Link, "copy-link", "Copy link", cx)),
-        )
-        .child(
-          Self::row(
-            "Claude Code",
-            "The command that adds this server to Claude Code, in every project.",
-            false,
-          )
-          .child(copy(Access::ClaudeCode, "copy-claude", "Copy command", cx)),
-        );
     }
     Self::group(title, card)
   }
@@ -2217,6 +2220,8 @@ impl Render for SettingsView {
           .child(sections)
           .child(content),
       )
+      .children(self.listen.as_ref().map(|(dialog, _)| dialog.clone().into_any_element()))
+      .children(self.agent.as_ref().map(|(dialog, _)| dialog.clone().into_any_element()))
       .focus_trap("settings-trap", &self.focus)
   }
 }
