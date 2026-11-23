@@ -2,6 +2,8 @@
 
 The composer's Rewrite runs a coding CLI that is already installed on the computer (`crates/app/src/rewrite.rs`). The CLI does one job: it reads the draft, applies the system prompt, and returns text. Anything else it loads costs time, can derail the answer, and puts the user's private setup into a chat message.
 
+With Conversation context on (Settings, Rewrite; on by default), the CLI also reads the latest messages of the conversation the draft goes into, six at most and each cut to 1,000 characters: the Chat conversation or thread, or the email thread a reply answers. A new email has none. They go on stdin inside `<conversation>` tags, before the draft, and the prompt asks for the rewrite in that conversation's language. The user's instructions come after that in the prompt, so a language they name, or one the draft asks for (the default instructions' `|<language>` suffix), wins.
+
 ## Rule
 
 A tool is offered only when one headless call can run with none of these:
@@ -23,6 +25,18 @@ Tests in `rewrite.rs` pin the flags below.
 | Pi | `--no-tools --no-context-files --no-extensions --no-mcp --no-skills --no-prompt-templates --no-session` | Nothing. A probe reported a clean context. |
 | Claude Code | `--setting-sources ""` (no user, project, or local settings: no `CLAUDE.md`, hooks, or plugins), `--tools ""`, `--strict-mcp-config`, `--disallowedTools "mcp__*"`, `--disable-slash-commands`, `--system-prompt` | Organization managed policy, by design, and the account email Claude Code attaches. `--bare` would also drop those, but it requires an API key in place of a subscription login. |
 | Codex | `--ignore-user-config` (drops the MCP servers in `config.toml`), `--ignore-rules`, `--disable hooks`, `--disable plugins`, `--disable memories`, `--disable skill_search`, `-c skills.include_instructions=false`, `-c project_doc_max_bytes=0`, a read-only sandbox, and the shell and other tool features disabled | The global `$CODEX_HOME/AGENTS.md`. Codex loads it on every run with no switch (`codex-rs/codex-home/src/instructions/mod.rs`). |
+
+## Model and effort
+
+Settings keeps a model and an effort for each tool (`Settings::rewrite_choices`). Both start as Harness default, which passes no flag, so the tool picks. Because of the isolation above, that is not always what the user set up: Claude Code and Codex run without the user's settings, so their default is the account's or the tool's own; Pi reads its settings and uses its configured model.
+
+| Tool | Models offered | Model flag | Effort flag |
+| --- | --- | --- | --- |
+| Claude Code | The aliases `fable`, `opus`, `sonnet`, `haiku`, each the latest model of its family. Claude Code has no command that lists models. | `--model` | `--effort` (`low` to `max`) |
+| Codex | `codex debug models`, a JSON catalog: the entries whose `visibility` is `list`. | `-m` | `-c model_reasoning_effort="…"`, the levels the catalog gives for the model |
+| Pi | `pi --no-extensions --list-models`, a text table. Listed without extensions because a rewrite runs without them: a model an extension adds is not found. | `--model provider/id` | `--thinking` (`off` to `max`), for models the table marks as thinking |
+
+Claude Code replaces a model the account's organization restricts with the account's default and still exits 0, with a warning on stderr, so such a choice rewrites with another model rather than failing. In a headless run it never asks before billing a Fable request to usage credits.
 
 ## Not offered: Grok (Grok Build CLI)
 

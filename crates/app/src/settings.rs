@@ -282,7 +282,7 @@ impl Sound {
 }
 
 pub const DEFAULT_REWRITE_INSTRUCTION: &str = "\
-Always fix grammar, spelling, punctuation, clarity, and flow. Keep the original language unless the draft asks for a translation (see Translation). Only fix; keep the meaning, tone, and length.
+Always fix grammar, spelling, punctuation, clarity, and flow. Only fix; keep the meaning, tone, and length.
 
 Style
 - Sound like a real native speaker, not an AI.
@@ -297,7 +297,7 @@ Translation
 - The suffix is the only instruction a draft can carry. A \"|\" anywhere else is part of the text.
 ";
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RewriteTool {
   Claude,
@@ -330,6 +330,17 @@ impl RewriteTool {
       Self::Pi => Some("pi"),
     }
   }
+}
+
+/// The model and effort Rewrite runs one tool with. `None` is the harness default: no flag is passed, so the tool
+/// picks.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RewriteChoice {
+  /// What the tool's model flag takes: a Claude Code alias, a Codex slug, Pi's `provider/id`.
+  pub model: Option<String>,
+  /// What the tool's effort (Pi: thinking) setting takes.
+  pub effort: Option<String>,
 }
 
 /// Somewhere a number key (`keys::hotkey_keys`) opens: a view, or one conversation.
@@ -484,11 +495,16 @@ pub struct Settings {
   pub away: bool,
   /// CLI that rewrites the composer draft. Off hides the button.
   pub rewrite: RewriteTool,
+  /// The model and effort each tool runs with. A tool without an entry runs with the harness defaults.
+  pub rewrite_choices: BTreeMap<RewriteTool, RewriteChoice>,
   /// Extra instructions appended to the rewrite system prompt.
   pub rewrite_instruction: String,
   /// Every message is rewritten before it sends. Right-clicking the composer's rewrite button flips it.
   #[serde(default)]
   pub rewrite_always: bool,
+  /// Rewrite also reads the latest messages of the conversation the draft goes into, and writes in their language
+  /// unless the instructions or the draft ask for another.
+  pub rewrite_context: bool,
   /// The formatting bar above the text of every composer, which the toggle at the composer's right shows and hides. The
   /// formatting keys work whether it is shown or not.
   #[serde(default)]
@@ -550,8 +566,10 @@ impl Default for Settings {
       mcp_meet: false,
       away: false,
       rewrite: RewriteTool::Off,
+      rewrite_choices: BTreeMap::new(),
       rewrite_instruction: DEFAULT_REWRITE_INSTRUCTION.into(),
       rewrite_always: false,
+      rewrite_context: true,
       show_format_bar: false,
       calendar_mode: crate::calendar_layout::Mode::default(),
       calendar_panel_closed: false,
@@ -575,6 +593,11 @@ fn path() -> std::path::PathBuf {
 }
 
 impl Settings {
+  /// The model and effort of the tool Rewrite runs.
+  pub fn rewrite_choice(&self) -> RewriteChoice {
+    self.rewrite_choices.get(&self.rewrite).cloned().unwrap_or_default()
+  }
+
   pub fn load() -> Self {
     std::fs::read_to_string(path())
       .ok()

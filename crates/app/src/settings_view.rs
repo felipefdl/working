@@ -1,5 +1,6 @@
 //! The Settings modal over the main window: sections on the left, their options on the right.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use gchat_core::{Command, Core, DndSchedule, DndSchedules, McpStatus};
@@ -16,13 +17,15 @@ use crate::keys;
 use crate::notify;
 #[cfg(target_os = "macos")]
 use crate::permissions::{self, Media, Status};
+use crate::rewrite::{self, Model};
 use crate::settings::{
   self, ActivityStatus, Appearance, DEFAULT_REWRITE_INSTRUCTION, Layout, ListWindow, McpState, MessageStyle,
-  RewriteTool, Settings, SidebarMode, SidebarSide, Sound, ThreadView,
+  RewriteChoice, RewriteTool, Settings, SidebarMode, SidebarSide, Sound, ThreadView,
 };
 use crate::status::{self, DndState};
 use crate::theme::{
-  ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, GREEN, MUTED, POPOVER, RED, ROW_HOVER, TEXT, THEMES, WHITE, control_fill, rgb,
+  ACCENT, ACCENT_BG, BG, BORDER, BUBBLE, GREEN, MUTED, POPOVER, RED, ROW_HOVER, TEXT, THEMES, Tone, WHITE,
+  control_fill, rgb,
 };
 use crate::ui::{Icon, icon, switch};
 
@@ -34,6 +37,8 @@ const MICROPHONE_PANE: &str = "x-apple.systempreferences:com.apple.preference.se
 const NOTIFICATIONS_PANE: &str = "x-apple.systempreferences:com.apple.Notifications-Settings.extension";
 /// How long typing in the rewrite instructions pauses before they are saved.
 const INSTRUCTION_SAVE_DELAY: Duration = Duration::from_millis(500);
+/// The first item of Rewrite's Model and Effort selects: no flag is passed and the tool picks.
+const HARNESS_DEFAULT: &str = "Harness default";
 /// The least and the most the Settings window measures as the main window grows.
 const SETTINGS_SIZE: (Size<f32>, Size<f32>) =
   (Size { width: 780.0, height: 500.0 }, Size { width: 1120.0, height: 860.0 });
@@ -217,6 +222,16 @@ pub struct SettingsView {
   mono_font: Entity<SelectState<SearchableVec<FontChoice>>>,
   list_window: Entity<SelectState<Vec<ListWindow>>>,
   thread_view: Entity<SelectState<Vec<ThreadView>>>,
+  /// The models listed for one tool, kept until another tool's are listed. A failure keeps its message.
+  rewrite_models: Option<(RewriteTool, Result<Arc<Vec<Model>>, String>)>,
+  /// The listing on its way, and for which tool. Replacing it cancels the one before.
+  rewrite_load: Option<(RewriteTool, Task<()>)>,
+  rewrite_model: Entity<SelectState<SearchableVec<ModelChoice>>>,
+  rewrite_effort: Entity<SelectState<Vec<EffortChoice>>>,
+  /// What the Model and Effort selects were last filled from: they are filled again only when it changes.
+  rewrite_shown: Option<RewriteShown>,
+  /// The current model offers efforts: the Effort row shows.
+  rewrite_has_efforts: bool,
   _copied_reset: Option<Task<()>>,
   #[cfg(target_os = "macos")]
   _refresh: Task<()>,
@@ -226,6 +241,7 @@ pub struct SettingsView {
   _font_subs: [Subscription; 2],
   _list_window_sub: Subscription,
   _thread_view_sub: Subscription,
+  _rewrite_choice_subs: [Subscription; 2],
 }
 
 impl EventEmitter<SettingsEvent> for SettingsView {}
@@ -319,6 +335,7 @@ impl SettingsView {
     });
     let (list_window, list_window_sub) = Self::list_window_select(window, cx);
     let (thread_view, thread_view_sub) = Self::thread_view_select(window, cx);
+    let (rewrite_model, rewrite_effort, rewrite_choice_subs) = Self::rewrite_selects(window, cx);
     let focus = cx.focus_handle();
     window.focus(&focus, cx);
     Self {
@@ -340,20 +357,30 @@ impl SettingsView {
       mono_font,
       list_window,
       thread_view,
+      rewrite_models: None,
+      rewrite_load: None,
+      rewrite_model,
+      rewrite_effort,
+      rewrite_shown: None,
+      rewrite_has_efforts: false,
       _copied_reset: None,
       #[cfg(target_os = "macos")]
       _refresh: refresh,
       _globals: [
         cx.observe_global::<McpState>(|_, cx| cx.notify()),
         cx.observe_global::<DndState>(|_, cx| cx.notify()),
-        // ⌘⇧T picks themes too: keep both selects on the saved ones.
-        cx.observe_global_in::<Settings>(window, Self::sync_theme_selects),
+        // ⌘⇧T picks themes too: keep both selects on the saved ones. A new rewrite tool lists its models.
+        cx.observe_global_in::<Settings>(window, |this, window, cx| {
+          this.sync_theme_selects(window, cx);
+          this.sync_rewrite(window, cx);
+        }),
       ],
       _rewrite_sub: rewrite_sub,
       _theme_subs: theme_subs,
       _font_subs: font_subs,
       _list_window_sub: list_window_sub,
       _thread_view_sub: thread_view_sub,
+      _rewrite_choice_subs: rewrite_choice_subs,
     }
   }
 
@@ -422,6 +449,11 @@ impl SettingsView {
   }
 
   fn row(title: impl Into<SharedString>, detail: impl Into<SharedString>, first: bool) -> Div {
+    Self::tinted_row(title, detail, MUTED, first)
+  }
+
+  /// A row whose description is in `tone`.
+  fn tinted_row(title: impl Into<SharedString>, detail: impl Into<SharedString>, tone: Tone, first: bool) -> Div {
     h_flex()
       .py_3()
       .gap_4()
@@ -433,7 +465,7 @@ impl SettingsView {
           .min_w_0()
           .gap_0p5()
           .child(div().text_size(px(14.)).child(title.into()))
-          .child(div().text_size(px(12.)).text_color(rgb(MUTED)).child(detail.into())),
+          .child(div().text_size(px(12.)).text_color(rgb(tone)).child(detail.into())),
       )
   }
 
@@ -1617,6 +1649,168 @@ impl SettingsView {
     }));
   }
 
+  /// Rewrite's Model and Effort selects, holding only Harness default until `sync_rewrite` fills them, and what
+  /// picking one writes. A new model drops a saved effort it does not offer.
+  fn rewrite_selects(
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) -> (
+    Entity<SelectState<SearchableVec<ModelChoice>>>,
+    Entity<SelectState<Vec<EffortChoice>>>,
+    [Subscription; 2],
+  ) {
+    let model = cx.new(|cx| {
+      SelectState::new(
+        SearchableVec::new(vec![ModelChoice::harness_default()]),
+        Some(IndexPath::new(0)),
+        window,
+        cx,
+      )
+      .searchable(true)
+    });
+    let effort = cx.new(|cx| SelectState::new(vec![EffortChoice::new(None)], Some(IndexPath::new(0)), window, cx));
+    let subs = [
+      cx.subscribe(&model, |this, _, event: &SelectEvent<SearchableVec<ModelChoice>>, cx| {
+        let SelectEvent::Confirm(Some(model)) = event else {
+          return;
+        };
+        let model = model.clone();
+        let tool = cx.global::<Settings>().rewrite;
+        let efforts = rewrite::efforts(tool, this.listed_models(tool), model.as_deref());
+        Settings::update(cx, |settings| {
+          let choice = settings.rewrite_choices.entry(tool).or_default();
+          if choice.effort.as_ref().is_some_and(|effort| !efforts.contains(effort)) {
+            choice.effort = None;
+          }
+          choice.model = model;
+        });
+      }),
+      cx.subscribe(&effort, |_, _, event: &SelectEvent<Vec<EffortChoice>>, cx| {
+        let SelectEvent::Confirm(Some(effort)) = event else {
+          return;
+        };
+        let effort = effort.clone();
+        Settings::update(cx, |settings| {
+          let tool = settings.rewrite;
+          settings.rewrite_choices.entry(tool).or_default().effort = effort;
+        });
+      }),
+    ];
+    (model, effort, subs)
+  }
+
+  /// What listing `tool`'s models answered, if it has.
+  fn rewrite_listing(&self, tool: RewriteTool) -> Option<&Result<Arc<Vec<Model>>, String>> {
+    self
+      .rewrite_models
+      .as_ref()
+      .filter(|(listed, _)| *listed == tool)
+      .map(|(_, models)| models)
+  }
+
+  /// `tool`'s models, none while they are not listed or listing them failed.
+  fn listed_models(&self, tool: RewriteTool) -> &[Model] {
+    match self.rewrite_listing(tool) {
+      Some(Ok(models)) => models,
+      _ => &[],
+    }
+  }
+
+  /// Lists the current tool's models off the UI thread, unless they are listed or on their way. `retry` lists them
+  /// again after a failure, for coming back to the section.
+  fn load_rewrite_models(&mut self, retry: bool, window: &mut Window, cx: &mut Context<Self>) {
+    let tool = cx.global::<Settings>().rewrite;
+    let listed = match self.rewrite_listing(tool) {
+      Some(Ok(_)) => true,
+      Some(Err(_)) => !retry,
+      None => false,
+    };
+    let on_its_way = self.rewrite_load.as_ref().is_some_and(|(loading, _)| *loading == tool);
+    if tool == RewriteTool::Off || listed || on_its_way {
+      return;
+    }
+    let task = cx.spawn_in(window, async move |this, cx| {
+      let listed = cx.background_executor().spawn(async move { rewrite::models(tool) }).await;
+      let _ = this.update_in(cx, |this, window, cx| {
+        this.rewrite_load = None;
+        this.rewrite_models = Some((tool, listed.map(Arc::new)));
+        this.sync_rewrite(window, cx);
+        cx.notify();
+      });
+    });
+    self.rewrite_load = Some((tool, task));
+  }
+
+  /// Keeps the Model and Effort selects on the current tool's models and saved choice, and lists the models while
+  /// the section is on screen and the tool has none yet. The items are made again only when one of those changed.
+  fn sync_rewrite(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.section == Section::Rewrite {
+      self.load_rewrite_models(false, window, cx);
+    }
+    let settings = cx.global::<Settings>();
+    let tool = settings.rewrite;
+    let shown = RewriteShown {
+      tool,
+      models: self.rewrite_listing(tool).cloned(),
+      choice: settings.rewrite_choice(),
+    };
+    if self.rewrite_shown.as_ref() == Some(&shown) {
+      return;
+    }
+    let models = self.listed_models(tool);
+    let RewriteChoice { model, effort } = &shown.choice;
+    // A saved model the tool no longer lists still shows, by its id, instead of reading as Harness default.
+    let mut model_items = vec![ModelChoice::harness_default()];
+    if let Some(id) = model
+      && !models.iter().any(|listed| listed.id == *id)
+    {
+      model_items.push(ModelChoice { id: Some(id.clone()), label: id.clone() });
+    }
+    model_items.extend(models.iter().map(|listed| ModelChoice {
+      id: Some(listed.id.clone()),
+      label: listed.label.clone(),
+    }));
+    let efforts = rewrite::efforts(tool, models, model.as_deref());
+    self.rewrite_has_efforts = !efforts.is_empty();
+    let mut effort_items = vec![EffortChoice::new(None)];
+    if let Some(saved) = effort
+      && self.rewrite_has_efforts
+      && !efforts.contains(saved)
+    {
+      effort_items.push(EffortChoice::new(Some(saved.clone())));
+    }
+    effort_items.extend(efforts.into_iter().map(|effort| EffortChoice::new(Some(effort))));
+    self.rewrite_model.update(cx, |select, cx| {
+      select.set_items(SearchableVec::new(model_items), window, cx);
+      select.set_selected_value(model, window, cx);
+    });
+    self.rewrite_effort.update(cx, |select, cx| {
+      select.set_items(effort_items, window, cx);
+      select.set_selected_value(effort, window, cx);
+    });
+    self.rewrite_shown = Some(shown);
+  }
+
+  /// The Model row: what listing the models is doing, or why it failed, under its title.
+  fn rewrite_model_row(&self, tool: RewriteTool) -> Div {
+    let loading = self.rewrite_load.as_ref().is_some_and(|(loading, _)| *loading == tool);
+    let (detail, tone): (SharedString, Tone) = match self.rewrite_listing(tool) {
+      _ if loading => ("Loading models...".into(), MUTED),
+      None => ("Loading models...".into(), MUTED),
+      Some(Err(error)) => (error.clone().into(), RED),
+      Some(Ok(_)) => (
+        "The model the tool runs. Harness default leaves the choice to the tool.".into(),
+        MUTED,
+      ),
+    };
+    Self::tinted_row("Model", detail, tone, false).child(Self::select_field(
+      Select::new(&self.rewrite_model)
+        .id("rewrite-model")
+        .search_placeholder("Search models")
+        .menu_width(px(320.)),
+    ))
+  }
+
   fn rewrite(&self, settings: Settings, cx: &mut Context<Self>) -> Div {
     let customized = settings.rewrite_instruction != DEFAULT_REWRITE_INSTRUCTION;
     let armed = self.reset_armed;
@@ -1629,6 +1823,14 @@ impl SettingsView {
         )
         .child(Self::rewrite_picker(settings.rewrite)),
       )
+      .when(settings.rewrite != RewriteTool::Off, |card| {
+        card.child(self.rewrite_model_row(settings.rewrite)).when(self.rewrite_has_efforts, |card| {
+          card.child(
+            Self::row("Effort", "How hard the model thinks. Harness default leaves it to the tool.", false)
+              .child(Self::select_field(Select::new(&self.rewrite_effort).id("rewrite-effort"))),
+          )
+        })
+      })
       .child(
         Self::row(
           "Always rewrite",
@@ -1638,6 +1840,17 @@ impl SettingsView {
         .child(
           Self::toggle("rewrite-always", settings.rewrite_always)
             .on_click(|_, _, cx| Settings::update(cx, |settings| settings.rewrite_always.toggle())),
+        ),
+      )
+      .child(
+        Self::row(
+          "Conversation context",
+          "Rewrite reads the latest messages of the conversation and writes in its language, unless the instructions or the draft ask for another.",
+          false,
+        )
+        .child(
+          Self::toggle("rewrite-context", settings.rewrite_context)
+            .on_click(|_, _, cx| Settings::update(cx, |settings| settings.rewrite_context.toggle())),
         ),
       )
       .child(
@@ -1930,8 +2143,12 @@ impl Render for SettingsView {
           .cursor_pointer()
           .when(selected, |item| item.bg(rgb(ACCENT_BG)))
           .when(!selected, |item| item.hover(|item| item.bg(rgb(ROW_HOVER))))
-          .on_click(cx.listener(move |this, _, _, cx| {
+          .on_click(cx.listener(move |this, _, window, cx| {
             this.section = section;
+            if section == Section::Rewrite {
+              this.load_rewrite_models(true, window, cx);
+              this.sync_rewrite(window, cx);
+            }
             cx.notify();
           }))
           .child(icon(section.icon(), 16., if selected { TEXT } else { MUTED }))
@@ -2086,5 +2303,72 @@ impl SelectItem for FontChoice {
 
   fn value(&self) -> &Option<String> {
     &self.family
+  }
+}
+
+/// What Rewrite's Model and Effort selects were filled from.
+#[derive(PartialEq)]
+struct RewriteShown {
+  tool: RewriteTool,
+  /// `Arc` compares by pointer first, so a list already shown costs nothing to compare.
+  models: Option<Result<Arc<Vec<Model>>, String>>,
+  choice: RewriteChoice,
+}
+
+/// One model in Rewrite's Model select; `None` is Harness default.
+#[derive(Clone)]
+struct ModelChoice {
+  id: Option<String>,
+  label: String,
+}
+
+impl ModelChoice {
+  fn harness_default() -> Self {
+    Self { id: None, label: HARNESS_DEFAULT.into() }
+  }
+}
+
+impl SelectItem for ModelChoice {
+  type Value = Option<String>;
+
+  fn title(&self) -> SharedString {
+    self.label.clone().into()
+  }
+
+  fn value(&self) -> &Option<String> {
+    &self.id
+  }
+}
+
+/// One effort in Rewrite's Effort select, shown with its first letter upper-cased; `None` is Harness default.
+#[derive(Clone)]
+struct EffortChoice {
+  effort: Option<String>,
+  label: SharedString,
+}
+
+impl EffortChoice {
+  fn new(effort: Option<String>) -> Self {
+    let label = effort.as_deref().map_or_else(
+      || HARNESS_DEFAULT.into(),
+      |effort| {
+        let mut chars = effort.chars();
+        let first = chars.next().into_iter().flat_map(char::to_uppercase);
+        first.chain(chars).collect::<String>().into()
+      },
+    );
+    Self { effort, label }
+  }
+}
+
+impl SelectItem for EffortChoice {
+  type Value = Option<String>;
+
+  fn title(&self) -> SharedString {
+    self.label.clone()
+  }
+
+  fn value(&self) -> &Option<String> {
+    &self.effort
   }
 }

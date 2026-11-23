@@ -1779,10 +1779,30 @@ impl ConversationView {
     }
     self.rewrite_error = None;
     self.rewriting = Some(in_thread);
+    let topic = match (&self.thread, in_thread) {
+      (Some(thread), true) => Some(&thread.topic),
+      _ => None,
+    };
+    let context = crate::rewrite::earlier(
+      self
+        .messages
+        .iter()
+        .rev()
+        .filter(|message| !message.system && topic.is_none_or(|topic| message.topic_id == *topic))
+        .map(|message| {
+          let from = if message.sender_id == self.me_id {
+            crate::rewrite::ME
+          } else {
+            message.sender_name.as_str()
+          };
+          (from, message.text.as_str())
+        }),
+    );
     let field = composer.clone();
     self.rewrite_task = Some(crate::rewrite::spawn(
       composer,
       crate::rewrite::Kind::Chat,
+      context,
       window,
       cx,
       move |this, result, window, cx| {

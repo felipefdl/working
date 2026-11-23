@@ -346,11 +346,38 @@ impl MailView {
       }
       return;
     }
+    // A new email answers nothing: only a reply has a conversation.
+    let context = if composing {
+      Vec::new()
+    } else {
+      let store = self.store.read(cx);
+      let me = store.me.as_ref().map_or("", |me| me.email.as_str());
+      crate::rewrite::earlier(
+        store
+          .mail
+          .messages
+          .iter()
+          .flat_map(|messages| messages.iter().rev())
+          .filter(|message| !message.draft)
+          .map(|message| {
+            let from = &message.from;
+            let from = if crate::mail_logic::is_me(from, me) {
+              crate::rewrite::ME
+            } else if from.name.trim().is_empty() {
+              from.email.as_str()
+            } else {
+              from.name.as_str()
+            };
+            (from, message.text.as_str())
+          }),
+      )
+    };
     self.rewrite_error = None;
     self.rewriting = true;
     self.rewrite_task = Some(crate::rewrite::spawn(
       composer,
       crate::rewrite::Kind::Mail,
+      context,
       window,
       cx,
       move |this, result, _, cx| {
