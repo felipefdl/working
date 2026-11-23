@@ -1468,15 +1468,14 @@ fn rich_text(row: &Row, prepared: &Prepared, ctx: &MsgCtx) -> AnyElement {
   for block in &prepared.blocks {
     column = match block {
       Block::Text(segment) => column.child(segment.draw(row, ctx)),
+      // The bullet hangs in the row's padding rather than sitting beside the text in a flex row: a flex row measures
+      // its text unwrapped, so under a parent as wide as its content a long item ran past the edge instead of wrapping.
       Block::Item(segment) => column.child(
-        h_flex()
-          .w_full()
-          .min_w_0()
-          .pl_2()
-          .gap_2()
-          .items_start()
-          .child(div().flex_shrink_0().child("•"))
-          .child(div().flex_1().min_w_0().child(segment.draw(row, ctx))),
+        div()
+          .relative()
+          .pl_6()
+          .child(div().absolute().left_2().child("•"))
+          .child(segment.draw(row, ctx)),
       ),
       Block::Code(code) => column.child(
         div()
