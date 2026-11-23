@@ -42,7 +42,6 @@ Working draws emoji with its own copy of Google's Noto Color Emoji on every dist
 
 - In the composer, an emoji the interface font also has, such as `❤️`, shows as that font's black glyph; the sent message shows it in color.
 - In the media viewer, a video can stay black while its sound plays. This was seen in a Fedora 44 virtual machine whose GStreamer had the needed demuxers and decoders (Matroska, VP8, VP9, AV1, H.264), so missing codec packages are not the cause there. The cause is still open: the most likely one is that VM's VA-API video decoder, which isn't confirmed. Audio, PDF, and text files open normally.
-- On the welcome screen, after the sign-in page is canceled, the window can ignore clicks until it is resized or the pointer leaves it and comes back ([gpui-kit#3985](https://github.com/longbridge/gpui-kit/issues/3985)).
 - With the window maximized, a window button can keep its hover color after the pointer leaves the window through the top edge, until the pointer comes back in ([gpui-kit#3987](https://github.com/longbridge/gpui-kit/issues/3987)).
 - The AppImage updates itself when it sits in a folder you can write to; a copy installed any other way, or in a folder you cannot write to, does not.
 
@@ -58,12 +57,7 @@ Updates keep your shortcuts as they are: the Start Menu shortcut is renewed, and
 
 ### Known limits
 
-- In Mail, an email scrolled partly out of the reading pane keeps drawing past the pane, over the Mail toolbar and the thread list. gpui-webview cannot clip a webview to a scrolling pane on Windows, where it has no window composition surface.
-
-## Known limits on every system
-
-- After a menu closes, the list row that was under the chosen item can keep its hover color once the pointer has moved away, until the pointer passes over the list again ([gpui-kit#4072](https://github.com/longbridge/gpui-kit/issues/4072)).
-- A button's tooltip can show over the menu the button opened, when the button is pressed before its tooltip appears. It goes away on the next pointer move ([gpui-kit#4073](https://github.com/longbridge/gpui-kit/issues/4073)).
+- In Mail, an email scrolled partly out of the reading pane keeps drawing past the pane, over the thread's subject line, the Mail toolbar, and the window's top bar. gpui-webview does not clip a webview to a scrolling pane on Windows.
 
 ## Mail
 
