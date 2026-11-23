@@ -26,6 +26,11 @@ impl GroupId {
       Self::Space(id) => format!("space_{id}"),
     }
   }
+
+  /// The id a chat has while it is being created (`Event::ChatStarting`), which no conversation ever keeps.
+  pub fn starting() -> Self {
+    Self::Dm("starting".into())
+  }
 }
 
 /// Kind of conversation, as the sidebar groups them.
@@ -1216,7 +1221,12 @@ pub enum Event {
     /// Commands that answer in the conversation. Commands that open a dialog are left out.
     commands: Arc<Vec<SlashCommand>>,
   },
-  /// Open this conversation: answer to `Command::CreateChat`, or an existing chat it found.
+  /// `Command::CreateChat` is creating this chat: it is shown at once, under `GroupId::starting`, and is in no list.
+  /// `OpenChat` follows with the conversation it became, or `ChatFailed`.
+  ChatStarting(Group),
+  /// The chat `Command::CreateChat` asked for could not be created, and why.
+  ChatFailed(String),
+  /// Open this conversation: answer to `Command::CreateChat`, the chat it created or an existing one it found.
   OpenChat(GroupId),
   /// The account's calendars, primary first: answer to `Command::LoadCalendars`. Replaces what came before.
   Calendars(Arc<Vec<Calendar>>),

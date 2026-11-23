@@ -316,6 +316,8 @@ fn main() {
         commands.iter().all(|command| command.name.starts_with('/'))
       ),
       Event::OpenChat(id) => println!("[{at}ms] open chat: {id:?}"),
+      Event::ChatStarting(group) => println!("[{at}ms] chat starting: {} members", group.member_ids.len()),
+      Event::ChatFailed(error) => println!("[{at}ms] chat failed: {error}"),
       Event::Calendars(calendars) => {
         let writable = calendars.iter().filter(|calendar| calendar.access.can_write()).count();
         println!(

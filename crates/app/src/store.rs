@@ -295,13 +295,16 @@ impl Calling {
     Self { name, stage }
   }
 
-  /// Takes the chat the core opened (`OpenChat`) when it is the one made for this call, a chat with that person
-  /// alone, and answers whether it was. The meeting is posted in it from then on.
+  /// Whether the call waits for a chat with these people: the one the core makes for it, a chat with that person
+  /// alone.
+  fn awaits_chat(&self, members: &[String]) -> bool {
+    matches!(&self.stage, CallStage::Chat(person) if members == [person.as_str()])
+  }
+
+  /// Takes the chat the core opened (`OpenChat`) when it is the one made for this call, and answers whether it was.
+  /// The meeting is posted in it from then on.
   fn take_chat(&mut self, chat: &GroupId, members: &[String]) -> bool {
-    let CallStage::Chat(person) = &self.stage else {
-      return false;
-    };
-    if members != [person.as_str()] {
+    if !self.awaits_chat(members) {
       return false;
     }
     self.stage = CallStage::Meeting(chat.clone());
@@ -569,6 +572,8 @@ pub struct Store {
   back: Vec<View>,
   /// Views left by Back, newest last: what Forward reopens. Navigating anywhere else clears it.
   forward: Vec<View>,
+  /// The people of the chat the core is creating, while its view is shown under `GroupId::starting`.
+  starting: Option<Vec<String>>,
   /// Back or Forward is moving: the view change it makes is not a new step in the history.
   moving: bool,
   pub conv: Option<Entity<ConversationView>>,
@@ -648,6 +653,7 @@ impl Store {
       view_asks: 0,
       back: Vec::new(),
       forward: Vec::new(),
+      starting: None,
       moving: false,
       conv: None,
       query: String::new(),
@@ -916,13 +922,48 @@ impl Store {
             view.update(cx, |view, cx| view.set_slash_commands(commands, cx));
           }
         },
+        Event::ChatStarting(group) => {
+          // A chat made for a call is not opened: the call goes on in its own window.
+          let for_call = self
+            .meet
+            .calling
+            .as_ref()
+            .is_some_and(|call| call.awaits_chat(&group.member_ids));
+          if !for_call {
+            self.show_starting(group, window, cx);
+            changed = true;
+          }
+        },
         Event::OpenChat(id) => {
+          let members = self.groups.get(&id).map(|conv| &conv.g.member_ids);
+          let started = members.is_some() && members == self.starting.as_ref();
           if self.is_call_chat(&id) {
             self.core.send(Command::StartMeet(id));
+          } else if started {
+            self.starting = None;
+            self.finish_starting(id, window, cx);
           } else {
             self.open(id, window, cx);
           }
           changed = true;
+        },
+        Event::ChatFailed(message) => {
+          tracing::warn!("chat not created: {message}");
+          // The call that was being started failed: the Meet view says why.
+          if self.meet.calling.take().is_some() {
+            self.meet.error = Some(message);
+            changed = true;
+          }
+          if self.starting.take().is_some() {
+            // There is no chat to show: back to where it was asked for.
+            let placeholder = View::Conversation(GroupId::starting());
+            if self.view == placeholder {
+              self.go_back(window, cx);
+            }
+            self.back.retain(|view| *view != placeholder);
+            self.forward.retain(|view| *view != placeholder);
+            changed = true;
+          }
         },
         Event::Calendars(calendars) => {
           self.calendar.calendars = calendars;
@@ -1720,6 +1761,63 @@ impl Store {
       Some(id) => self.open(id, window, cx),
       None => self.core.send(Command::CreateChat { user_ids: vec![user_id.to_string()] }),
     }
+  }
+
+  /// Shows the chat the core is creating (`Event::ChatStarting`) before it exists: an empty conversation that sends
+  /// nothing, which `finish_starting` turns into the real one.
+  fn show_starting(&mut self, group: Group, window: &mut Window, cx: &mut Context<Self>) {
+    self.ask_view();
+    if !self.query.is_empty() {
+      self.query.clear();
+      self.search = None;
+    }
+    self.starting = Some(group.member_ids.clone());
+    let id = group.id.clone();
+    let history = History {
+      messages: Arc::default(),
+      reached_start: true,
+      reached_end: true,
+    };
+    let store = cx.weak_entity();
+    let (core, images, me) = (self.core.clone(), self.images.clone(), self.me.clone());
+    self.conv = Some(cx.new(|cx| {
+      let mut view = ConversationView::new(store, core, images, group, me, Some(history), window, cx);
+      view.hold();
+      view
+    }));
+    self.set_view(View::Conversation(id));
+    self.drop_shortcut(cx);
+    cx.notify();
+  }
+
+  /// The chat that was starting exists, as `id`: the view that showed it goes on as that conversation, opened as
+  /// `open` would. A user who went elsewhere meanwhile stays there, with Back leading to the new chat.
+  fn finish_starting(&mut self, id: GroupId, window: &mut Window, cx: &mut Context<Self>) {
+    let Some(group) = self.groups.get(&id).map(|c| c.g.clone()) else {
+      return;
+    };
+    let placeholder = View::Conversation(GroupId::starting());
+    for view in self.back.iter_mut().chain(&mut self.forward) {
+      if *view == placeholder {
+        *view = View::Conversation(id.clone());
+      }
+    }
+    if self.view != placeholder {
+      return;
+    }
+    // Not a step in the history: the chat was on screen already.
+    self.view = View::Conversation(id.clone());
+    self.recent.retain(|r| r != &id);
+    self.recent.insert(0, id.clone());
+    self.recent.truncate(50);
+    self.rebuild_lists();
+    self.rebuild_sidebar();
+    self.core.send(Command::Open(id.clone()));
+    self.core.send(Command::MarkRead(id));
+    if let Some(view) = &self.conv {
+      view.update(cx, |view, cx| view.started(group, window, cx));
+    }
+    cx.notify();
   }
 
   pub fn open(&mut self, id: GroupId, window: &mut Window, cx: &mut Context<Self>) {

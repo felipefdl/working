@@ -2117,11 +2117,15 @@ impl Engine {
       }),
       Command::CreateChat { user_ids } => {
         if self.readonly {
-          return self.emit(Event::Error("Read-only mode: the chat was not created.".into()));
+          return self.emit(Event::ChatFailed("Read-only mode: the chat was not created.".into()));
         }
         tokio::spawn(async move {
-          let result = engine.create_chat(user_ids).await;
-          engine.report(result);
+          match engine.create_chat(user_ids).await {
+            Err(error) if error.downcast_ref::<SignedOut>().is_none() => {
+              engine.emit(Event::ChatFailed(format!("{error:#}")));
+            },
+            result => engine.report(result),
+          }
         });
       },
     }
@@ -4908,43 +4912,74 @@ impl Engine {
       self.emit(Event::OpenChat(group));
       return Ok(());
     }
-    let members: Vec<proto::UserId> = ids
-      .iter()
-      .map(|id| proto::UserId {
-        id: Some(id.clone()),
-        ..Default::default()
-      })
-      .collect();
-    let invitees: Vec<proto::InviteeInfo> = members
-      .iter()
-      .cloned()
-      .map(|user_id| proto::InviteeInfo {
-        user_id: Some(user_id),
-        ..Default::default()
-      })
-      .collect();
-    let request = proto::CreateDmRequest {
-      request_header: Some(request_header()),
-      members,
-      invitees,
-      retention_settings: Some(proto::RetentionSettings {
-        state: Some(proto::retention_settings::RetentionState::Permanent as i32),
-        ..Default::default()
-      }),
-      local_id: Some(format!("working%{}", rand::random::<u64>())),
-      force_empty_dm_visible: Some(true),
-      ..Default::default()
+    // Nothing holds the chat back from the screen while Google creates it.
+    let starting = {
+      let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      created_group(GroupId::starting(), ids.clone(), &me, &state.users)
     };
-    let answer: proto::CreateDmResponse = self.http.api("create_dm", &request).await?;
-    let group_id = answer
-      .dm
+    self.emit(Event::ChatStarting(starting));
+    let invitees: Vec<proto::InviteeInfo> = ids
+      .iter()
+      .map(|id| proto::InviteeInfo {
+        user_id: Some(proto::UserId {
+          id: Some(id.clone()),
+          ..Default::default()
+        }),
+        ..Default::default()
+      })
+      .collect();
+    let local_id = Some(format!("working%{}", rand::random::<u64>()));
+    // `create_dm` makes one-to-one chats only. A chat with several people is an unnamed space, whose name the server
+    // writes from its members.
+    let created = if invitees.len() == 1 {
+      let request = proto::CreateDmRequest {
+        request_header: Some(request_header()),
+        members: invitees.iter().filter_map(|invitee| invitee.user_id.clone()).collect(),
+        invitees,
+        retention_settings: Some(proto::RetentionSettings {
+          state: Some(proto::retention_settings::RetentionState::Permanent as i32),
+          ..Default::default()
+        }),
+        local_id,
+        force_empty_dm_visible: Some(true),
+        ..Default::default()
+      };
+      let answer: proto::CreateDmResponse = self.http.api("create_dm", &request).await?;
+      answer.dm
+    } else {
+      let request = proto::CreateGroupRequest {
+        request_header: Some(request_header()),
+        space: Some(proto::SpaceCreationInfo {
+          flat_group: Some(proto::space_creation_info::FlatGroup {}),
+          has_server_generated_name: Some(true),
+          invitee_member_infos: invitees
+            .into_iter()
+            .map(|invitee_info| proto::InviteeMemberInfo { invitee_info: Some(invitee_info) })
+            .collect(),
+          ..Default::default()
+        }),
+        local_id,
+        should_find_existing_space: Some(true),
+      };
+      let answer: proto::CreateGroupResponse = self.http.api("create_group", &request).await?;
+      answer.group
+    };
+    let group_id = created
       .as_ref()
-      .and_then(|dm| dm.group_id.as_ref())
+      .and_then(|group| group.group_id.as_ref())
       .and_then(convert::group_id);
     let Some(group_id) = group_id else {
       bail!("Google Chat did not return the new conversation")
     };
-    self.fetch_users(ids.clone()).await.ok();
+    // The people picker offers known people, so this lookup, which would hold the new chat back for another round
+    // trip, is only for ids that came from somewhere else.
+    let unknown: Vec<String> = {
+      let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      ids.iter().filter(|id| state.users.get(*id).is_none()).cloned().collect()
+    };
+    if !unknown.is_empty() {
+      self.fetch_users(unknown).await.ok();
+    }
     let group = {
       let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
       created_group(group_id.clone(), ids, &me, &state.users)

@@ -1143,7 +1143,7 @@ impl Demo {
     ids.sort();
     ids.dedup();
     if ids.is_empty() {
-      return self.emit(Event::Error("Pick at least one person.".into()));
+      return self.emit(Event::ChatFailed("Pick at least one person.".into()));
     }
     let kind = if ids.len() == 1 {
       GroupKind::Dm
@@ -1185,6 +1185,7 @@ impl Demo {
       blocked: false,
       can_delete: false,
     };
+    self.emit(Event::ChatStarting(Group { id: GroupId::starting(), ..group.clone() }));
     self.groups.insert(id.clone(), group.clone());
     self.members.insert(id.clone(), ids);
     self.histories.insert(id.clone(), Vec::new());

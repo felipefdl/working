@@ -477,6 +477,11 @@ pub struct ConversationView {
   asked_commands: bool,
   /// The `@` or `/` menu over one of the composers.
   menu: Option<Menu>,
+  /// The chat is still being created (`Event::ChatStarting`): the core does not know it yet, so nothing is sent
+  /// for it until `started`.
+  starting: bool,
+  /// Send was asked for while the chat was starting: the composer keeps the message, and it goes out once it started.
+  send_held: bool,
 }
 
 impl ConversationView {
@@ -622,6 +627,8 @@ impl ConversationView {
       asked_members: false,
       asked_commands: false,
       menu: None,
+      starting: false,
+      send_held: false,
     };
     // Picking IRC lists a space's members.
     view._subs.push(cx.observe_global::<Settings>(|this, cx| {
@@ -649,6 +656,31 @@ impl ConversationView {
       cx.notify();
     });
     cx.notify();
+  }
+
+  /// Marks the view as one of a chat that is still being created.
+  pub const fn hold(&mut self) {
+    self.starting = true;
+  }
+
+  /// The chat the view was showing while it was created now exists, as `group`: what was held back goes out.
+  pub fn started(&mut self, group: Group, window: &mut Window, cx: &mut Context<Self>) {
+    self.starting = false;
+    // Whatever was asked while it was starting was never sent.
+    self.typing_sent = false;
+    self.asked_members = false;
+    self.asked_commands = false;
+    self.set_group(group, cx);
+    if std::mem::take(&mut self.send_held) {
+      self.send(window, cx);
+    }
+  }
+
+  /// Sends a command about this conversation, unless the chat is still being created.
+  fn command(&self, command: Command) {
+    if !self.starting {
+      self.core.send(command);
+    }
   }
 
   pub fn set_me(&mut self, me: User, cx: &mut Context<Self>) {
@@ -1030,7 +1062,7 @@ impl ConversationView {
   /// Leaves the window around a search hit for the latest messages.
   fn jump_latest(&mut self, cx: &mut Context<Self>) {
     self.to_latest = true;
-    self.core.send(Command::Open(self.group.id.clone()));
+    self.command(Command::Open(self.group.id.clone()));
     cx.notify();
   }
 
@@ -1056,7 +1088,7 @@ impl ConversationView {
     self.check_top(cx);
     if at_end && !load.at_end.get() && !load.loading_newer.get() {
       load.loading_newer.set(true);
-      self.core.send(Command::LoadNewer(self.group.id.clone()));
+      self.command(Command::LoadNewer(self.group.id.clone()));
     }
     if at_end && load.unseen.get() > 0 {
       load.unseen.set(0);
@@ -1137,7 +1169,7 @@ impl ConversationView {
     }
     if main.at_top() {
       load.loading.set(true);
-      self.core.send(Command::LoadOlder(self.group.id.clone()));
+      self.command(Command::LoadOlder(self.group.id.clone()));
     }
   }
 
@@ -1177,7 +1209,7 @@ impl ConversationView {
   fn on_typed(&mut self, cx: &mut Context<Self>) {
     if !self.typing_sent {
       self.typing_sent = true;
-      self.core.send(Command::SetTyping {
+      self.command(Command::SetTyping {
         group: self.group.id.clone(),
         typing: true,
       });
@@ -1192,7 +1224,7 @@ impl ConversationView {
     self.typing_task = None;
     if self.typing_sent {
       self.typing_sent = false;
-      self.core.send(Command::SetTyping {
+      self.command(Command::SetTyping {
         group: self.group.id.clone(),
         typing: false,
       });
@@ -1203,6 +1235,10 @@ impl ConversationView {
     if self.rewriting == Some(false) {
       return;
     }
+    if self.starting {
+      self.send_held = true;
+      return;
+    }
     let (text, chips) = completion::message(&self.composer.read(cx).content());
     let editing = self.editing.as_ref().is_some_and(|editing| !editing.in_thread);
     // Files alone make a message; a change to an existing one needs text.
@@ -1211,7 +1247,7 @@ impl ConversationView {
     }
     let group = self.group.id.clone();
     if let Some(editing) = self.editing.take_if(|editing| !editing.in_thread) {
-      self.core.send(Command::Edit {
+      self.command(Command::Edit {
         group,
         message_id: editing.message_id,
         text,
@@ -1223,7 +1259,7 @@ impl ConversationView {
       }
       let quote = self.quoting.take().map(|message| message.id.clone());
       let files = std::mem::take(&mut self.files);
-      self.core.send(Command::Send {
+      self.command(Command::Send {
         group,
         topic_id: None,
         text,
@@ -1998,11 +2034,11 @@ impl ConversationView {
     match trigger {
       Trigger::Mention if !self.asked_members => {
         self.asked_members = true;
-        self.core.send(Command::LoadMembers(self.group.id.clone()));
+        self.command(Command::LoadMembers(self.group.id.clone()));
       },
       Trigger::Command if !self.asked_commands => {
         self.asked_commands = true;
-        self.core.send(Command::LoadSlashCommands(self.group.id.clone()));
+        self.command(Command::LoadSlashCommands(self.group.id.clone()));
       },
       _ => {},
     }
@@ -2284,7 +2320,7 @@ impl Drop for ConversationView {
 impl ConversationView {
   /// Creates a Google Meet meeting and posts its link here.
   fn start_meet(&mut self, cx: &mut Context<Self>) {
-    self.core.send(Command::StartMeet(self.group.id.clone()));
+    self.command(Command::StartMeet(self.group.id.clone()));
     scroll_list(&self.main, None, cx);
     cx.notify();
   }
@@ -2294,7 +2330,7 @@ impl ConversationView {
   fn want_members(&mut self, cx: &App) {
     if !self.asked_members && self.group.kind == GroupKind::Space && cx.global::<Settings>().layout == Layout::Irc {
       self.asked_members = true;
-      self.core.send(Command::LoadMembers(self.group.id.clone()));
+      self.command(Command::LoadMembers(self.group.id.clone()));
     }
   }
 
