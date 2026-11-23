@@ -4,9 +4,9 @@
 
 use std::time::Duration;
 
-use chrono::{Datelike, Local, Timelike};
 use gchat_core::{Command, Core, DndSchedules, Presence};
 use gpui_kit::*;
+use jiff::ZonedDateTime;
 
 use crate::settings::{ActivityStatus, Settings};
 
@@ -67,8 +67,8 @@ fn idle() -> bool {
 }
 
 fn now_minute() -> u16 {
-  let now = Local::now();
-  (now.hour() * 60 + now.minute()) as u16
+  let now = ZonedDateTime::now();
+  (i16::from(now.hour()) * 60 + i16::from(now.minute())) as u16
 }
 
 /// Whether `minute` of the day is inside `start..end`. A range that ends at or before its start runs past
@@ -157,8 +157,8 @@ pub fn quiet(cx: &App) -> bool {
 
 /// Whether a schedule that is turned on covers this moment.
 pub fn muted_now(schedules: &DndSchedules) -> bool {
-  let now = Local::now();
-  let today = now.weekday().number_from_monday() as u8;
+  let now = ZonedDateTime::now();
+  let today = now.weekday().to_monday_one_offset() as u8;
   let yesterday = if today == 1 { 7 } else { today - 1 };
   let minute = now_minute();
   schedules.schedules.iter().filter(|schedule| schedule.enabled).any(|schedule| {

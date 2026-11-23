@@ -3,12 +3,12 @@
 
 use std::ops::Range;
 
-use chrono::{Datelike, NaiveDate};
 use gpui_kit::component::date_picker::DatePicker;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use jiff::civil::Date;
 
 use crate::calendar::round_button;
 use crate::calendar_layout::today;
@@ -82,7 +82,7 @@ impl MeetView {
 
   /// A day of the week strip: the weekday over the day number. The selected day is filled and today is ringed, its
   /// weekday in the accent color.
-  fn day_cell(&self, ix: usize, day: NaiveDate, cx: &Context<Self>) -> Stateful<Div> {
+  fn day_cell(&self, ix: usize, day: Date, cx: &Context<Self>) -> Stateful<Div> {
     let (selected, now) = (day == self.day, day == today());
     v_flex()
       .id(("meet-day", ix))
@@ -100,7 +100,7 @@ impl MeetView {
           .text_size(px(11.))
           .text_color(rgb(if now { ACCENT } else { MUTED }))
           .when(now, |label| label.font_weight(FontWeight::MEDIUM))
-          .child(day.format("%a").to_string()),
+          .child(day.strftime("%a").to_string()),
       )
       .child(
         div()

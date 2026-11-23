@@ -22,14 +22,14 @@ axum = { version = "0.8", default-features = false, features = ["tokio", "http1"
 base64 = "0.23"
 block2 = "0.6"
 cargo-packager-updater = "0.2.3"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dirs = "7"
 dispatch2 = { version = "0.3", default-features = false, features = ["std", "objc2"] }
 emojis = "0.9.1"
 flume = "0.12"
-gpui-kit = { version = "0.10", features = ["gpui-fast"] }
-gpui-webview = { version = "0.10", features = ["gpui-fast"] }
+gpui-kit = { version = "0.11", features = ["gpui-fast"] }
+gpui-webview = { version = "0.11", features = ["gpui-fast"] }
 iana-time-zone = "0.1"
+jiff = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff", "bmp"] }
 linkify = "0.11"
 mime_guess = "2"

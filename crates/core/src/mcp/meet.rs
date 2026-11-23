@@ -4,7 +4,7 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use chrono::{Duration, Local};
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -98,9 +98,8 @@ fn meeting_lines(events: &[CalendarEvent], limit: usize) -> String {
 async fn upcoming(engine: &Arc<Engine>, arguments: Value) -> Result<String, String> {
   let args: UpcomingArgs = parse(arguments)?;
   let limit = args.limit.unwrap_or(10).clamp(1, 50);
-  let now = Local::now();
-  let start = now.timestamp_micros();
-  let end = (now + Duration::days(UPCOMING_DAYS)).timestamp_micros();
+  let start = Timestamp::now().as_microsecond();
+  let end = start.saturating_add(UPCOMING_DAYS * 24 * 3_600_000_000);
   let events = engine
     .calendar_events(start, end)
     .await

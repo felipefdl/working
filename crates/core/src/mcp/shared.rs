@@ -7,7 +7,9 @@
   reason = "a count a model sent as a float is cut to a whole number, and answers are cut on char boundaries"
 )]
 
-use chrono::{DateTime, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
+use jiff::civil::{Date, DateTime, Time};
+use jiff::tz::TimeZone;
+use jiff::{Timestamp, ZonedDateTime};
 use serde::de::{DeserializeOwned, Error as _};
 use serde::{Deserialize, Deserializer};
 use serde_json::{Value, json};
@@ -106,16 +108,18 @@ pub(super) fn no_arguments(name: &str, arguments: &Value) -> Result<(), String> 
 
 // ---- Words for things ----
 
-pub(super) fn local(time: Micros) -> DateTime<Local> {
-  DateTime::from_timestamp_micros(time).unwrap_or_default().with_timezone(&Local)
+pub(super) fn local(time: Micros) -> ZonedDateTime {
+  Timestamp::from_microsecond(time)
+    .unwrap_or_default()
+    .to_zoned_datetime(TimeZone::system())
 }
 
 pub(super) fn stamp(time: Micros) -> String {
-  local(time).format("%Y-%m-%d %H:%M").to_string()
+  local(time).strftime("%Y-%m-%d %H:%M").to_string()
 }
 
 pub(super) fn now_line() -> String {
-  Local::now().format("Now: %a %Y-%m-%d %H:%M (UTC%:z).").to_string()
+  ZonedDateTime::now().strftime("Now: %a %Y-%m-%d %H:%M (UTC%:z).").to_string()
 }
 
 /// A point in time: the number a previous answer gave, or a local date or date and time.
@@ -127,18 +131,14 @@ pub(super) fn cursor(text: &str) -> Result<Micros, String> {
     return Ok(micros);
   }
   let formats = ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"];
-  let timed = formats
-    .iter()
-    .find_map(|format| NaiveDateTime::parse_from_str(text, format).ok());
+  let timed = formats.iter().find_map(|format| DateTime::strptime(format, text).ok());
   let day = || {
-    NaiveDate::parse_from_str(text, "%Y-%m-%d")
+    Date::strptime("%Y-%m-%d", text)
       .ok()
-      .map(|day| day.and_time(NaiveTime::MIN))
+      .map(|day| day.to_datetime(Time::midnight()))
   };
-  let moment = timed
-    .or_else(day)
-    .and_then(|naive| Local.from_local_datetime(&naive).earliest());
-  moment.map(|moment| moment.timestamp_micros()).ok_or_else(|| {
+  let moment = timed.or_else(day).and_then(crate::local_instant);
+  moment.ok_or_else(|| {
     format!("\"{text}\" is not a point in time. Pass the value a previous answer gave, or a date such as 2026-11-01 or 2026-11-01T14:30.")
   })
 }

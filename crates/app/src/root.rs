@@ -1,9 +1,9 @@
 //! Window root: title bar with search and status, the layout's columns, content panel, and overlays.
 
-use chrono::NaiveDate;
 use gchat_core::{Connection, Core, Shortcut};
 use gpui_kit::component::input::{Copy, Cut, Paste, Redo, SelectAll, Undo};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
+use jiff::civil::Date;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -796,7 +796,7 @@ impl RootView {
 
   /// Meet's "Schedule in Google Calendar": shows the calendar on `day`, with the editor open on a new event that has
   /// Google Meet.
-  fn schedule_meeting(&mut self, day: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
+  fn schedule_meeting(&mut self, day: Date, window: &mut Window, cx: &mut Context<Self>) {
     self.open_calendar(window, cx);
     // A modal over the window refuses the navigation: the calendar is not on screen then.
     if self.store.read(cx).view == View::Calendar {

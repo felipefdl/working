@@ -150,7 +150,7 @@ impl Row {
       return clock.clone();
     }
     // Asked before the text is made, so a time that reads as minutes is never kept.
-    let old = chrono::Local::now().timestamp_micros() - self.msg.time >= ONE_HOUR;
+    let old = jiff::Timestamp::now().as_microsecond() - self.msg.time >= ONE_HOUR;
     let time = SharedString::from(util::message_time(self.msg.time));
     if old {
       let _ = self.clock.set(time.clone());
@@ -742,9 +742,9 @@ const IRC_CHAR: f32 = 8.;
 fn irc_clock(time: Micros, h24: bool) -> String {
   let at = util::local(time);
   if h24 {
-    at.format("%H:%M").to_string()
+    at.strftime("%H:%M").to_string()
   } else {
-    at.format("%I:%M %p").to_string()
+    at.strftime("%I:%M %p").to_string()
   }
 }
 
@@ -2294,17 +2294,13 @@ fn react(core: &Core, group: &GroupId, topic: &str, id: &str, emoji: &str, add: 
 #[cfg(test)]
 mod tests {
   use super::{MENTION_PAD, find_ranges, irc_clock, link_domain, mention_marks, pad_at, shift_end, shift_start};
-  use chrono::{Local, TimeZone};
   use gchat_core::SpanKind;
+  use gchat_core::local_instant;
+  use jiff::civil::date;
 
   #[test]
   fn irc_times_fill_their_column() {
-    let at = |hour, minute| {
-      Local
-        .with_ymd_and_hms(2026, 11, 13, hour, minute, 0)
-        .single()
-        .map(|at| at.timestamp_micros())
-    };
+    let at = |hour, minute| local_instant(date(2026, 11, 13).at(hour, minute, 0, 0));
     let (morning, afternoon) = (at(9, 5), at(13, 50));
     assert_eq!(morning.map(|time| irc_clock(time, false)).as_deref(), Some("09:05 AM"));
     assert_eq!(afternoon.map(|time| irc_clock(time, false)).as_deref(), Some("01:50 PM"));

@@ -23,7 +23,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub use calendar::{EVENT_COLORS, boundary_date, local_midnight};
+pub use calendar::{EVENT_COLORS, boundary_date, local_instant, local_midnight, local_time};
 pub use engine::device_time_zone;
 pub use http::SessionCookie;
 pub use mail::reply_recipients;

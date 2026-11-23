@@ -6,13 +6,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::NaiveDate;
 use gchat_core::User;
 use gpui_kit::component::date_picker::{DatePickerEvent, DatePickerState, DateTime};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use jiff::civil::Date;
 
 use crate::calendar::{TOOLBAR_HEIGHT, idle_pill, pill};
 use crate::calendar_layout::today;
@@ -39,7 +39,7 @@ const MENU_WIDTH: f32 = 256.0;
 /// What the window root is told.
 pub enum MeetEvent {
   /// "Schedule in Google Calendar": show the calendar on this day, with an editor open on a new event that has Meet.
-  Schedule(NaiveDate),
+  Schedule(Date),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -68,7 +68,7 @@ pub struct MeetView {
   /// The field of the Calls tab.
   pub(crate) search: Entity<InputState>,
   /// The day the list shows.
-  pub(crate) day: NaiveDate,
+  pub(crate) day: Date,
   pub(crate) picker: Entity<DatePickerState>,
   /// The day's meetings: the store's events of that day, without those of hidden calendars and declined ones.
   pub(crate) meetings: Vec<Meeting>,
@@ -257,7 +257,7 @@ impl MeetView {
   // Moving around.
 
   /// Shows another day, and asks for its meetings.
-  pub(crate) fn go_to(&mut self, day: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
+  pub(crate) fn go_to(&mut self, day: Date, window: &mut Window, cx: &mut Context<Self>) {
     self.day = day;
     self.picker.update(cx, |picker, cx| picker.set_date(day, window, cx));
     self.load(cx);

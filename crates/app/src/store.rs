@@ -1211,7 +1211,7 @@ impl Store {
     let when = if event.all_day {
       "All day".to_string()
     } else {
-      let clock = |time| crate::util::clock_text(crate::util::local(time), h24);
+      let clock = |time| crate::util::clock_text(&crate::util::local(time), h24);
       format!("{} to {}", clock(event.start), clock(event.end))
     };
     let place = if event.location.trim().is_empty() {

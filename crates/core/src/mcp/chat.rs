@@ -412,7 +412,7 @@ fn line(message: &Message, me: &str) -> String {
     () if message.sender_name.is_empty() => "Someone",
     () => &message.sender_name,
   };
-  let mut out = format!("[{}] {who}:", local(message.time).format("%H:%M"));
+  let mut out = format!("[{}] {who}:", local(message.time).strftime("%H:%M"));
   if let Some(quote) = &message.quote {
     let _ = write!(out, " (quoting {}: \"{}\")", quote.sender_name, clip(&quote.text, 80));
   }
@@ -484,10 +484,10 @@ fn transcript<'a>(messages: impl IntoIterator<Item = &'a Arc<Message>>, me: &str
   let mut out = String::new();
   let mut day = None;
   for message in messages {
-    let date = local(message.time).date_naive();
+    let date = local(message.time).date();
     if day != Some(date) {
       day = Some(date);
-      let _ = writeln!(out, "-- {} --", date.format("%a %Y-%m-%d"));
+      let _ = writeln!(out, "-- {} --", date.strftime("%a %Y-%m-%d"));
     }
     if focus == Some(message.id.as_str()) {
       out.push_str(">> ");
@@ -797,7 +797,7 @@ async fn recent_activity(engine: &Arc<Engine>, arguments: Value) -> Result<Strin
   let args: ActivityArgs = parse(arguments)?;
   let limit = args.limit.unwrap_or(10).clamp(1, 25);
   let me = engine.me().map_or_default(|me| me.id);
-  let now = chrono::Local::now().timestamp_micros();
+  let now = jiff::Timestamp::now().as_microsecond();
   let since = now - RECENT;
 
   let groups: Vec<Group> = directory(engine)

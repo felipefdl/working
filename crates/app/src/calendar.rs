@@ -5,12 +5,12 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{Datelike, NaiveDate, Timelike};
 use gchat_core::{Calendar, CalendarEvent, EditScope, Micros, Rsvp};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use jiff::civil::Date;
 
 use crate::calendar_layout::{
   HOUR, MINUTE, Mode, add_days, add_months, day_start, local, month_start, month_weeks, now_micros, range, step, title,
@@ -60,9 +60,9 @@ pub struct CalendarView {
   pub(crate) focus: FocusHandle,
   pub(crate) mode: Mode,
   /// The day the view is on: shown alone by Day, inside the week of Week, in the month of Month.
-  pub(crate) anchor: NaiveDate,
+  pub(crate) anchor: Date,
   /// The month the side panel shows. Follows `anchor`, until its arrows move it.
-  mini: NaiveDate,
+  mini: Date,
   /// The events on screen: the store's, without those of the calendars unchecked in the side panel.
   pub(crate) events: Arc<Vec<CalendarEvent>>,
   /// Each calendar's color, by id.
@@ -157,7 +157,7 @@ impl CalendarView {
     }
     // A clicked reminder: its day, with its card.
     if let Some(event) = self.store.update(cx, |store, _| store.take_reveal()) {
-      self.go_to(crate::util::local(event.start).date_naive(), cx);
+      self.go_to(crate::util::local(event.start).date(), cx);
       self.open_card(&event, point(px(360.), px(160.)), window, cx);
     }
     self.refresh_events(cx);
@@ -238,7 +238,7 @@ impl CalendarView {
 
   // Moving around.
 
-  pub(crate) fn go_to(&mut self, date: NaiveDate, cx: &mut Context<Self>) {
+  pub(crate) fn go_to(&mut self, date: Date, cx: &mut Context<Self>) {
     // The card is about an event of the view on screen: it goes when the view changes.
     self.card = None;
     self.anchor = date;
@@ -260,7 +260,7 @@ impl CalendarView {
   }
 
   /// Shows one day: what a click on a day's number does in every view.
-  pub(crate) fn open_day(&mut self, date: NaiveDate, cx: &mut Context<Self>) {
+  pub(crate) fn open_day(&mut self, date: Date, cx: &mut Context<Self>) {
     self.anchor = date;
     self.mini = month_start(date);
     if self.mode == Mode::Day {
@@ -372,7 +372,7 @@ impl CalendarView {
   }
 
   /// A new event of one hour on `date` with Google Meet turned on, as Meet's "Schedule in Google Calendar" asks for.
-  pub fn new_meeting(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
+  pub fn new_meeting(&mut self, date: Date, window: &mut Window, cx: &mut Context<Self>) {
     self.go_to(date, cx);
     self.open_new_event(None, true, window, cx);
   }
@@ -382,7 +382,7 @@ impl CalendarView {
       let now = local(now_micros());
       // Today: the next half hour. Another day: nine in the morning.
       let minutes = if self.anchor == today() {
-        i64::from(now.hour() * 60 + now.minute()) / 30 * 30 + 30
+        (i64::from(now.hour()) * 60 + i64::from(now.minute())) / 30 * 30 + 30
       } else {
         9 * 60
       };
@@ -398,7 +398,7 @@ impl CalendarView {
   }
 
   /// A new all-day event on `date`.
-  pub(crate) fn new_all_day(&mut self, date: NaiveDate, window: &mut Window, cx: &mut Context<Self>) {
+  pub(crate) fn new_all_day(&mut self, date: Date, window: &mut Window, cx: &mut Context<Self>) {
     let seed = Seed::New {
       start: day_start(date),
       end: day_start(add_days(date, 1)),
@@ -498,7 +498,7 @@ impl CalendarView {
       .child(
         pill("calendar-today")
           .child("Today")
-          .tooltip(|window, cx| Tooltip::new(today().format("%A, %B %-d").to_string()).build(window, cx))
+          .tooltip(|window, cx| Tooltip::new(today().strftime("%A, %B %-d").to_string()).build(window, cx))
           .on_click(cx.listener(|this, _, _, cx| this.go_today(cx))),
       )
       .child(
@@ -553,9 +553,9 @@ impl CalendarView {
   /// tells the months of one screen apart.
   pub(crate) fn mini_month(
     &self,
-    month: NaiveDate,
+    month: Date,
     slot: usize,
-    marks: Option<&HashSet<NaiveDate>>,
+    marks: Option<&HashSet<Date>>,
     cx: &mut Context<Self>,
   ) -> Div {
     let now = today();
@@ -687,7 +687,7 @@ impl CalendarView {
           .text_size(px(13.))
           .font_weight(FontWeight::MEDIUM)
           .text_color(rgb(TEXT))
-          .child(month.format("%B %Y").to_string()),
+          .child(month.strftime("%B %Y").to_string()),
       )
       .child(
         round_button("mini-previous", Icon::ChevronLeft).on_click(cx.listener(|this, _, _, cx| {

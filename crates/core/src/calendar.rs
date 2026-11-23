@@ -17,7 +17,9 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use chrono::{DateTime, Datelike, Local, NaiveDate, TimeZone, Weekday};
+use jiff::civil::{Date, DateTime, Weekday};
+use jiff::tz::{AmbiguousOffset, TimeZone};
+use jiff::{Timestamp, ZonedDateTime};
 use regex::Regex;
 use reqwest::Method;
 use reqwest::cookie::Jar;
@@ -664,37 +666,52 @@ fn calendar_from(entry: &Value, pastels: &HashMap<String, u32>) -> Option<Calend
 }
 
 /// Local midnight of `date`, or the first moment of it when a clock change skips midnight.
-pub fn local_midnight(date: NaiveDate) -> Option<Micros> {
-  let midnight = date.and_hms_opt(0, 0, 0)?;
-  let one = date.and_hms_opt(1, 0, 0)?;
-  Local
-    .from_local_datetime(&midnight)
-    .earliest()
-    .or_else(|| Local.from_local_datetime(&one).earliest())
-    .map(|at| at.timestamp_micros())
+pub fn local_midnight(date: Date) -> Option<Micros> {
+  midnight_in(&TimeZone::system(), date)
+}
+
+fn midnight_in(zone: &TimeZone, date: Date) -> Option<Micros> {
+  instant_in(zone, date.at(0, 0, 0, 0)).or_else(|| instant_in(zone, date.at(1, 0, 0, 0)))
+}
+
+/// The instant a local date and time names: the earlier one when a clock change repeats it, none when a clock change
+/// skips it.
+pub fn local_instant(at: DateTime) -> Option<Micros> {
+  instant_in(&TimeZone::system(), at)
+}
+
+fn instant_in(zone: &TimeZone, at: DateTime) -> Option<Micros> {
+  let ambiguous = zone.to_ambiguous_timestamp(at);
+  if matches!(ambiguous.offset(), AmbiguousOffset::Gap { .. }) {
+    return None;
+  }
+  ambiguous.earlier().ok().map(Timestamp::as_microsecond)
+}
+
+/// `at` in local time.
+pub fn local_time(at: Micros) -> Option<ZonedDateTime> {
+  Timestamp::from_microsecond(at)
+    .ok()
+    .map(|at| at.to_zoned_datetime(TimeZone::system()))
 }
 
 /// The local date an all-day boundary at `at` stands for. A few hours of slack keep a boundary moved by a clock change
 /// on its day.
-pub fn boundary_date(at: Micros) -> Option<NaiveDate> {
-  let at = at.checked_add(3 * 3_600_000_000)?;
-  Some(Local.timestamp_micros(at).single()?.date_naive())
+pub fn boundary_date(at: Micros) -> Option<Date> {
+  Some(local_time(at.checked_add(3 * 3_600_000_000)?)?.date())
 }
 
 fn rfc3339(at: Micros) -> Result<String> {
-  let at = Local
-    .timestamp_micros(at)
-    .single()
-    .ok_or_else(|| anyhow!("{at} is not a time"))?;
-  Ok(at.to_rfc3339())
+  let at = local_time(at).ok_or_else(|| anyhow!("{at} is not a time"))?;
+  Ok(at.timestamp().display_with_offset(at.offset()).to_string())
 }
 
 /// An event's start or end: the instant, and whether it is a date of an all-day event.
 fn when(value: &Value) -> Option<(Micros, bool)> {
   if let Some(text) = value["dateTime"].as_str() {
-    return Some((DateTime::parse_from_rfc3339(text).ok()?.timestamp_micros(), false));
+    return Some((text.parse::<Timestamp>().ok()?.as_microsecond(), false));
   }
-  let date = NaiveDate::parse_from_str(value["date"].as_str()?, "%Y-%m-%d").ok()?;
+  let date = Date::strptime("%Y-%m-%d", value["date"].as_str()?).ok()?;
   Some((local_midnight(date)?, true))
 }
 
@@ -851,29 +868,26 @@ fn plain_text(html: &str) -> String {
 fn time_value(at: Micros, all_day: bool) -> Result<Value> {
   if all_day {
     let date = boundary_date(at).ok_or_else(|| anyhow!("{at} is not a date"))?;
-    return Ok(json!({ "date": date.format("%Y-%m-%d").to_string(), "dateTime": null, "timeZone": null }));
+    return Ok(json!({ "date": date.strftime("%Y-%m-%d").to_string(), "dateTime": null, "timeZone": null }));
   }
   Ok(json!({ "dateTime": rfc3339(at)?, "timeZone": crate::engine::device_time_zone(), "date": null }))
 }
 
 const fn weekday_code(day: Weekday) -> &'static str {
   match day {
-    Weekday::Mon => "MO",
-    Weekday::Tue => "TU",
-    Weekday::Wed => "WE",
-    Weekday::Thu => "TH",
-    Weekday::Fri => "FR",
-    Weekday::Sat => "SA",
-    Weekday::Sun => "SU",
+    Weekday::Monday => "MO",
+    Weekday::Tuesday => "TU",
+    Weekday::Wednesday => "WE",
+    Weekday::Thursday => "TH",
+    Weekday::Friday => "FR",
+    Weekday::Saturday => "SA",
+    Weekday::Sunday => "SU",
   }
 }
 
 /// The recurrence rule of `repeat` for an event starting at `start`; empty for `Repeat::Never`.
 fn recurrence(repeat: Repeat, start: Micros) -> Result<Vec<String>> {
-  let day = Local
-    .timestamp_micros(start)
-    .single()
-    .ok_or_else(|| anyhow!("{start} is not a time"))?;
+  let day = local_time(start).ok_or_else(|| anyhow!("{start} is not a time"))?;
   let rule = match repeat {
     Repeat::Never => return Ok(Vec::new()),
     Repeat::Daily => "FREQ=DAILY".to_string(),
@@ -1065,8 +1079,29 @@ mod tests {
       json!({ "id": "e2", "summary": "Holiday", "start": { "date": "2026-11-26" }, "end": { "date": "2026-11-27" } });
     let event = event_from(&day, &calendar(CalendarAccess::Reader)).expect("parses");
     assert!(event.all_day && !event.can_edit && !event.can_delete);
-    assert_eq!(boundary_date(event.start), NaiveDate::from_ymd_opt(2026, 11, 26));
-    assert_eq!(boundary_date(event.end), NaiveDate::from_ymd_opt(2026, 11, 27));
+    assert_eq!(boundary_date(event.start), Date::new(2026, 11, 26).ok());
+    assert_eq!(boundary_date(event.end), Date::new(2026, 11, 27).ok());
+  }
+
+  #[test]
+  fn local_times_take_the_first_of_a_repeat_and_none_of_a_skip() {
+    let micros = |text: &str| text.parse::<Timestamp>().expect("a timestamp").as_microsecond();
+    let new_york = TimeZone::get("America/New_York").expect("New York");
+    // Clocks go back from 2:00 to 1:00: 1:30 happens twice, first at -04:00.
+    let repeated = jiff::civil::date(2026, 11, 1).at(1, 30, 0, 0);
+    assert_eq!(instant_in(&new_york, repeated), Some(micros("2026-11-01T05:30:00Z")));
+    // Clocks go forward from 2:00 to 3:00: 2:30 never happens.
+    assert_eq!(instant_in(&new_york, jiff::civil::date(2026, 3, 8).at(2, 30, 0, 0)), None);
+    assert_eq!(
+      midnight_in(&new_york, jiff::civil::date(2026, 3, 8)),
+      Some(micros("2026-03-08T05:00:00Z"))
+    );
+    // São Paulo skipped midnight to 1:00 in 2018: the day started at 1:00.
+    let sao_paulo = TimeZone::get("America/Sao_Paulo").expect("São Paulo");
+    assert_eq!(
+      midnight_in(&sao_paulo, jiff::civil::date(2018, 11, 4)),
+      Some(micros("2018-11-04T03:00:00Z"))
+    );
   }
 
   #[test]
@@ -1091,8 +1126,7 @@ mod tests {
 
   #[test]
   fn new_event_body_has_meet_rule_and_guests() {
-    let start =
-      local_midnight(NaiveDate::from_ymd_opt(2026, 11, 19).expect("date")).expect("midnight") + 9 * 3_600_000_000;
+    let start = local_midnight(jiff::civil::date(2026, 11, 19)).expect("midnight") + 9 * 3_600_000_000;
     let draft = EventDraft {
       calendar_id: "primary".into(),
       title: " Planning ".into(),

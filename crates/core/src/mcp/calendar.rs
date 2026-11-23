@@ -6,7 +6,8 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use chrono::{Duration, Local, NaiveDate};
+use jiff::civil::Date;
+use jiff::{ToSpan as _, ZonedDateTime};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -356,8 +357,8 @@ const fn rsvp_text(rsvp: Rsvp) -> &'static str {
 fn when_text(event: &CalendarEvent) -> String {
   let start = local(event.start);
   if event.all_day {
-    let last = crate::boundary_date(event.end.saturating_sub(1)).unwrap_or_else(|| start.date_naive());
-    let first = start.date_naive();
+    let last = crate::boundary_date(event.end.saturating_sub(1)).unwrap_or_else(|| start.date());
+    let first = start.date();
     return if last > first {
       format!("{first} to {last}, all day")
     } else {
@@ -365,10 +366,10 @@ fn when_text(event: &CalendarEvent) -> String {
     };
   }
   let end = local(event.end);
-  if end.date_naive() == start.date_naive() {
-    format!("{}–{}", start.format("%Y-%m-%d %H:%M"), end.format("%H:%M"))
+  if end.date() == start.date() {
+    format!("{}–{}", start.strftime("%Y-%m-%d %H:%M"), end.strftime("%H:%M"))
   } else {
-    format!("{} to {}", start.format("%Y-%m-%d %H:%M"), end.format("%Y-%m-%d %H:%M"))
+    format!("{} to {}", start.strftime("%Y-%m-%d %H:%M"), end.strftime("%Y-%m-%d %H:%M"))
   }
 }
 
@@ -448,7 +449,7 @@ fn find_calendar<'a>(calendars: &'a [Calendar], wanted: &str) -> Result<&'a Cale
 }
 
 /// Local midnight of `date`.
-fn midnight(date: NaiveDate) -> Result<Micros, String> {
+fn midnight(date: Date) -> Result<Micros, String> {
   crate::local_midnight(date).ok_or_else(|| format!("{date} has no midnight here"))
 }
 
@@ -469,11 +470,11 @@ fn scope_of(event: &CalendarEvent, scope: Option<ScopeArg>) -> Result<EditScope,
 fn span(start: &str, end: Option<&str>, all_day: bool) -> Result<(Micros, Micros), String> {
   let start = cursor(start)?;
   if all_day {
-    let first = local(start).date_naive();
+    let first = local(start).date();
     let start = midnight(first)?;
     let end = match end {
-      Some(end) => midnight(local(cursor(end)?).date_naive())?,
-      None => midnight(first + Duration::days(1))?,
+      Some(end) => midnight(local(cursor(end)?).date())?,
+      None => midnight(first.saturating_add(1.day()))?,
     };
     return Ok((start, end.max(start)));
   }
@@ -508,14 +509,14 @@ async fn calendar_list(engine: &Arc<Engine>, arguments: &Value) -> Result<String
 
 async fn calendar_events(engine: &Arc<Engine>, arguments: Value) -> Result<String, String> {
   let args: EventsArgs = parse(arguments)?;
-  let today = Local::now().date_naive();
+  let today = ZonedDateTime::now().date();
   let start = match &args.start {
     Some(start) => cursor(start)?,
     None => midnight(today)?,
   };
   let end = match &args.end {
     Some(end) => cursor(end)?,
-    None => midnight(today + Duration::days(8))?,
+    None => midnight(today.saturating_add(8.days()))?,
   };
   if end <= start {
     return Err("`end` has to come after `start`.".into());
@@ -542,8 +543,8 @@ async fn calendar_events(engine: &Arc<Engine>, arguments: Value) -> Result<Strin
   let mut out = format!(
     "{}\nEvents from {} to {}:\n",
     now_line(),
-    local(start).format("%Y-%m-%d %H:%M"),
-    local(end).format("%Y-%m-%d %H:%M")
+    local(start).strftime("%Y-%m-%d %H:%M"),
+    local(end).strftime("%Y-%m-%d %H:%M")
   );
   if matching.is_empty() {
     out.push_str("No events.\n");
@@ -616,7 +617,7 @@ async fn calendar_create_event(engine: &Arc<Engine>, arguments: Value) -> Result
   let mut created = format!(
     "Created \"{title}\" in {} on {}",
     calendar.name,
-    local(start).format("%Y-%m-%d %H:%M")
+    local(start).strftime("%Y-%m-%d %H:%M")
   );
   if args.all_day {
     created.push_str(" (all day)");
@@ -679,8 +680,8 @@ async fn calendar_update_event(engine: &Arc<Engine>, arguments: Value) -> Result
       None if args.start.is_some() => Some(start.saturating_add(length)),
       None => None,
     };
-    let start_text = local(start).format("%Y-%m-%dT%H:%M").to_string();
-    let end_text = end.map(|end| local(end).format("%Y-%m-%dT%H:%M").to_string());
+    let start_text = local(start).strftime("%Y-%m-%dT%H:%M").to_string();
+    let end_text = end.map(|end| local(end).strftime("%Y-%m-%dT%H:%M").to_string());
     let (start, end) = span(&start_text, end_text.as_deref(), draft.all_day)?;
     draft.start = start;
     draft.end = end;

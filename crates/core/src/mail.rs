@@ -648,7 +648,7 @@ impl Session {
       bail!("Gmail did not open");
     }
     let config = PageConfig::parse(&page)?;
-    let offset_ms = i64::from(chrono::Local::now().offset().local_minus_utc()) * 1000;
+    let offset_ms = i64::from(jiff::ZonedDateTime::now().offset().seconds()) * 1000;
     let btai = config.btai(USER_AGENT, offset_ms, &crate::engine::device_time_zone());
     Ok(Self {
       http,
@@ -1766,10 +1766,10 @@ fn reply_body(text: &str, quoted: String, signature: Option<&MailSignature>, bef
 /// When an email came, as Gmail writes it above a quote or in a forward (`Thu, Nov 19, 2026 at 3:28 PM`), in local
 /// time.
 fn gmail_date(time: Micros) -> String {
-  chrono::DateTime::from_timestamp_micros(time)
+  jiff::Timestamp::from_microsecond(time)
     .unwrap_or_default()
-    .with_timezone(&chrono::Local)
-    .format("%a, %b %-d, %Y at %-I:%M %p")
+    .to_zoned_datetime(jiff::tz::TimeZone::system())
+    .strftime("%a, %b %-d, %Y at %-I:%M %p")
     .to_string()
 }
 

@@ -2675,7 +2675,7 @@ fn save_pasted(picture: &Image) -> Option<PathBuf> {
   };
   let path = pasted_dir().join(format!(
     "Pasted image {}.{extension}",
-    chrono::Local::now().format("%Y-%m-%d at %H.%M.%S%.3f")
+    jiff::ZonedDateTime::now().strftime("%Y-%m-%d at %H.%M.%S%.3f")
   ));
   gchat_core::write_private(&path, &bytes).ok()?;
   Some(path)

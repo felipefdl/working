@@ -5,9 +5,10 @@
 
 use std::collections::HashMap;
 
-use chrono::{Datelike, Days, Local, NaiveDate, TimeZone, Weekday};
+use jiff::Span;
+use jiff::civil::{Date, Time, Weekday};
 
-use crate::calendar::{event_color, local_midnight, sort_events};
+use crate::calendar::{event_color, local_instant, local_midnight, local_time, sort_events};
 use crate::model::{
   Calendar, CalendarAccess, CalendarEvent, EditScope, EventDraft, EventKind, Guest, Micros, Reminder, Repeat, Rsvp,
   User, Visibility,
@@ -18,8 +19,8 @@ const OWN: &str = "amorgan@example.com";
 const TEAM: &str = "demo-team-calendar";
 const HOLIDAYS: &str = "demo-holidays";
 /// Days before and after today that hold the recurring events.
-const PAST_DAYS: u64 = 60;
-const FUTURE_DAYS: u64 = 180;
+const PAST_DAYS: i64 = 60;
+const FUTURE_DAYS: i64 = 180;
 /// The event that starts soon after the demo does.
 pub const SOON: &str = "demo-design-sync";
 /// Minutes from the demo's start to `SOON`'s, which its reminder is set for.
@@ -37,16 +38,21 @@ pub struct DemoCalendar {
 }
 
 /// `hour:minute` on `date`, local time.
-fn at(date: NaiveDate, hour: u32, minute: u32) -> Micros {
+fn at(date: Date, hour: i8, minute: i8) -> Micros {
   let midnight = local_midnight(date).unwrap_or_default();
-  date
-    .and_hms_opt(hour, minute, 0)
-    .and_then(|time| Local.from_local_datetime(&time).earliest())
-    .map_or(midnight, |time| time.timestamp_micros())
+  Time::new(hour, minute, 0, 0)
+    .ok()
+    .and_then(|time| local_instant(date.to_datetime(time)))
+    .unwrap_or(midnight)
 }
 
-fn date_of(time: Micros) -> NaiveDate {
-  Local.timestamp_micros(time).single().map_or_default(|time| time.date_naive())
+fn date_of(time: Micros) -> Date {
+  local_time(time).map_or_default(|time| time.date())
+}
+
+/// `date` moved by `days`, none past the ends of the calendar.
+fn shift(date: Date, days: i64) -> Option<Date> {
+  date.checked_add(Span::new().try_days(days).ok()?).ok()
 }
 
 fn event(id: &str, calendar_id: &str, title: &str, start: Micros, end: Micros) -> CalendarEvent {
@@ -77,8 +83,8 @@ fn event(id: &str, calendar_id: &str, title: &str, start: Micros, end: Micros) -
 }
 
 /// A whole-day event from `first` through `last`.
-fn all_day(id: &str, calendar_id: &str, title: &str, first: NaiveDate, last: NaiveDate) -> CalendarEvent {
-  let after = last.checked_add_days(Days::new(1)).unwrap_or(last);
+fn all_day(id: &str, calendar_id: &str, title: &str, first: Date, last: Date) -> CalendarEvent {
+  let after = shift(last, 1).unwrap_or(last);
   let start = local_midnight(first).unwrap_or_default();
   let end = local_midnight(after).unwrap_or(start);
   CalendarEvent {
@@ -155,17 +161,17 @@ impl DemoCalendar {
     event
   }
 
-  fn fill(&mut self, today: NaiveDate) {
-    let first = today.checked_sub_days(Days::new(PAST_DAYS)).unwrap_or(today);
+  fn fill(&mut self, today: Date) {
+    let first = shift(today, -PAST_DAYS).unwrap_or(today);
     for offset in 0..=PAST_DAYS + FUTURE_DAYS {
-      let Some(day) = first.checked_add_days(Days::new(offset)) else {
+      let Some(day) = shift(first, offset) else {
         continue;
       };
       self.recurring(day, today);
       self.holidays(day);
     }
-    let plus = |days: u64| today.checked_add_days(Days::new(days)).unwrap_or(today);
-    let minus = |days: u64| today.checked_sub_days(Days::new(days)).unwrap_or(today);
+    let plus = |days: i64| shift(today, days).unwrap_or(today);
+    let minus = |days: i64| shift(today, -days).unwrap_or(today);
 
     let mut launch = event("demo-launch", OWN, "Launch readiness", at(plus(1), 13, 0), at(plus(1), 14, 0));
     launch.meet_url = Some("https://meet.google.com/demo-launch".into());
@@ -227,10 +233,10 @@ impl DemoCalendar {
   }
 
   /// The events that repeat on `day`.
-  fn recurring(&mut self, day: NaiveDate, today: NaiveDate) {
+  fn recurring(&mut self, day: Date, today: Date) {
     let weekday = day.weekday();
-    let key = day.format("%Y%m%d");
-    if !matches!(weekday, Weekday::Sat | Weekday::Sun) {
+    let key = day.strftime("%Y%m%d");
+    if !matches!(weekday, Weekday::Saturday | Weekday::Sunday) {
       let mut standup = event(
         &format!("demo-standup_{key}"),
         OWN,
@@ -245,7 +251,7 @@ impl DemoCalendar {
         .events
         .push(self.invited(standup, "rbrooks@example.com", &others, Rsvp::Accepted));
     }
-    if weekday == Weekday::Tue {
+    if weekday == Weekday::Tuesday {
       let mut one = event(
         &format!("demo-one_{key}"),
         OWN,
@@ -262,13 +268,13 @@ impl DemoCalendar {
       one.organizer.clone_from(&self.me.name);
       self.events.push(one);
     }
-    if weekday == Weekday::Wed {
+    if weekday == Weekday::Wednesday {
       let mut focus = event(&format!("demo-focus_{key}"), OWN, "Focus time", at(day, 15, 0), at(day, 17, 0));
       focus.series = Some("demo-focus".into());
       focus.kind = EventKind::FocusTime;
       self.events.push(focus);
     }
-    if weekday == Weekday::Thu {
+    if weekday == Weekday::Thursday {
       let mut review = event(
         &format!("demo-review_{key}"),
         OWN,
@@ -290,16 +296,16 @@ impl DemoCalendar {
     }
   }
 
-  fn holidays(&mut self, day: NaiveDate) {
+  fn holidays(&mut self, day: Date) {
     let name = match (day.month(), day.day()) {
       (1, 1) => "New Year's Day",
       (7, 4) => "Independence Day",
       (12, 25) => "Christmas Day",
       // The fourth Thursday of November.
-      (11, 22..=28) if day.weekday() == Weekday::Thu => "Thanksgiving Day",
+      (11, 22..=28) if day.weekday() == Weekday::Thursday => "Thanksgiving Day",
       _ => return,
     };
-    let mut holiday = all_day(&format!("demo-holiday_{}", day.format("%Y%m%d")), HOLIDAYS, name, day, day);
+    let mut holiday = all_day(&format!("demo-holiday_{}", day.strftime("%Y%m%d")), HOLIDAYS, name, day, day);
     holiday.can_edit = false;
     holiday.can_delete = false;
     self.events.push(holiday);
@@ -392,7 +398,7 @@ impl DemoCalendar {
       FUTURE_DAYS
     };
     for offset in 0..=days {
-      let Some(day) = first.checked_add_days(Days::new(offset)) else {
+      let Some(day) = shift(first, offset) else {
         continue;
       };
       let on = match repeat {
@@ -401,7 +407,7 @@ impl DemoCalendar {
         Repeat::Weekly => day.weekday() == first.weekday(),
         Repeat::Monthly => day.day() == first.day(),
         Repeat::Yearly => day.month() == first.month() && day.day() == first.day(),
-        Repeat::Weekdays => !matches!(day.weekday(), Weekday::Sat | Weekday::Sun),
+        Repeat::Weekdays => !matches!(day.weekday(), Weekday::Saturday | Weekday::Sunday),
       };
       if !on {
         continue;

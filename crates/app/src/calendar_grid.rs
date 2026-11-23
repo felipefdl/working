@@ -2,11 +2,11 @@
 
 use std::sync::Arc;
 
-use chrono::{Datelike, NaiveDate, Timelike};
 use gchat_core::{CalendarEvent, Micros};
 use gpui_kit::component::{h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use jiff::civil::Date;
 
 use crate::calendar::{CalendarView, TOOLBAR_HEIGHT};
 use crate::calendar_layout::{
@@ -125,7 +125,7 @@ impl CalendarView {
   }
 
   /// `+2 more` under the days with more events than lanes. A click opens the day.
-  fn more_labels(more: &[u16], days: &[NaiveDate], lanes: u16, top: f32, cx: &Context<Self>) -> Vec<AnyElement> {
+  fn more_labels(more: &[u16], days: &[Date], lanes: u16, top: f32, cx: &Context<Self>) -> Vec<AnyElement> {
     let count = f32::from(u8::try_from(days.len()).unwrap_or(u8::MAX).max(1));
     let lane = f32::from(lanes.saturating_sub(1));
     more
@@ -233,14 +233,7 @@ impl CalendarView {
   }
 
   /// One day's column of hours: the hour lines, its timed events, and the line that marks now.
-  fn day_column(
-    &self,
-    index: usize,
-    day: NaiveDate,
-    events: &Events,
-    now: Micros,
-    cx: &Context<Self>,
-  ) -> Stateful<Div> {
+  fn day_column(&self, index: usize, day: Date, events: &Events, now: Micros, cx: &Context<Self>) -> Stateful<Div> {
     let base = day_start(day);
     let lines = (0..24).map(|_| div().h(px(HOUR_HEIGHT)).flex_shrink_0().border_b_1().border_color(rgb(BORDER)));
     let mut column = div()
@@ -265,7 +258,8 @@ impl CalendarView {
     }
     if day == today() {
       let at = local(now);
-      let y = f32::from(u16::try_from(at.hour() * 60 + at.minute()).unwrap_or(0)) * HOUR_HEIGHT / 60.;
+      let minute = i16::from(at.hour()) * 60 + i16::from(at.minute());
+      let y = f32::from(u16::try_from(minute).unwrap_or(0)) * HOUR_HEIGHT / 60.;
       column = column
         .child(div().absolute().top(px(y - 1.)).left_0().right_0().h(px(2.)).bg(rgb(RED)))
         .child(
@@ -282,7 +276,7 @@ impl CalendarView {
   }
 
   /// The names and numbers of the days over their columns. A click opens the day.
-  fn day_heads(days: &[NaiveDate], cx: &Context<Self>) -> Div {
+  fn day_heads(days: &[Date], cx: &Context<Self>) -> Div {
     let now = today();
     let heads = days.iter().enumerate().map(|(index, day)| {
       let (date, is_today) = (*day, *day == now);
@@ -301,7 +295,7 @@ impl CalendarView {
             .text_size(px(11.))
             .font_weight(FontWeight::MEDIUM)
             .text_color(rgb(if is_today { ACCENT } else { MUTED }))
-            .child(day.format("%a").to_string().to_uppercase()),
+            .child(day.strftime("%a").to_string().to_uppercase()),
         )
         .child(
           div()
@@ -333,7 +327,7 @@ impl CalendarView {
       // Today: from an hour and a half before now. Another day: from the morning.
       let minute = if days.contains(&today()) {
         let at = local(now);
-        u16::try_from(at.hour() * 60 + at.minute()).unwrap_or(0)
+        u16::try_from(i16::from(at.hour()) * 60 + i16::from(at.minute())).unwrap_or(0)
       } else {
         9 * 60
       };
@@ -397,20 +391,13 @@ impl CalendarView {
   // Month.
 
   /// One week of the Month view: its seven cells, and its events in lanes over them.
-  fn week_row(
-    &self,
-    index: usize,
-    week: &[NaiveDate],
-    lanes: u16,
-    events: &Events,
-    cx: &Context<Self>,
-  ) -> Stateful<Div> {
+  fn week_row(&self, index: usize, week: &[Date], lanes: u16, events: &Events, cx: &Context<Self>) -> Stateful<Div> {
     let (now, month) = (today(), self.anchor.month());
     let placed = row(events, week, lanes, true);
     let cells = week.iter().enumerate().map(|(column, day)| {
       let (date, is_today) = (*day, *day == now);
       let label = if day.day() == 1 {
-        day.format("%b %-d").to_string()
+        day.strftime("%b %-d").to_string()
       } else {
         day.day().to_string()
       };
@@ -483,7 +470,7 @@ impl CalendarView {
           .text_size(px(11.))
           .font_weight(FontWeight::MEDIUM)
           .text_color(rgb(MUTED))
-          .child(day.format("%a").to_string().to_uppercase())
+          .child(day.strftime("%a").to_string().to_uppercase())
       }))
     });
     let rows: Vec<Stateful<Div>> = weeks
@@ -497,7 +484,7 @@ impl CalendarView {
   // Year.
 
   pub(crate) fn year_view(&self, cx: &mut Context<Self>) -> AnyElement {
-    let first = NaiveDate::from_ymd_opt(self.anchor.year(), 1, 1).unwrap_or(self.anchor);
+    let first = self.anchor.first_of_year();
     let marks = busy_days(&self.events);
     let mut months = h_flex().flex_wrap().items_start().justify_center().gap_x_8().gap_y_4().p_6();
     for index in 0..12_u8 {
@@ -523,7 +510,7 @@ impl CalendarView {
                 this.anchor = month;
                 this.set_mode(Mode::Month, cx);
               }))
-              .child(month.format("%B").to_string()),
+              .child(month.strftime("%B").to_string()),
           )
           .child(self.mini_month(month, slot, Some(&marks), cx)),
       );
@@ -639,7 +626,7 @@ impl CalendarView {
             .text_size(px(11.))
             .font_weight(FontWeight::MEDIUM)
             .text_color(rgb(if is_today { ACCENT } else { MUTED }))
-            .child(day.format("%b, %a").to_string().to_uppercase()),
+            .child(day.strftime("%b, %a").to_string().to_uppercase()),
         );
       let lines = held.into_iter().filter_map(|event| self.agenda_event(&events, event, now, cx));
       list = list.child(

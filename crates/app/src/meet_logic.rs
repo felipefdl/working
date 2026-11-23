@@ -1,8 +1,8 @@
 //! What the Meet view accepts and lists, as plain code: the link a Join field's text names, the meetings of a day with
 //! their times, and how a date reads. No GPUI here.
 
-use chrono::NaiveDate;
 use gchat_core::{CalendarEvent, Micros, Rsvp};
+use jiff::civil::Date;
 
 use crate::calendar_layout::{Mode, add_days, days, event_days, local, range, sub_days};
 
@@ -81,7 +81,7 @@ pub struct Meeting {
 
 /// `1:45 PM`, or `13:45` when `h24`: a clock time as Meet writes it.
 fn clock(time: Micros, h24: bool) -> String {
-  crate::util::clock_text(local(time), h24)
+  crate::util::clock_text(&local(time), h24)
 }
 
 fn time_text(event: &CalendarEvent, h24: bool) -> String {
@@ -94,7 +94,7 @@ fn time_text(event: &CalendarEvent, h24: bool) -> String {
 
 /// Whether `event` is a meeting to list on `day`: it is on that day, the user did not decline it, and its calendar is
 /// not one of `hidden`.
-fn is_listed(event: &CalendarEvent, day: NaiveDate, hidden: &[String]) -> bool {
+fn is_listed(event: &CalendarEvent, day: Date, hidden: &[String]) -> bool {
   let (first, last) = event_days(event);
   let on_day = first <= day && day <= last;
   on_day && event.my_rsvp != Some(Rsvp::Declined) && !hidden.contains(&event.calendar_id)
@@ -103,7 +103,7 @@ fn is_listed(event: &CalendarEvent, day: NaiveDate, hidden: &[String]) -> bool {
 /// The meetings of `day` among `events`: those with a Meet link, except the ones the user declined and the ones of a
 /// calendar in `hidden`. All-day meetings come first, then the others by start. Times are on a 24-hour clock when
 /// `h24`.
-pub fn meetings_on(events: &[CalendarEvent], day: NaiveDate, hidden: &[String], h24: bool) -> Vec<Meeting> {
+pub fn meetings_on(events: &[CalendarEvent], day: Date, hidden: &[String], h24: bool) -> Vec<Meeting> {
   let mut listed: Vec<(&CalendarEvent, &str)> = events
     .iter()
     .filter(|event| is_listed(event, day, hidden))
@@ -124,12 +124,12 @@ pub fn meetings_on(events: &[CalendarEvent], day: NaiveDate, hidden: &[String], 
 }
 
 /// `Fri, Nov 13`.
-fn date_label(day: NaiveDate) -> String {
-  day.format("%a, %b %-d").to_string()
+fn date_label(day: Date) -> String {
+  day.strftime("%a, %b %-d").to_string()
 }
 
 /// What the list says when `day` has no meetings: `today` is the day on the calendar now.
-pub fn empty_title(day: NaiveDate, today: NaiveDate) -> String {
+pub fn empty_title(day: Date, today: Date) -> String {
   if day == today {
     "No meetings scheduled for today".into()
   } else {
@@ -138,12 +138,12 @@ pub fn empty_title(day: NaiveDate, today: NaiveDate) -> String {
 }
 
 /// The days of the week strip that shows `day`, Sunday first.
-pub fn week_of(day: NaiveDate) -> Vec<NaiveDate> {
+pub fn week_of(day: Date) -> Vec<Date> {
   days(Mode::Week, day)
 }
 
 /// The day the week arrows go to: the same weekday of the next week, or of the one before.
-pub fn shift_week(day: NaiveDate, forward: bool) -> NaiveDate {
+pub fn shift_week(day: Date, forward: bool) -> Date {
   if forward {
     add_days(day, 7)
   } else {
@@ -152,7 +152,7 @@ pub fn shift_week(day: NaiveDate, forward: bool) -> NaiveDate {
 }
 
 /// The time to ask the core for to list `day`: from its first moment to the first one of the day after.
-pub fn day_range(day: NaiveDate) -> (Micros, Micros) {
+pub fn day_range(day: Date) -> (Micros, Micros) {
   range(Mode::Day, day)
 }
 
@@ -163,8 +163,8 @@ mod tests {
   use super::*;
   use crate::calendar_layout::{HOUR, MINUTE, day_start};
 
-  fn date(year: i32, month: u32, day: u32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(year, month, day).expect("a date")
+  fn date(year: i16, month: i8, day: i8) -> Date {
+    Date::new(year, month, day).expect("a date")
   }
 
   /// The link of the meeting `path` names.
@@ -173,7 +173,7 @@ mod tests {
   }
 
   /// A timed event of calendar `c` on `day`, from and to `(hour, minute)` after midnight, with a Meet link.
-  fn meeting(day: NaiveDate, from: (i64, i64), to: (i64, i64), title: &str) -> CalendarEvent {
+  fn meeting(day: Date, from: (i64, i64), to: (i64, i64), title: &str) -> CalendarEvent {
     let base = day_start(day);
     CalendarEvent {
       id: format!("e-{title}"),
@@ -312,7 +312,7 @@ mod tests {
     let day = date(2026, 11, 13);
     // From eleven at night to one in the morning.
     let overnight = meeting(day, (23, 0), (25, 0), "overnight");
-    let listed_on = |on_day: NaiveDate| meetings_on(std::slice::from_ref(&overnight), on_day, &[], false);
+    let listed_on = |on_day: Date| meetings_on(std::slice::from_ref(&overnight), on_day, &[], false);
     assert_eq!(titles(&listed_on(day)), ["overnight"]);
     assert_eq!(titles(&listed_on(add_days(day, 1))), ["overnight"]);
     assert_eq!(titles(&listed_on(add_days(day, 2))), [] as [&str; 0]);

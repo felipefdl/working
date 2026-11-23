@@ -190,7 +190,7 @@ fn log_refusal(cookie_path: &std::path::Path, who: &str) {
     .map_or_else(|| "at an unknown time".to_string(), |age| format!("{} s before", age.as_secs()));
   let line = format!(
     "{} {who} refused the session; the session file was written {written}\n",
-    chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+    jiff::ZonedDateTime::now().strftime("%Y-%m-%d %H:%M:%S")
   );
   tracing::warn!("{}", line.trim_end());
   let log = std::fs::OpenOptions::new()

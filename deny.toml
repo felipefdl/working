@@ -22,9 +22,6 @@ ignore = [
   # gtk3-rs is archived and pins glib 0.18; the fix is in glib 0.20, which no GTK 3 binding uses. Drop this when
   # wry moves to GTK 4.
   { id = "RUSTSEC-2024-0429", reason = "glib 0.18.5 is pinned by gtk3-rs 0.18 through lb-wry and webkit2gtk on Linux; VariantStrIter is unused" },
-  # chrono is soft-deprecated; gpui-kit is moving to jiff and this workspace follows it. Drop this with the migration
-  # (AGENTS.md, Automatic to-dos).
-  { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained, not vulnerable; the workspace moves to jiff together with gpui-kit" },
 ]
 yanked = "deny"
 unmaintained = "workspace"

@@ -3,8 +3,9 @@
 
 use std::collections::HashSet;
 
-use chrono::{DateTime, Datelike, Days, Local, Months, NaiveDate, TimeZone, Timelike};
 use gchat_core::{CalendarEvent, Micros, boundary_date, local_midnight};
+use jiff::civil::Date;
+use jiff::{Span, Timestamp, ZonedDateTime};
 use serde::{Deserialize, Serialize};
 
 pub const MINUTE: Micros = 60_000_000;
@@ -73,56 +74,65 @@ pub fn whole(value: f32) -> u16 {
   value.clamp(0., f32::from(u16::MAX)) as u16
 }
 
-pub fn today() -> NaiveDate {
-  Local::now().date_naive()
+pub fn today() -> Date {
+  ZonedDateTime::now().date()
 }
 
 pub fn now_micros() -> Micros {
-  Local::now().timestamp_micros()
+  Timestamp::now().as_microsecond()
 }
 
-pub fn local(time: Micros) -> DateTime<Local> {
-  Local.timestamp_micros(time).single().unwrap_or_else(Local::now)
+pub fn local(time: Micros) -> ZonedDateTime {
+  gchat_core::local_time(time).unwrap_or_else(ZonedDateTime::now)
 }
 
-pub fn date_of(time: Micros) -> NaiveDate {
-  local(time).date_naive()
+pub fn date_of(time: Micros) -> Date {
+  local(time).date()
 }
 
 /// Local midnight at the start of `date`.
-pub fn day_start(date: NaiveDate) -> Micros {
+pub fn day_start(date: Date) -> Micros {
   local_midnight(date).unwrap_or_default()
 }
 
-pub fn add_days(date: NaiveDate, days: u64) -> NaiveDate {
-  date.checked_add_days(Days::new(days)).unwrap_or(date)
+/// `date` moved by `days` either way, none past the ends of the calendar.
+fn shift(date: Date, days: i64) -> Option<Date> {
+  date.checked_add(Span::new().try_days(days).ok()?).ok()
 }
 
-pub fn sub_days(date: NaiveDate, days: u64) -> NaiveDate {
-  date.checked_sub_days(Days::new(days)).unwrap_or(date)
+pub fn add_days(date: Date, days: u64) -> Date {
+  i64::try_from(days).ok().and_then(|days| shift(date, days)).unwrap_or(date)
+}
+
+pub fn sub_days(date: Date, days: u64) -> Date {
+  i64::try_from(days).ok().and_then(|days| shift(date, -days)).unwrap_or(date)
 }
 
 /// The Sunday on or before `date`.
-pub fn week_start(date: NaiveDate) -> NaiveDate {
-  sub_days(date, u64::from(date.weekday().num_days_from_sunday()))
+pub fn week_start(date: Date) -> Date {
+  shift(date, -i64::from(date.weekday().to_sunday_zero_offset())).unwrap_or(date)
 }
 
-pub fn month_start(date: NaiveDate) -> NaiveDate {
-  date.with_day(1).unwrap_or(date)
+pub fn month_start(date: Date) -> Date {
+  date.first_of_month()
 }
 
-/// `date` moved by whole months, on the same day when that month has it.
-pub fn add_months(date: NaiveDate, months: u32, forward: bool) -> NaiveDate {
-  let moved = if forward {
-    date.checked_add_months(Months::new(months))
+/// `date` moved by whole months, on the same day when that month has it, else on its last day.
+pub fn add_months(date: Date, months: u32, forward: bool) -> Date {
+  let months = if forward {
+    i64::from(months)
   } else {
-    date.checked_sub_months(Months::new(months))
+    -i64::from(months)
   };
-  moved.unwrap_or(date)
+  Span::new()
+    .try_months(months)
+    .ok()
+    .and_then(|span| date.checked_add(span).ok())
+    .unwrap_or(date)
 }
 
 /// The weeks a month's grid shows: whole weeks from the Sunday on or before the 1st through the month's last day.
-pub fn month_weeks(anchor: NaiveDate) -> Vec<Vec<NaiveDate>> {
+pub fn month_weeks(anchor: Date) -> Vec<Vec<Date>> {
   let first = month_start(anchor);
   let next = add_months(first, 1, true);
   let mut weeks = Vec::new();
@@ -135,8 +145,8 @@ pub fn month_weeks(anchor: NaiveDate) -> Vec<Vec<NaiveDate>> {
 }
 
 /// The days a view shows, in order. The Year view answers its whole year.
-pub fn days(mode: Mode, anchor: NaiveDate) -> Vec<NaiveDate> {
-  let run = |first: NaiveDate, count: u64| (0..count).map(|offset| add_days(first, offset)).collect();
+pub fn days(mode: Mode, anchor: Date) -> Vec<Date> {
+  let run = |first: Date, count: u64| (0..count).map(|offset| add_days(first, offset)).collect();
   match mode {
     Mode::Day => vec![anchor],
     Mode::FourDays => run(anchor, 4),
@@ -144,15 +154,15 @@ pub fn days(mode: Mode, anchor: NaiveDate) -> Vec<NaiveDate> {
     Mode::Month => month_weeks(anchor).into_iter().flatten().collect(),
     Mode::Schedule => run(anchor, SCHEDULE_DAYS),
     Mode::Year => {
-      let first = NaiveDate::from_ymd_opt(anchor.year(), 1, 1).unwrap_or(anchor);
-      let count = if first.leap_year() { 366 } else { 365 };
+      let first = anchor.first_of_year();
+      let count = if first.in_leap_year() { 366 } else { 365 };
       run(first, count)
     },
   }
 }
 
 /// The time a view covers: from the start of its first day to the end of its last.
-pub fn range(mode: Mode, anchor: NaiveDate) -> (Micros, Micros) {
+pub fn range(mode: Mode, anchor: Date) -> (Micros, Micros) {
   let days = days(mode, anchor);
   let first = days.first().copied().unwrap_or(anchor);
   let last = days.last().copied().unwrap_or(anchor);
@@ -160,7 +170,7 @@ pub fn range(mode: Mode, anchor: NaiveDate) -> (Micros, Micros) {
 }
 
 /// The date the previous or next button goes to.
-pub fn step(mode: Mode, anchor: NaiveDate, forward: bool) -> NaiveDate {
+pub fn step(mode: Mode, anchor: Date, forward: bool) -> Date {
   let by_days = |days: u64| {
     if forward {
       add_days(anchor, days)
@@ -178,22 +188,22 @@ pub fn step(mode: Mode, anchor: NaiveDate, forward: bool) -> NaiveDate {
 }
 
 /// `November 2026`, or `Nov – Dec 2026` and `Dec 2026 – Jan 2027` for days in two months.
-fn months_title(first: NaiveDate, last: NaiveDate) -> String {
+fn months_title(first: Date, last: Date) -> String {
   if (first.year(), first.month()) == (last.year(), last.month()) {
-    first.format("%B %Y").to_string()
+    first.strftime("%B %Y").to_string()
   } else if first.year() == last.year() {
-    format!("{} – {}", first.format("%b"), last.format("%b %Y"))
+    format!("{} – {}", first.strftime("%b"), last.strftime("%b %Y"))
   } else {
-    format!("{} – {}", first.format("%b %Y"), last.format("%b %Y"))
+    format!("{} – {}", first.strftime("%b %Y"), last.strftime("%b %Y"))
   }
 }
 
 /// What the toolbar names the time on screen.
-pub fn title(mode: Mode, anchor: NaiveDate) -> String {
+pub fn title(mode: Mode, anchor: Date) -> String {
   match mode {
-    Mode::Day => anchor.format("%B %-d, %Y").to_string(),
-    Mode::Month => anchor.format("%B %Y").to_string(),
-    Mode::Year => anchor.format("%Y").to_string(),
+    Mode::Day => anchor.strftime("%B %-d, %Y").to_string(),
+    Mode::Month => anchor.strftime("%B %Y").to_string(),
+    Mode::Year => anchor.strftime("%Y").to_string(),
     Mode::Week | Mode::FourDays | Mode::Schedule => {
       let days = days(mode, anchor);
       months_title(days.first().copied().unwrap_or(anchor), days.last().copied().unwrap_or(anchor))
@@ -207,7 +217,7 @@ pub const fn is_banner(event: &CalendarEvent) -> bool {
 }
 
 /// The first and the last day an event touches. An event that ends at midnight does not touch the day after.
-pub fn event_days(event: &CalendarEvent) -> (NaiveDate, NaiveDate) {
+pub fn event_days(event: &CalendarEvent) -> (Date, Date) {
   if event.all_day {
     let first = boundary_date(event.start).unwrap_or_else(|| date_of(event.start));
     let after = boundary_date(event.end).unwrap_or(first);
@@ -235,7 +245,7 @@ fn minute_of(time: Micros, day: Micros) -> u16 {
 }
 
 /// The timed events of `day`, laid out so that overlapping ones sit side by side.
-pub fn day_blocks(events: &[CalendarEvent], day: NaiveDate) -> Vec<Block> {
+pub fn day_blocks(events: &[CalendarEvent], day: Date) -> Vec<Block> {
   let (from, until) = (day_start(day), day_start(add_days(day, 1)));
   let mut blocks: Vec<Block> = events
     .iter()
@@ -317,16 +327,16 @@ pub struct Row {
 
 /// Places the events of a row of consecutive `days` in at most `lanes` lanes. With `timed` off, only the all-day
 /// strip's events are placed. A day with more events than lanes keeps its last lane to say how many more.
-pub fn row(events: &[CalendarEvent], days: &[NaiveDate], lanes: u16, timed: bool) -> Row {
+pub fn row(events: &[CalendarEvent], days: &[Date], lanes: u16, timed: bool) -> Row {
   let (Some(first_day), Some(last_day)) = (days.first().copied(), days.last().copied()) else {
     return Row::default();
   };
-  let column = |date: NaiveDate| {
-    let offset = (date.max(first_day) - first_day).num_days();
+  let column = |date: Date| {
+    let offset = date.max(first_day).since(first_day).map_or(i32::MAX, |span| span.get_days());
     u8::try_from(offset).unwrap_or(u8::MAX)
   };
   // Bars first, the longer ones on top, then the timed events in order.
-  let mut picks: Vec<(usize, NaiveDate, NaiveDate, bool)> = events
+  let mut picks: Vec<(usize, Date, Date, bool)> = events
     .iter()
     .enumerate()
     .filter(|(_, event)| timed || is_banner(event))
@@ -431,7 +441,7 @@ pub fn row(events: &[CalendarEvent], days: &[NaiveDate], lanes: u16, timed: bool
 }
 
 /// The days of `days` that have an event, for the Year view's marks.
-pub fn busy_days(events: &[CalendarEvent]) -> HashSet<NaiveDate> {
+pub fn busy_days(events: &[CalendarEvent]) -> HashSet<Date> {
   let mut busy = HashSet::new();
   for event in events {
     let (first, last) = event_days(event);
@@ -446,7 +456,7 @@ pub fn busy_days(events: &[CalendarEvent]) -> HashSet<NaiveDate> {
 
 /// The events of each day from `first`, for the Schedule view: only days that have one, an event that spans days on
 /// each of them, all-day ones first.
-pub fn agenda(events: &[CalendarEvent], days: &[NaiveDate]) -> Vec<(NaiveDate, Vec<usize>)> {
+pub fn agenda(events: &[CalendarEvent], days: &[Date]) -> Vec<(Date, Vec<usize>)> {
   days
     .iter()
     .filter_map(|day| {
@@ -474,11 +484,11 @@ pub fn clock(time: Micros) -> String {
 fn clock_with(time: Micros, h24: bool) -> String {
   let at = local(time);
   if h24 {
-    at.format("%-H:%M").to_string()
+    at.strftime("%-H:%M").to_string()
   } else if at.minute() == 0 {
-    at.format("%-I%P").to_string()
+    at.strftime("%-I%P").to_string()
   } else {
-    at.format("%-I:%M%P").to_string()
+    at.strftime("%-I:%M%P").to_string()
   }
 }
 
@@ -530,25 +540,25 @@ fn when_line_with(event: &CalendarEvent, h24: bool) -> String {
   let (first, last) = event_days(event);
   if event.all_day {
     if first == last {
-      return first.format("%A, %B %-d").to_string();
+      return first.strftime("%A, %B %-d").to_string();
     }
     if (first.year(), first.month()) == (last.year(), last.month()) {
-      return format!("{} – {}", first.format("%b %-d"), last.format("%-d, %Y"));
+      return format!("{} – {}", first.strftime("%b %-d"), last.strftime("%-d, %Y"));
     }
-    return format!("{} – {}", first.format("%b %-d"), last.format("%b %-d, %Y"));
+    return format!("{} – {}", first.strftime("%b %-d"), last.strftime("%b %-d, %Y"));
   }
   if first == last {
     return format!(
       "{} ⋅ {}",
-      first.format("%A, %B %-d"),
+      first.strftime("%A, %B %-d"),
       clock_range_with(event.start, event.end, h24)
     );
   }
   format!(
     "{}, {} – {}, {}",
-    first.format("%b %-d"),
+    first.strftime("%b %-d"),
     clock_with(event.start, h24),
-    last.format("%b %-d"),
+    last.strftime("%b %-d"),
     clock_with(event.end, h24)
   )
 }
@@ -570,11 +580,11 @@ mod tests {
 
   use super::*;
 
-  fn date(year: i32, month: u32, day: u32) -> NaiveDate {
-    NaiveDate::from_ymd_opt(year, month, day).expect("a date")
+  fn date(year: i16, month: i8, day: i8) -> Date {
+    Date::new(year, month, day).expect("a date")
   }
 
-  fn timed(day: NaiveDate, from: (i64, i64), to: (i64, i64)) -> CalendarEvent {
+  fn timed(day: Date, from: (i64, i64), to: (i64, i64)) -> CalendarEvent {
     let base = day_start(day);
     CalendarEvent {
       id: format!("e-{}-{}", from.0, from.1),
@@ -602,7 +612,7 @@ mod tests {
     }
   }
 
-  fn whole(first: NaiveDate, last: NaiveDate) -> CalendarEvent {
+  fn whole(first: Date, last: Date) -> CalendarEvent {
     CalendarEvent {
       start: day_start(first),
       end: day_start(add_days(last, 1)),

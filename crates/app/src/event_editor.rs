@@ -6,7 +6,6 @@
   reason = "one dialog with a field per event property"
 )]
 
-use chrono::{Days, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
 use gchat_core::fuzzy::Fuzzy;
 use gchat_core::{
   Calendar, CalendarEvent, Command, EVENT_COLORS, EditScope, EventDraft, EventKind, Micros, Reminder, Repeat, User,
@@ -18,6 +17,7 @@ use gpui_kit::component::time_field::{HourCycle, TimeField, TimeFieldEvent, Time
 use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use jiff::civil::{self, Date, Time};
 
 use crate::calendar_layout::{day_start, event_days, local};
 use crate::conv_list::hint;
@@ -73,8 +73,8 @@ pub struct EventEditor {
   start_time: Entity<TimeFieldState>,
   end_time: Entity<TimeFieldState>,
   /// Local start and end. All-day: only the dates count, and `end` is the last day.
-  start: NaiveDateTime,
-  end: NaiveDateTime,
+  start: civil::DateTime,
+  end: civil::DateTime,
   all_day: bool,
   repeat: Repeat,
   add_meet: bool,
@@ -94,16 +94,13 @@ pub struct EventEditor {
 
 impl EventEmitter<EditorEvent> for EventEditor {}
 
-fn naive(time: Micros) -> NaiveDateTime {
-  local(time).naive_local()
+fn naive(time: Micros) -> civil::DateTime {
+  local(time).datetime()
 }
 
 /// A local date and time as an instant; the first one when a clock change repeats it, the one after when it skips it.
-fn instant(time: NaiveDateTime) -> Micros {
-  Local
-    .from_local_datetime(&time)
-    .earliest()
-    .map_or_else(|| day_start(time.date()), |at| at.timestamp_micros())
+fn instant(time: civil::DateTime) -> Micros {
+  gchat_core::local_instant(time).unwrap_or_else(|| day_start(time.date()))
 }
 
 const fn repeat_label(repeat: Repeat) -> &'static str {
@@ -195,12 +192,12 @@ impl EventEditor {
     let (start, end) = if all_day {
       let (first, last) = held.map_or_else(
         || {
-          let first = local(start).date_naive();
-          (first, local(end - 1).date_naive().max(first))
+          let first = local(start).date();
+          (first, local(end - 1).date().max(first))
         },
         event_days,
       );
-      (first.and_time(NaiveTime::MIN), last.and_time(NaiveTime::MIN))
+      (first.to_datetime(Time::midnight()), last.to_datetime(Time::midnight()))
     } else {
       (naive(start), naive(end))
     };
@@ -220,7 +217,7 @@ impl EventEditor {
       let value = event.description.clone();
       description.update(cx, |state, cx| state.set_value(value, window, cx));
     }
-    let date = |date: NaiveDate, window: &mut Window, cx: &mut Context<Self>| {
+    let date = |date: Date, window: &mut Window, cx: &mut Context<Self>| {
       cx.new(|cx| {
         let mut state = DatePickerState::new(window, cx).date_format("%a, %b %-d, %Y");
         state.set_date(date, window, cx);
@@ -232,7 +229,7 @@ impl EventEditor {
     } else {
       HourCycle::H12
     };
-    let time = |time: NaiveTime, window: &mut Window, cx: &mut Context<Self>| {
+    let time = |time: Time, window: &mut Window, cx: &mut Context<Self>| {
       cx.new(|cx| {
         let mut state = TimeFieldState::new(window, cx).hour_cycle(cycle);
         state.set_time(time, window, cx);
@@ -257,23 +254,23 @@ impl EventEditor {
         let DatePickerEvent::Change(DateTime::Single(Some(picked))) = event else {
           return;
         };
-        this.set_start(picked.date().and_time(this.start.time()), window, cx);
+        this.set_start(picked.date().to_datetime(this.start.time()), window, cx);
       }),
       cx.subscribe_in(&end_date, window, |this, _, event: &DatePickerEvent, _, cx| {
         let DatePickerEvent::Change(DateTime::Single(Some(picked))) = event else {
           return;
         };
-        this.end = picked.date().and_time(this.end.time());
+        this.end = picked.date().to_datetime(this.end.time());
         this.error = None;
         cx.notify();
       }),
       cx.subscribe_in(&start_time, window, |this, _, event: &TimeFieldEvent, window, cx| {
         let TimeFieldEvent::Change(picked) = event;
-        this.set_start(this.start.date().and_time(*picked), window, cx);
+        this.set_start(this.start.date().to_datetime(*picked), window, cx);
       }),
       cx.subscribe_in(&end_time, window, |this, _, event: &TimeFieldEvent, _, cx| {
         let TimeFieldEvent::Change(picked) = event;
-        this.end = this.end.date().and_time(*picked);
+        this.end = this.end.date().to_datetime(*picked);
         this.error = None;
         cx.notify();
       }),
@@ -329,10 +326,10 @@ impl EventEditor {
   }
 
   /// Moves the start, and the end with it so the event keeps its length.
-  fn set_start(&mut self, start: NaiveDateTime, window: &mut Window, cx: &mut Context<Self>) {
-    let length = self.end - self.start;
+  fn set_start(&mut self, start: civil::DateTime, window: &mut Window, cx: &mut Context<Self>) {
+    let length = self.end.duration_since(self.start);
     self.start = start;
-    self.end = start + length;
+    self.end = start.saturating_add(length);
     let end = self.end;
     self.end_date.update(cx, |state, cx| state.set_date(end.date(), window, cx));
     self.end_time.update(cx, |state, cx| state.set_time(end.time(), window, cx));
@@ -349,11 +346,11 @@ impl EventEditor {
       self.busy = !on;
     }
     // Back to a timed event: an hour from nine, on the days it had.
-    if !on && self.start.time() == NaiveTime::MIN && self.end.time() == NaiveTime::MIN {
-      let nine = NaiveTime::from_hms_opt(9, 0, 0).unwrap_or(NaiveTime::MIN);
-      let ten = NaiveTime::from_hms_opt(10, 0, 0).unwrap_or(NaiveTime::MIN);
-      self.start = self.start.date().and_time(nine);
-      self.end = self.end.date().and_time(ten);
+    if !on && self.start.time() == Time::midnight() && self.end.time() == Time::midnight() {
+      let nine = Time::constant(9, 0, 0, 0);
+      let ten = Time::constant(10, 0, 0, 0);
+      self.start = self.start.date().to_datetime(nine);
+      self.end = self.end.date().to_datetime(ten);
       self.start_time.update(cx, |state, cx| state.set_time(nine, window, cx));
       self.end_time.update(cx, |state, cx| state.set_time(ten, window, cx));
     }
@@ -396,11 +393,7 @@ impl EventEditor {
       return;
     }
     let (start, end) = if self.all_day {
-      let after = self
-        .end
-        .date()
-        .checked_add_days(Days::new(1))
-        .unwrap_or_else(|| self.end.date());
+      let after = self.end.date().tomorrow().unwrap_or_else(|_| self.end.date());
       (day_start(self.start.date()), day_start(after))
     } else {
       (instant(self.start), instant(self.end))

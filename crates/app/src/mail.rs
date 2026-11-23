@@ -917,7 +917,7 @@ fn find_thread<'a>(mail: &'a MailData, mailbox: &Mailbox, id: &str) -> Option<&'
 
 /// When an email arrived, in full: `Today, 1:50 PM`, `Tuesday, Nov 3, 9:05 AM`.
 fn full_time(time: gchat_core::Micros) -> String {
-  let clock = util::clock_text(util::local(time), crate::clock::is_24_hour());
+  let clock = util::clock_text(&util::local(time), crate::clock::is_24_hour());
   format!("{}, {clock}", util::date_label(time))
 }
 

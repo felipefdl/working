@@ -3,10 +3,11 @@
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::{Datelike, Local};
 use gchat_core::{Command, Connection, Core, DndFor, MyStatus, Presence};
 use gpui_kit::component::input::{Input, InputState};
 use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
+use jiff::civil::{Date, Time};
+use jiff::{ToSpan as _, ZonedDateTime};
 
 use gpui_kit::*;
 
@@ -459,31 +460,20 @@ pub fn now_usec() -> i64 {
   SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_micros() as i64)
 }
 
+/// Local midnight at the start of `day`, or now when a clock change skips it.
+fn midnight_usec(day: Date) -> i64 {
+  gchat_core::local_instant(day.to_datetime(Time::midnight())).unwrap_or_else(now_usec)
+}
+
 fn end_of_today_usec() -> i64 {
-  let now = Local::now();
-  let Some(tomorrow) = now.date_naive().succ_opt() else {
-    return now_usec();
-  };
-  let Some(midnight) = tomorrow.and_hms_opt(0, 0, 0) else {
-    return now_usec();
-  };
-  midnight
-    .and_local_timezone(Local)
-    .earliest()
-    .map_or_else(now_usec, |time| time.timestamp_micros())
+  ZonedDateTime::now()
+    .date()
+    .tomorrow()
+    .map_or_else(|_| now_usec(), midnight_usec)
 }
 
 fn end_of_week_usec() -> i64 {
-  let now = Local::now();
-  let days = 8 - i64::from(now.weekday().number_from_monday());
-  let Some(day) = now.date_naive().checked_add_days(chrono::Days::new(days as u64)) else {
-    return now_usec();
-  };
-  let Some(midnight) = day.and_hms_opt(0, 0, 0) else {
-    return now_usec();
-  };
-  midnight
-    .and_local_timezone(Local)
-    .earliest()
-    .map_or_else(now_usec, |time| time.timestamp_micros())
+  let now = ZonedDateTime::now();
+  let days = 8 - i64::from(now.weekday().to_monday_one_offset());
+  now.date().checked_add(days.days()).map_or_else(|_| now_usec(), midnight_usec)
 }

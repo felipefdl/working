@@ -1,11 +1,17 @@
 //! Small pure helpers: time formatting, initials, avatar colors, fuzzy matching.
 
-use chrono::{DateTime, Datelike, Duration, Local, TimeZone};
 use gchat_core::Micros;
 use gpui_kit::{Hsla, hsla};
+use jiff::civil::{Date, Time};
+use jiff::{SignedDuration, ZonedDateTime};
 
-pub fn local(t: Micros) -> DateTime<Local> {
-  Local.timestamp_micros(t).single().unwrap_or_else(Local::now)
+pub fn local(t: Micros) -> ZonedDateTime {
+  gchat_core::local_time(t).unwrap_or_else(ZonedDateTime::now)
+}
+
+/// The local date a day (24 hours) before `now`.
+fn day_before(now: &ZonedDateTime) -> Date {
+  (now - SignedDuration::from_hours(24)).date()
 }
 
 /// `now`, `4 min`, `11:22 AM` (`11:22` on a 24-hour clock), `Yesterday`, `Nov 3`.
@@ -13,80 +19,76 @@ pub fn rel_time(t: Micros) -> String {
   if t <= 0 {
     return String::new();
   }
-  let now = Local::now();
+  let now = ZonedDateTime::now();
   let then = local(t);
-  let secs = (now - then).num_seconds();
+  let secs = now.duration_since(&then).as_secs();
   if secs < 60 {
     return "now".into();
   }
   if secs < 3600 {
     return format!("{} min", secs / 60);
   }
-  if then.date_naive() == now.date_naive() {
-    return clock_text(then, crate::clock::is_24_hour());
+  if then.date() == now.date() {
+    return clock_text(&then, crate::clock::is_24_hour());
   }
-  if then.date_naive() == (now - Duration::days(1)).date_naive() {
+  if then.date() == day_before(&now) {
     return "Yesterday".into();
   }
   if then.year() == now.year() {
-    then.format("%b %-d").to_string()
+    then.strftime("%b %-d").to_string()
   } else {
-    then.format("%b %-d, %Y").to_string()
+    then.strftime("%b %-d, %Y").to_string()
   }
 }
 
 /// Time shown in a message header: minutes while recent, the clock time otherwise.
 pub fn message_time(t: Micros) -> String {
-  let now = Local::now();
+  let now = ZonedDateTime::now();
   let then = local(t);
-  let secs = (now - then).num_seconds();
+  let secs = now.duration_since(&then).as_secs();
   if secs < 60 {
     "now".into()
   } else if secs < 3600 {
     format!("{} min", secs / 60)
   } else {
-    clock_text(then, crate::clock::is_24_hour())
+    clock_text(&then, crate::clock::is_24_hour())
   }
 }
 
 /// `1:50 PM`, or `13:50` when `h24`: a clock time as message headers and lists write it.
-pub fn clock_text(at: DateTime<Local>, h24: bool) -> String {
+pub fn clock_text(at: &ZonedDateTime, h24: bool) -> String {
   if h24 {
-    at.format("%-H:%M").to_string()
+    at.strftime("%-H:%M").to_string()
   } else {
-    at.format("%-I:%M %p").to_string()
+    at.strftime("%-I:%M %p").to_string()
   }
 }
 
-/// The local day of `t` as a number (`num_days_from_ce`), and the span of microseconds of that day, so the times after
-/// it on the same day need no time-zone conversion. A day whose midnight cannot be found (a time-zone change at
+/// The local day of `t` as a number (days since 0001-01-01), and the span of microseconds of that day, so the times
+/// after it on the same day need no time-zone conversion. A day whose midnight cannot be found (a time-zone change at
 /// midnight) spans `t` alone.
 pub fn day_span(t: Micros) -> (i32, std::ops::Range<Micros>) {
-  let date = local(t).date_naive();
-  let midnight = |date: chrono::NaiveDate| {
-    date
-      .and_hms_opt(0, 0, 0)
-      .and_then(|time| Local.from_local_datetime(&time).earliest())
-      .map(|time| time.timestamp_micros())
-  };
-  let span = match (midnight(date), date.succ_opt().and_then(midnight)) {
+  let date = local(t).date();
+  let midnight = |date: Date| gchat_core::local_instant(date.to_datetime(Time::midnight()));
+  let span = match (midnight(date), date.tomorrow().ok().and_then(midnight)) {
     (Some(start), Some(end)) if start <= t && t < end => start..end,
     _ => t..t.saturating_add(1),
   };
-  (date.num_days_from_ce(), span)
+  let number = date.since(Date::constant(1, 1, 1)).map_or(0, |days| days.get_days());
+  (number, span)
 }
 
 pub fn date_label(t: Micros) -> String {
-  let now = Local::now();
+  let now = ZonedDateTime::now();
   let then = local(t);
-  if then.date_naive() == now.date_naive() {
+  if then.date() == now.date() {
     "Today".into()
-  } else if then.date_naive() == (now - Duration::days(1)).date_naive() {
+  } else if then.date() == day_before(&now) {
     "Yesterday".into()
   } else if then.year() == now.year() {
-    then.format("%A, %b %-d").to_string()
+    then.strftime("%A, %b %-d").to_string()
   } else {
-    then.format("%A, %b %-d, %Y").to_string()
+    then.strftime("%A, %b %-d, %Y").to_string()
   }
 }
 
