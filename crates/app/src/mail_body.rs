@@ -204,9 +204,9 @@ impl MailView {
           .with_ipc_handler(ipc)
           .with_navigation_handler(navigate)
           .with_new_window_req_handler(new_window)
+          .with_initialization_script(mail_page::SCRIPT)
+          .with_url(PAGE_URL)
       },
-      vec![mail_page::SCRIPT],
-      Some(PAGE_URL.to_owned()),
       window,
       cx,
       move |this, web, _, cx| this.body_ready(&id, generation, web, cx),

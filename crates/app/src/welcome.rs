@@ -122,9 +122,8 @@ impl WelcomeView {
             let _ = nav_tx.send(Nav::Open(url));
             NewWindowResponse::Deny
           })
+          .with_url(LOGIN_URL)
       },
-      Vec::new(),
-      Some(LOGIN_URL.to_owned()),
       window,
       cx,
       move |this, web, window, cx| this.login_ready(web, nav_rx, window, cx),

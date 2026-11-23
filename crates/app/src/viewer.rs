@@ -635,11 +635,11 @@ impl Viewer {
           .with_ipc_handler(move |_| {
             let _ = escape_tx.send(());
           })
+          .with_initialization_script(
+            "window.addEventListener('keydown',function(e){if(e.key==='Escape'){window.ipc.postMessage('close');}},true);",
+          )
+          .with_url(url)
       },
-      vec![
-        "window.addEventListener('keydown',function(e){if(e.key==='Escape'){window.ipc.postMessage('close');}},true);",
-      ],
-      Some(url.to_owned()),
       window,
       cx,
       move |this, web, _, cx| this.preview_ready(generation, len, web, cx),

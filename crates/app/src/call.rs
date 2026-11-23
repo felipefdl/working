@@ -166,7 +166,10 @@ impl CallView {
     let separator = if url.contains('?') { '&' } else { '?' };
     let target = format!("{url}{separator}hl=en");
     webview::build(
-      move |builder| {
+      move |mut builder| {
+        for script in scripts {
+          builder = builder.with_initialization_script(script);
+        }
         #[cfg(not(target_os = "windows"))]
         let builder = builder.with_user_agent(USER_AGENT);
         builder
@@ -176,8 +179,6 @@ impl CallView {
             let _ = report_tx.send(request.into_body());
           })
       },
-      scripts,
-      None,
       window,
       cx,
       move |this, web, _, cx| this.web_ready(web, target, cx),
