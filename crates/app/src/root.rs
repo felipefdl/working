@@ -20,7 +20,9 @@ use std::cell::RefCell;
 #[cfg(not(target_os = "macos"))]
 use std::rc::Rc;
 
+use crate::about::{About, AboutEvent};
 use crate::calendar::{CalendarView, OpenCalendar};
+use crate::choice_picker::{Choice, ChoicePicker, ChoicePickerEvent};
 use crate::chrome;
 use crate::conv_list::ConvList;
 use crate::emoji_font;
@@ -52,6 +54,9 @@ actions!(
   [
     OpenSwitcher,
     OpenThemePicker,
+    OpenLayoutPicker,
+    OpenMessageStylePicker,
+    OpenAbout,
     OpenSettings,
     GoHome,
     Quit,
@@ -134,8 +139,12 @@ pub fn menus(cx: &App) -> Vec<Menu> {
     disabled: false,
   };
   let mut app = vec![
+    MenuItem::action("About Working", OpenAbout),
+    MenuItem::separator(),
     MenuItem::action("Settings...", OpenSettings),
     MenuItem::action("Color Theme…", OpenThemePicker),
+    MenuItem::action("Layout…", OpenLayoutPicker),
+    MenuItem::action("Message Style…", OpenMessageStylePicker),
     MenuItem::separator(),
   ];
   #[cfg(target_os = "macos")]
@@ -234,6 +243,9 @@ pub fn bind_menu_commands(cx: &mut App, on_main: fn(&mut App, MenuCommand)) {
   }
   bind::<OpenSettings>(cx, on_main, RootView::open_settings);
   bind::<OpenThemePicker>(cx, on_main, RootView::open_theme_picker);
+  bind::<OpenLayoutPicker>(cx, on_main, RootView::open_choice_picker::<Layout>);
+  bind::<OpenMessageStylePicker>(cx, on_main, RootView::open_choice_picker::<settings::MessageStyle>);
+  bind::<OpenAbout>(cx, on_main, RootView::open_about);
   bind::<FindInChat>(cx, on_main, RootView::find_in_chat);
   bind::<FindNext>(cx, on_main, RootView::find_next);
   bind::<FindPrevious>(cx, on_main, RootView::find_previous);
@@ -290,6 +302,14 @@ fn fill_menu(
   popup
 }
 
+/// The layout or message style picker on screen.
+struct OpenChoicePicker {
+  view: AnyView,
+  /// Puts the saved choice back on screen.
+  restore: Box<dyn Fn(&mut App)>,
+  _sub: Subscription,
+}
+
 pub struct RootView {
   store: Entity<Store>,
   sidebar: Entity<Sidebar>,
@@ -315,6 +335,8 @@ pub struct RootView {
   composer: Entity<StatusComposer>,
   switcher: Option<(Entity<Switcher>, Subscription)>,
   theme_picker: Option<(Entity<ThemePicker>, Subscription)>,
+  choice_picker: Option<OpenChoicePicker>,
+  about: Option<(Entity<About>, Subscription)>,
   settings: Option<(Entity<SettingsView>, Subscription)>,
   new_chat: Option<(Entity<NewChat>, Subscription)>,
   welcome: Option<Entity<WelcomeView>>,
@@ -478,6 +500,8 @@ impl RootView {
       composer,
       switcher: None,
       theme_picker: None,
+      choice_picker: None,
+      about: None,
       settings: None,
       new_chat: None,
       welcome: None,
@@ -545,6 +569,68 @@ impl RootView {
       this.close_theme_picker(window, cx);
     });
     self.theme_picker = Some((picker, sub));
+    cx.notify();
+  }
+
+  /// Opens the picker of a setting's choices: the layout, or the message style. One at a time.
+  fn open_choice_picker<T: Choice>(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.choice_picker.is_some() {
+      return;
+    }
+    let picker = cx.new(|cx| ChoicePicker::<T>::new(window, cx));
+    let saved = picker.read(cx).saved;
+    let sub = cx.subscribe_in(&picker, window, |this, _, event: &ChoicePickerEvent<T>, window, cx| {
+      let picked = match *event {
+        ChoicePickerEvent::Pick(value) => {
+          settings::Settings::preview(cx, |settings| value.set(settings));
+          true
+        },
+        ChoicePickerEvent::Close => false,
+      };
+      this.close_choice_picker(picked, window, cx);
+    });
+    self.choice_picker = Some(OpenChoicePicker {
+      view: picker.into(),
+      restore: Box::new(move |cx| {
+        settings::Settings::preview(cx, |settings| saved.set(settings));
+      }),
+      _sub: sub,
+    });
+    cx.notify();
+  }
+
+  /// Closes the picker: `picked` saves the choice on screen, and without a pick the saved one comes back.
+  fn close_choice_picker(&mut self, picked: bool, window: &mut Window, cx: &mut Context<Self>) {
+    let Some(picker) = self.choice_picker.take() else {
+      return;
+    };
+    if picked {
+      settings::Settings::commit(cx);
+    } else {
+      (picker.restore)(cx);
+    }
+    self.refocus(window, cx);
+    cx.notify();
+  }
+
+  fn open_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.about.is_some() {
+      return;
+    }
+    let logo = self.logo.clone();
+    let about = cx.new(|cx| About::new(logo, window, cx));
+    let sub = cx.subscribe_in(&about, window, |this, _, _: &AboutEvent, window, cx| {
+      this.close_about(window, cx)
+    });
+    self.about = Some((about, sub));
+    cx.notify();
+  }
+
+  fn close_about(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.about.take().is_none() {
+      return;
+    }
+    self.refocus(window, cx);
     cx.notify();
   }
 
@@ -975,6 +1061,10 @@ impl RootView {
       self.close_switcher(window, cx);
     } else if self.theme_picker.is_some() {
       self.close_theme_picker(window, cx);
+    } else if self.choice_picker.is_some() {
+      self.close_choice_picker(false, window, cx);
+    } else if self.about.is_some() {
+      self.close_about(window, cx);
     } else if self.overlay.is_some() {
       self.close_overlay(window, cx);
     } else if self.meet.update(cx, |meet, cx| meet.dismiss(window, cx)) {
@@ -1009,6 +1099,8 @@ impl RootView {
       || self.text_panel.read(cx).is_open()
       || self.switcher.is_some()
       || self.theme_picker.is_some()
+      || self.choice_picker.is_some()
+      || self.about.is_some()
       || self.new_chat.is_some()
       || self.calendar.read(cx).has_modal()
   }
@@ -1451,6 +1543,11 @@ impl Render for RootView {
       .when(self.resizing.is_some(), |root| root.cursor(CursorStyle::ResizeLeftRight))
       .on_action(cx.listener(|this, _: &OpenSwitcher, window, cx| this.open_switcher(window, cx)))
       .on_action(cx.listener(|this, _: &OpenThemePicker, window, cx| this.open_theme_picker(window, cx)))
+      .on_action(cx.listener(|this, _: &OpenLayoutPicker, window, cx| this.open_choice_picker::<Layout>(window, cx)))
+      .on_action(cx.listener(|this, _: &OpenMessageStylePicker, window, cx| {
+        this.open_choice_picker::<settings::MessageStyle>(window, cx);
+      }))
+      .on_action(cx.listener(|this, _: &OpenAbout, window, cx| this.open_about(window, cx)))
       .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
       .on_action(cx.listener(|this, _: &OpenNotificationSettings, window, cx| this.open_settings_at(true, window, cx)))
       .on_action(cx.listener(|this, _: &GoHome, window, cx| this.go_home(window, cx)))
@@ -1504,6 +1601,8 @@ impl Render for RootView {
       )
       .children(self.switcher.as_ref().map(|(switcher, _)| switcher.clone()))
       .children(self.theme_picker.as_ref().map(|(picker, _)| picker.clone()))
+      .children(self.choice_picker.as_ref().map(|picker| picker.view.clone()))
+      .children(self.about.as_ref().map(|(about, _)| about.clone()))
       .children(self.new_chat.as_ref().map(|(view, _)| view.clone()))
       .children(self.thread_popup(window, cx))
       .children(self.settings.as_ref().map(|(view, _)| view.clone()))

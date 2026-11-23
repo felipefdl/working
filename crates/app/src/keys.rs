@@ -14,8 +14,9 @@ use crate::conversation::{FormatBold, FormatBulletedList, FormatItalic, FormatSt
 use crate::mail::{CloseMailThread, OpenMailLabels, OpenSelectedThread, SelectNextThread, SelectPreviousThread};
 use crate::new_chat::OpenNewChat;
 use crate::root::{
-  FindInChat, FindNext, FindPrevious, GoBack, GoForward, NextConversation, NextUnread, OpenSettings, OpenSwitcher,
-  OpenThemePicker, PreviousConversation, Quit, RewriteDraft, ToggleSidebar,
+  FindInChat, FindNext, FindPrevious, GoBack, GoForward, NextConversation, NextUnread, OpenLayoutPicker,
+  OpenMessageStylePicker, OpenSettings, OpenSwitcher, OpenThemePicker, PreviousConversation, Quit, RewriteDraft,
+  ToggleSidebar,
 };
 
 // What the number keys do: each opens the place `Settings::hotkeys` gives its number.
@@ -97,6 +98,8 @@ fn table() -> Vec<(&'static str, Box<dyn Action>, Option<&'static str>)> {
   let mut table: Vec<(&'static str, Box<dyn Action>, Option<&'static str>)> = vec![
     ("secondary-k", Box::new(OpenSwitcher), None),
     ("secondary-shift-t", Box::new(OpenThemePicker), None),
+    ("secondary-shift-l", Box::new(OpenLayoutPicker), None),
+    ("secondary-shift-m", Box::new(OpenMessageStylePicker), None),
     ("secondary-n", Box::new(OpenNewChat), None),
     // Safari's pair. The kit's text field binds the same keys to outdent and indent, which a chat composer has no
     // use for: binding them again in its "Input" context, after `init`, takes them back.

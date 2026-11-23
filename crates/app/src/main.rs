@@ -30,6 +30,7 @@
   reason = "GPUI view signatures, theme hex colors, and layout math"
 )]
 
+mod about;
 mod calendar;
 mod calendar_grid;
 mod calendar_layout;
@@ -50,6 +51,7 @@ mod call {
     false
   }
 }
+mod choice_picker;
 mod chrome;
 mod clock;
 mod completion;
