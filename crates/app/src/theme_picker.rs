@@ -3,7 +3,7 @@
 
 use gchat_core::fuzzy::Fuzzy;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -17,6 +17,8 @@ pub enum ThemePickerEvent {
 }
 
 pub struct ThemePicker {
+  /// Holds the panel's focus trap, so Tab stays in the picker.
+  focus: FocusHandle,
   input: Entity<InputState>,
   /// Indexes in `THEMES`: the themes of the appearance on screen first, then the others.
   results: Vec<usize>,
@@ -65,6 +67,7 @@ impl ThemePicker {
     let this = Self {
       selected: results.iter().position(|ix| *ix == shown).unwrap_or_default(),
       scroll: ScrollHandle::new(),
+      focus: cx.focus_handle(),
       input,
       results,
       saved,
@@ -211,7 +214,8 @@ impl Render for ThemePicker {
               .border_color(rgb(BORDER))
               .child(Input::new(&self.input).appearance(false).bordered(false)),
           )
-          .child(list),
+          .child(list)
+          .focus_trap("theme-picker", &self.focus),
       )
   }
 }

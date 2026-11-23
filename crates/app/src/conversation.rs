@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use gchat_core::{Command, Core, Group, GroupKind, Message, Micros, ReadReceipt, SlashCommand, User};
 use gpui_kit::component::input::{Input, InputEvent, InputState, Paste, RopeExt as _, Textarea, TextareaState};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -434,6 +434,8 @@ pub struct ConversationView {
   refocus: bool,
   /// The press on the thread pop-up's backdrop also closed the text panel: that press leaves the thread open.
   backdrop_kept: bool,
+  /// Keeps Tab inside the thread pop-up, whose composer has the keyboard once it opens.
+  thread_focus: FocusHandle,
   loaded: bool,
   composer: Entity<TextareaState>,
   load: LoadState,
@@ -599,6 +601,7 @@ impl ConversationView {
       on_tools,
       refocus: false,
       backdrop_kept: false,
+      thread_focus: cx.focus_handle(),
       loaded,
       composer,
       load,
@@ -2276,6 +2279,7 @@ impl ConversationView {
             .overflow_hidden()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
         )
+        .focus_trap("thread-popup", &self.thread_focus)
         .into_any_element(),
     )
   }

@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::{Datelike, Local};
 use gchat_core::{Command, Connection, Core, DndFor, MyStatus, Presence};
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 
 use gpui_kit::*;
 
@@ -287,7 +287,6 @@ impl Render for StatusComposer {
       .left_0()
       .size_full()
       .occlude()
-      .track_focus(&self.focus)
       .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
         if event.keystroke.key == "escape" {
           this.close(window, cx);
@@ -296,6 +295,7 @@ impl Render for StatusComposer {
       }))
       .on_mouse_down(MouseButton::Left, cx.listener(|this, _, window, cx| this.close(window, cx)))
       .child(panel)
+      .focus_trap("status-composer-trap", &self.focus)
       .into_any_element()
   }
 }

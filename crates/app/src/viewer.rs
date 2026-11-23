@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gchat_core::{Attachment, AttachmentKind, Core};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_webview::WebView;
@@ -1139,12 +1139,12 @@ impl Render for Viewer {
       .size_full()
       .bg(rgba(0x000000e6))
       .occlude()
-      .track_focus(&self.focus)
       .key_context("Viewer")
       .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| this.on_key(event, window, cx)))
       .on_scroll(cx.listener(|this, event: &ScrollEvent, window, cx| this.on_wheel(event, window, cx)))
       .on_pinch(cx.listener(|this, event: &PinchEvent, window, cx| this.on_pinch(event, window, cx)))
       .child(v_flex().size_full().child(toolbar).child(body))
+      .focus_trap("viewer-trap", &self.focus)
       .into_any_element()
   }
 }

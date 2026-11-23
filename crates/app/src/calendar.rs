@@ -334,7 +334,7 @@ impl CalendarView {
       .find(|calendar| calendar.id == event.calendar_id)
       .cloned();
     let (store, color, event) = (self.store.clone(), self.color_of(event), event.clone());
-    let card = cx.new(|_| EventCard::new(store, event, calendar, color, at));
+    let card = cx.new(|cx| EventCard::new(store, event, calendar, color, at, window, cx));
     let sub = cx.subscribe_in(&card, window, |this, card, event: &CardEvent, window, cx| match event {
       CardEvent::Close => {
         this.card = None;

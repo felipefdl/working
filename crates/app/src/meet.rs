@@ -82,6 +82,8 @@ pub struct MeetView {
   failure: Option<String>,
   /// The link of the meeting made for later, in the card that shows it.
   card: Option<String>,
+  /// Has the keyboard while the card is open, and keeps Tab inside it.
+  pub(crate) card_focus: FocusHandle,
   /// The link in the card was just copied.
   pub(crate) copied: bool,
   /// Meet is the view on screen.
@@ -170,6 +172,7 @@ impl MeetView {
       picked: None,
       failure: None,
       card: None,
+      card_focus: cx.focus_handle(),
       copied: false,
       active: false,
       stale: false,
@@ -202,7 +205,7 @@ impl MeetView {
     if let Some(url) = self.store.update(cx, |store, _| store.take_meeting()) {
       self.card = Some(url);
       self.copied = false;
-      window.focus(&self.focus, cx);
+      window.focus(&self.card_focus, cx);
     }
     cx.notify();
   }
@@ -408,7 +411,10 @@ impl MeetView {
       return;
     }
     let key = stroke.key.as_str();
-    let handled = if window.focused(cx).is_some_and(|focused| focused == self.focus) {
+    let handled = if window
+      .focused(cx)
+      .is_some_and(|focused| focused == self.focus || focused == self.card_focus)
+    {
       let slash = key == "/" || stroke.key_char.as_deref() == Some("/");
       self.on_view_key(key, slash, window, cx)
     } else {

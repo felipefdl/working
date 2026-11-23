@@ -6,7 +6,7 @@ use std::ops::Range;
 use chrono::{Datelike, NaiveDate};
 use gpui_kit::component::date_picker::DatePicker;
 use gpui_kit::component::input::Input;
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -404,6 +404,7 @@ impl MeetView {
               ),
           ),
       )
+      .focus_trap("meet-card", &self.card_focus)
       .into_any_element()
   }
 }

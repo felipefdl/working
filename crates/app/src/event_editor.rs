@@ -15,7 +15,7 @@ use gchat_core::{
 use gpui_kit::component::date_picker::{DatePicker, DatePickerEvent, DatePickerState, DateTime};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState, Textarea, TextareaState};
 use gpui_kit::component::time_field::{HourCycle, TimeField, TimeFieldEvent, TimeFieldState};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -87,6 +87,8 @@ pub struct EventEditor {
   notify: bool,
   saving: bool,
   error: Option<String>,
+  /// Keeps Tab inside the editor while it is open.
+  focus: FocusHandle,
   _subs: Vec<Subscription>,
 }
 
@@ -314,6 +316,7 @@ impl EventEditor {
       notify: true,
       saving: false,
       error: None,
+      focus: cx.focus_handle(),
       _subs: subs,
     }
   }
@@ -1052,6 +1055,7 @@ impl Render for EventEditor {
           .child(fields)
           .child(self.footer(cx)),
       )
+      .focus_trap("event-editor", &self.focus)
   }
 }
 

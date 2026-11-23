@@ -532,8 +532,9 @@ impl RootView {
         SettingsView::new(core, window, cx)
       }
     });
-    let sub = cx.subscribe_in(&view, window, |this, _, _: &SettingsEvent, _, cx| {
+    let sub = cx.subscribe_in(&view, window, |this, _, _: &SettingsEvent, window, cx| {
       this.settings = None;
+      this.refocus(window, cx);
       cx.notify();
     });
     self.settings = Some((view, sub));

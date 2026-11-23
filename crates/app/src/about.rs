@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use gpui_kit::component::v_flex;
+use gpui_kit::component::{FocusTrapElement as _, v_flex};
 use gpui_kit::*;
 
 use crate::theme::{ACCENT, BORDER, MUTED, POPOVER, TEXT, is_light, rgb};
@@ -53,7 +53,6 @@ impl Render for About {
           .border_1()
           .border_color(rgb(BORDER))
           .shadow_lg()
-          .track_focus(&self.focus)
           .on_key_down(cx.listener(|_, event: &KeyDownEvent, _, cx| {
             if matches!(event.keystroke.key.as_str(), "escape" | "enter") {
               cx.emit(AboutEvent::Close);
@@ -92,7 +91,8 @@ impl Render for About {
               .cursor_pointer()
               .on_click(|_, _, cx| cx.open_url(REPOSITORY))
               .child(REPOSITORY.trim_start_matches("https://")),
-          ),
+          )
+          .focus_trap("about", &self.focus),
       )
   }
 }

@@ -3,7 +3,7 @@
 //! cannot be selected: this stands in until the kit's selectable text can carry links.
 
 use gpui_kit::component::input::{Textarea, TextareaState};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::*;
 
 use crate::calendar::{pill, round_button};
@@ -179,7 +179,6 @@ impl Render for TextPanel {
             .overflow_hidden()
             .occlude()
             .text_color(rgb(TEXT))
-            .track_focus(&self.focus)
             .key_context("TextPanel")
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
               if event.keystroke.key == "escape" {
@@ -195,7 +194,8 @@ impl Render for TextPanel {
                 .pb_3()
                 .min_h_0()
                 .child(Textarea::new(&self.field).appearance(false).bordered(false).readonly(true)),
-            ),
+            )
+            .focus_trap("text-panel-trap", &self.focus),
         ),
       )
       .into_any_element()

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use gchat_core::fuzzy::Fuzzy;
 use gchat_core::{Command, GroupId, GroupKind, User};
 use gpui_kit::component::input::{Escape, Input, InputEvent, InputState};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -28,6 +28,8 @@ pub enum NewChatEvent {
 
 pub struct NewChat {
   store: Entity<Store>,
+  /// Holds the panel's focus trap, so Tab stays in the dialog.
+  focus: FocusHandle,
   input: Entity<InputState>,
   selected: Vec<User>,
   results: Vec<Arc<User>>,
@@ -74,6 +76,7 @@ impl NewChat {
     input.update(cx, |state, cx| state.focus(window, cx));
     let mut view = Self {
       store,
+      focus: cx.focus_handle(),
       input,
       selected: Vec::new(),
       results: Vec::new(),
@@ -338,7 +341,8 @@ impl Render for NewChat {
                   .when(!can_start, |d| d.bg(rgb(FIELD)).text_color(rgb(MUTED)))
                   .child("Start chat"),
               ),
-          ),
+          )
+          .focus_trap("new-chat", &self.focus),
       )
   }
 }

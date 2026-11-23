@@ -3,7 +3,7 @@
 
 use gchat_core::fuzzy::Fuzzy;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -65,6 +65,8 @@ pub enum ChoicePickerEvent<T> {
 }
 
 pub struct ChoicePicker<T: Choice> {
+  /// Holds the panel's focus trap, so Tab stays in the picker.
+  focus: FocusHandle,
   input: Entity<InputState>,
   results: Vec<T>,
   selected: usize,
@@ -101,6 +103,7 @@ impl<T: Choice> ChoicePicker<T> {
     let results = matching::<T>("");
     Self {
       selected: results.iter().position(|value| *value == saved).unwrap_or_default(),
+      focus: cx.focus_handle(),
       input,
       results,
       saved,
@@ -214,7 +217,8 @@ impl<T: Choice> Render for ChoicePicker<T> {
               .border_color(rgb(BORDER))
               .child(Input::new(&self.input).appearance(false).bordered(false)),
           )
-          .child(list),
+          .child(list)
+          .focus_trap("choice-picker", &self.focus),
       )
   }
 }

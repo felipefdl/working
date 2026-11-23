@@ -5,7 +5,7 @@ use std::sync::Arc;
 use gchat_core::GroupId;
 use gchat_core::fuzzy::Fuzzy;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -22,6 +22,8 @@ pub enum SwitcherEvent {
 
 pub struct Switcher {
   store: Entity<Store>,
+  /// Holds the panel's focus trap, so Tab stays in the switcher.
+  focus: FocusHandle,
   input: Entity<InputState>,
   results: Vec<Arc<Conv>>,
   selected: usize,
@@ -41,6 +43,7 @@ impl Switcher {
     input.update(cx, |state, cx| state.focus(window, cx));
     let mut this = Self {
       store,
+      focus: cx.focus_handle(),
       input,
       results: Vec::new(),
       selected: 0,
@@ -173,7 +176,8 @@ impl Render for Switcher {
               .border_color(rgb(BORDER))
               .child(Input::new(&self.input).appearance(false).bordered(false)),
           )
-          .child(list),
+          .child(list)
+          .focus_trap("switcher", &self.focus),
       )
   }
 }

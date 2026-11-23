@@ -5,6 +5,7 @@
 //! While it is open the emails' webviews hide (`MailView::apply_cover`), since they are native views drawn over it.
 
 use gchat_core::Mailbox;
+use gpui_kit::component::FocusTrapElement as _;
 use gpui_kit::component::h_flex;
 use gpui_kit::component::input::Input;
 use gpui_kit::component::tooltip::Tooltip;
@@ -227,6 +228,7 @@ impl MailView {
         .size_full()
         .child(backdrop)
         .child(panel)
+        .focus_trap("mail-labels-trap", &self.labels_focus)
         .into_any_element(),
     )
   }

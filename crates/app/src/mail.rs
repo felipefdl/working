@@ -76,6 +76,8 @@ pub struct MailView {
   pub(crate) labels_open: bool,
   /// Its filter field.
   pub(crate) label_filter: Entity<InputState>,
+  /// Holds the popover's focus trap; its filter field takes the keyboard on opening.
+  pub(crate) labels_focus: FocusHandle,
   /// Parents whose labels the popover's tree leaves out, by id. Kept while the app runs.
   pub(crate) label_folded: HashSet<String>,
   /// The popover's row the arrows are on.
@@ -157,6 +159,7 @@ impl MailView {
       bodies: Bodies::new(events, images),
       labels_open: false,
       label_filter,
+      labels_focus: cx.focus_handle(),
       label_folded: HashSet::new(),
       label_pick: None,
       reply: None,

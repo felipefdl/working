@@ -2,7 +2,7 @@
 //! was pressed, over the whole window; a press outside closes it.
 
 use gchat_core::{Calendar, CalendarEvent, Command, EditScope, EventKind, Guest, Reminder, Rsvp, Visibility};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -34,6 +34,8 @@ pub struct EventCard {
   color: u32,
   /// Where the event was pressed.
   at: Point<Pixels>,
+  /// Has the keyboard while the card is open, and keeps Tab inside it.
+  focus: FocusHandle,
 }
 
 impl EventEmitter<CardEvent> for EventCard {}
@@ -103,14 +105,18 @@ fn reminder_text(reminder: Reminder) -> Option<String> {
 }
 
 impl EventCard {
-  pub const fn new(
+  pub fn new(
     store: Entity<Store>,
     event: CalendarEvent,
     calendar: Option<Calendar>,
     color: u32,
     at: Point<Pixels>,
+    window: &mut Window,
+    cx: &mut Context<Self>,
   ) -> Self {
-    Self { store, event, calendar, color, at }
+    let focus = cx.focus_handle();
+    window.focus(&focus, cx);
+    Self { store, event, calendar, color, at, focus }
   }
 
   pub const fn event(&self) -> &CalendarEvent {
@@ -431,6 +437,13 @@ impl Render for EventCard {
       .occlude()
       .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, cx| cx.emit(CardEvent::Close)))
       .on_mouse_down(MouseButton::Right, cx.listener(|_, _, _, cx| cx.emit(CardEvent::Close)))
+      // The card has the keyboard, so the calendar's keys no longer see Escape.
+      .on_key_down(cx.listener(|_, event: &KeyDownEvent, _, cx| {
+        if event.keystroke.key == "escape" {
+          cx.emit(CardEvent::Close);
+          cx.stop_propagation();
+        }
+      }))
       .child(
         anchored().position(at).snap_to_window_with_margin(px(MARGIN)).child(
           v_flex()
@@ -448,5 +461,6 @@ impl Render for EventCard {
             .child(details),
         ),
       )
+      .focus_trap("event-card", &self.focus)
   }
 }

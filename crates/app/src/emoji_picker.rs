@@ -4,7 +4,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::*;
 
 use crate::emoji_font;
@@ -28,6 +28,8 @@ pub struct EmojiPicker {
   shown: Option<Shown>,
   input: Entity<InputState>,
   scroll: UniformListScrollHandle,
+  /// Holds the picker's focus trap; the search field inside it takes the focus on open.
+  focus: FocusHandle,
   /// The emoji matching the search text, in Unicode's order.
   results: Vec<&'static emojis::Emoji>,
   _sub: Subscription,
@@ -65,6 +67,7 @@ impl EmojiPicker {
       shown: None,
       input,
       scroll: UniformListScrollHandle::new(),
+      focus: cx.focus_handle(),
       results: drawable().collect(),
       _sub: sub,
     }
@@ -216,6 +219,7 @@ impl Render for EmojiPicker {
           )
           .child(grid),
       )
+      .focus_trap("emoji-picker-trap", &self.focus)
       .into_any_element()
   }
 }

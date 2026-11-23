@@ -7,7 +7,7 @@ use gpui_kit::component::IndexPath;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::searchable_list::{SearchableListDelegate, SearchableListItem, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectItem, SelectState};
-use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -196,6 +196,8 @@ pub enum SettingsEvent {
 pub struct SettingsView {
   core: Core,
   section: Section,
+  /// Holds the dialog's focus trap: it takes the keyboard on opening, so Tab stays in the dialog.
+  focus: FocusHandle,
   #[cfg(target_os = "macos")]
   allowed: Allowed,
   /// What was just copied: its button says so for a moment.
@@ -317,9 +319,12 @@ impl SettingsView {
     });
     let (list_window, list_window_sub) = Self::list_window_select(window, cx);
     let (thread_view, thread_view_sub) = Self::thread_view_select(window, cx);
+    let focus = cx.focus_handle();
+    window.focus(&focus, cx);
     Self {
       core,
       section: Section::Features,
+      focus,
       #[cfg(target_os = "macos")]
       allowed: Self::read_allowed(),
       copied: None,
@@ -1995,6 +2000,7 @@ impl Render for SettingsView {
           .child(sections)
           .child(content),
       )
+      .focus_trap("settings-trap", &self.focus)
   }
 }
 

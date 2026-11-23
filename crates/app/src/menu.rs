@@ -3,6 +3,7 @@
 
 use std::rc::Rc;
 
+use gpui_kit::component::FocusTrapElement as _;
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -692,7 +693,6 @@ impl Render for ContextMenu {
       .left_0()
       .size_full()
       .occlude()
-      .track_focus(&self.focus)
       .key_context("ContextMenu")
       .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
         if event.keystroke.key == "escape" {
@@ -704,6 +704,7 @@ impl Render for ContextMenu {
       .on_mouse_down(MouseButton::Right, cx.listener(|this, _, window, cx| this.close(window, cx)))
       .child(self.panel(shown, left, top, cx))
       .children(self.submenu(shown, (left, top, note), window_size, cx))
+      .focus_trap("context-menu-trap", &self.focus)
       .into_any_element()
   }
 }
