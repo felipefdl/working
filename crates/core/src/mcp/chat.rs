@@ -485,7 +485,7 @@ fn line(message: &Message, me: &str) -> String {
     let _ = write!(out, " {{{}}}", reactions.join(" "));
   }
   if !message.is_thread_reply() && !message.pending {
-    let _ = write!(out, " #{}", message.id);
+    let _ = write!(out, " #{}", message.topic());
   }
   out
 }
@@ -1223,6 +1223,7 @@ mod tests {
         Arc::new(Message {
           id: format!("{time}-{i}"),
           topic_id: format!("{time}"),
+          reply: i > 0,
           group: GroupId::Dm("g".into()),
           sender_id: "u".into(),
           sender_name: "U".into(),
@@ -1279,6 +1280,7 @@ mod tests {
     Message {
       id: id.into(),
       topic_id: topic_id.into(),
+      reply: id != topic_id,
       sender_id: sender.into(),
       sender_name: if sender == ME {
         "Me".into()

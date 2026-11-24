@@ -2551,6 +2551,7 @@ impl Engine {
     let message = Arc::new(Message {
       id: local_id.clone(),
       topic_id: topic_id.unwrap_or_default().to_string(),
+      reply: topic_id.is_some(),
       group: group.clone(),
       sender_id: me.id.clone(),
       sender_name: me.name.clone(),
@@ -5505,6 +5506,7 @@ mod tests {
     std::sync::Arc::new(crate::model::Message {
       id: id.into(),
       topic_id: topic.into(),
+      reply: id != topic,
       group: GroupId::Space("AAAA".into()),
       sender_id: "u1".into(),
       sender_name: "Jordan Park".into(),

@@ -401,8 +401,11 @@ impl Card {
 pub struct Message {
   /// Message id. Local while `pending`.
   pub id: String,
-  /// Topic id: the first message of the thread, or this message if it started one.
+  /// Topic id: the thread this belongs to. The message that started the thread usually has it as its own id, but not
+  /// in a space moved over from the older threading, so `reply` says which of a topic's messages are replies.
   pub topic_id: String,
+  /// True for a reply inside a thread, false for the message that started the topic.
+  pub reply: bool,
   /// Conversation this belongs to.
   pub group: GroupId,
   /// Sender user id.
@@ -447,9 +450,19 @@ pub(crate) const MEET_PREVIEW: &str = "Shared a Meet link";
 pub(crate) const ATTACHMENT_PREVIEW: &str = "Sent an attachment";
 
 impl Message {
-  /// True for a reply inside a thread: it follows the message that started the topic, whose id is the topic id.
-  pub fn is_thread_reply(&self) -> bool {
-    !self.topic_id.is_empty() && self.id != self.topic_id
+  /// True for a reply inside a thread: it follows the message that started the topic.
+  pub const fn is_thread_reply(&self) -> bool {
+    self.reply
+  }
+
+  /// The topic this belongs to. A message still going out to the main conversation has no topic id yet and stands
+  /// for its own topic.
+  pub fn topic(&self) -> &str {
+    if self.topic_id.is_empty() {
+      &self.id
+    } else {
+      &self.topic_id
+    }
   }
 
   /// The message on one line, for the sidebar and notifications: its text, else what it carries (a Meet link, a
@@ -1578,6 +1591,7 @@ mod tests {
     Message {
       id: id.into(),
       topic_id: topic.into(),
+      reply: false,
       group: GroupId::Dm("g".into()),
       sender_id: "u".into(),
       sender_name: "U".into(),
@@ -1605,10 +1619,9 @@ mod tests {
   }
 
   #[test]
-  fn thread_reply_is_not_the_starter() {
-    assert!(!message("t1", "t1").is_thread_reply());
-    assert!(!message("t1", "").is_thread_reply());
-    assert!(message("r1", "t1").is_thread_reply());
+  fn a_message_without_a_topic_id_is_its_own_topic() {
+    assert_eq!(message("m1", "t1").topic(), "t1");
+    assert_eq!(message("m1", "").topic(), "m1");
   }
 
   #[test]

@@ -267,6 +267,7 @@ pub fn message(group: &GroupId, id: &str, topic: &str, sender: &User, time: Micr
   Message {
     id: id.into(),
     topic_id: topic.into(),
+    reply: !topic.is_empty() && id != topic,
     group: group.clone(),
     sender_id: sender.id.clone(),
     sender_name: sender.name.clone(),
@@ -809,9 +810,10 @@ mod tests {
       for message in messages {
         assert!(ids.insert(message.id.clone()), "duplicate {}", message.id);
         if message.is_thread_reply() {
-          assert!(seen.contains(&message.topic_id), "reply {} before its topic", message.id);
+          assert!(seen.contains(message.topic()), "reply {} before its topic", message.id);
+        } else {
+          seen.insert(message.topic().to_owned());
         }
-        seen.insert(message.id.clone());
       }
     }
   }

@@ -833,18 +833,14 @@ impl ConversationView {
     let Some(message) = self.messages.iter().find(|message| message.id == id).cloned() else {
       return;
     };
-    let top_level = if message.is_thread_reply() {
-      message.topic_id.clone()
-    } else {
-      id.clone()
-    };
-    let ix = self.main.read(cx).rows.iter().position(|row| row.msg.id == top_level);
+    let topic = message.topic().to_owned();
+    let ix = self.main.read(cx).rows.iter().position(|row| row.msg.topic() == topic);
     if let Some(ix) = ix {
       // The hit's own row: one row above can be a tall image that pushes the hit below the fold.
       scroll_list(&self.main, Some(ListOffset { item_ix: ix, offset_in_item: px(0.) }), cx);
     }
     if message.is_thread_reply() {
-      self.open_thread(&top_level, window, cx);
+      self.open_thread(&topic, window, cx);
     }
     self.focus = Some(id);
     self.sync_marks(cx);
@@ -1317,7 +1313,7 @@ impl ConversationView {
         });
       },
       Act::Leave => return self.pointer_left(window, cx),
-      Act::Thread => self.open_thread(&message.id, window, cx),
+      Act::Thread => self.open_thread(message.topic(), window, cx),
       Act::Quote => {
         if self.editing.take_if(|editing| !editing.in_thread).is_some() {
           self.composer.update(cx, |state, cx| state.set_value("", window, cx));

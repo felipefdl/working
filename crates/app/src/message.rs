@@ -230,7 +230,7 @@ pub fn build_rows(messages: &[Arc<Message>], me_id: &str, seen: impl Fn(&str) ->
     let date = (key != prev_day).then(|| SharedString::from(util::date_label(msg.time)));
     let head = starts_run(rows.last(), msg, date.is_some());
     prev_day = key;
-    let thread = infos.get(msg.id.as_str()).copied();
+    let thread = infos.get(msg.topic()).copied();
     let own = !me_id.is_empty() && msg.sender_id == me_id;
     rows.push(Row::new(msg, date, head, own, thread));
   }
@@ -239,7 +239,7 @@ pub fn build_rows(messages: &[Arc<Message>], me_id: &str, seen: impl Fn(&str) ->
 
 /// Rows of the thread panel: the starting message, then its replies oldest first. None when the starter is gone.
 pub fn build_thread_rows(messages: &[Arc<Message>], topic: &str, me_id: &str) -> Option<Vec<Row>> {
-  let start = messages.iter().find(|m| m.id == topic)?;
+  let start = messages.iter().find(|m| !m.is_thread_reply() && m.topic() == topic)?;
   let infos = thread_infos(messages, me_id, |_| None);
   let own = |msg: &Message| !me_id.is_empty() && msg.sender_id == me_id;
   let mut rows = vec![Row::new(start, None, true, own(start), infos.get(topic).copied())];
@@ -275,7 +275,12 @@ pub fn new_line(
   read: Micros,
   marked: bool,
 ) -> Option<(SharedString, bool)> {
-  let at: HashMap<&str, usize> = rows.iter().enumerate().map(|(ix, row)| (row.msg.id.as_str(), ix)).collect();
+  // A row by its message's id, and the row of a message that started a thread by its topic too.
+  let starters = rows.iter().enumerate().filter(|(_, row)| !row.msg.is_thread_reply());
+  let at: HashMap<&str, usize> = starters
+    .map(|(ix, row)| (row.msg.topic(), ix))
+    .chain(rows.iter().enumerate().map(|(ix, row)| (row.msg.id.as_str(), ix)))
+    .collect();
   let sent: Vec<receipt_logic::Sent> = messages
     .iter()
     .filter(|msg| !msg.system)
@@ -1223,7 +1228,7 @@ fn reply_label(count: usize) -> String {
 /// `N replies · time` under a thread starter, with `M new` between them while replies are new to the user, and the
 /// small corner connector; opens the thread panel.
 fn thread_footer(row: &Row, info: ThreadInfo, open: Opener) -> AnyElement {
-  let topic = row.id.clone();
+  let topic = row.msg.topic().to_owned();
   h_flex()
     .id((row.id.clone(), PART_THREAD))
     .mt_1()
@@ -2425,6 +2430,7 @@ mod tests {
       Arc::new(Message {
         id: id.into(),
         topic_id: topic.into(),
+        reply: id != topic,
         group: GroupId::Dm("g".into()),
         sender_id: sender.into(),
         sender_name: sender.into(),
@@ -2466,6 +2472,7 @@ mod tests {
       Arc::new(Message {
         id: id.into(),
         topic_id: topic.into(),
+        reply: id != topic,
         group: GroupId::Dm("g".into()),
         sender_id: sender.into(),
         sender_name: sender.into(),
@@ -2507,6 +2514,7 @@ mod tests {
     let message = |id: &str, time: i64| Message {
       id: id.into(),
       topic_id: id.into(),
+      reply: false,
       group: GroupId::Dm("g".into()),
       sender_id: "you".into(),
       sender_name: "you".into(),

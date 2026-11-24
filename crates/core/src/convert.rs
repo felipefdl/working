@@ -974,6 +974,7 @@ pub fn message(message: &proto::Message, users: &Users) -> Option<Message> {
   Some(Message {
     id: id.message_id.clone()?,
     topic_id: topic.topic_id.clone().unwrap_or_default(),
+    reply: message.is_inline_reply == Some(true),
     group,
     sender_id,
     sender_name,
@@ -1014,7 +1015,8 @@ mod tests {
 
   use super::{
     Users, Utf16Index, absolute, annotations, emoji_text, format_annotations, group, group_id, is_member,
-    merge_receipts, notify, pending_spans, proto_group_id, read_receipts, room_state, strip_tags, user, with_links,
+    merge_receipts, message, notify, pending_spans, proto_group_id, read_receipts, room_state, strip_tags, user,
+    with_links,
   };
   use crate::markup::parse;
   use crate::model::{Chip, ChipKind, GroupId, Notify, ReadReceipt, Span, SpanKind, User};
@@ -1193,6 +1195,31 @@ mod tests {
       avatar_url: None,
       read_time,
     }
+  }
+
+  #[test]
+  fn the_wire_says_which_messages_of_a_topic_are_replies() {
+    // A space moved over from the older threading: the message that started a topic has an id of its own.
+    let wire = |id: &str, inline_reply: Option<bool>| proto::Message {
+      id: Some(proto::MessageId {
+        parent_id: Some(proto::MessageParentId {
+          topic_id: Some(proto::TopicId {
+            group_id: Some(proto_group_id(&GroupId::Space("s".into()))),
+            topic_id: Some("topic-1".into()),
+          }),
+        }),
+        message_id: Some(id.into()),
+      }),
+      is_inline_reply: inline_reply,
+      ..Default::default()
+    };
+    let users = Users::default();
+    let starter = message(&wire("message-1", None), &users).expect("the starter");
+    let reply = message(&wire("message-2", Some(true)), &users).expect("the reply");
+    assert!(!starter.is_thread_reply());
+    assert!(reply.is_thread_reply());
+    assert_eq!((starter.id.as_str(), starter.topic()), ("message-1", "topic-1"));
+    assert_eq!((reply.id.as_str(), reply.topic()), ("message-2", "topic-1"));
   }
 
   #[test]
