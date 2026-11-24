@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gchat_core::{Command, Core, Group, GroupKind, Message, Micros, ReadReceipt, SlashCommand, User};
-use gpui_kit::component::input::{Input, InputEvent, InputState, Paste, RopeExt as _, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState, MoveUp, Paste, RopeExt as _, Textarea, TextareaState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;

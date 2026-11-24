@@ -711,6 +711,16 @@ fn coffee(b: &mut Builder) {
     id: "demo-social".into(),
     name: "Social".into(),
   };
+  // A thread from before the space moved to in-line threading: its first message has an id of its own.
+  let mut grinder = chat.post(&noah, 3 * DAY, "Is the grinder fixed yet?");
+  grinder.topic_id = "demo-coffee-grinder".into();
+  chat.add(grinder);
+  chat.answer(
+    "demo-coffee-grinder",
+    &mei,
+    3 * DAY - HOUR,
+    "Fixed this morning, new burrs and all.",
+  );
   let mut beans = chat.post(&mei, 30 * HOUR, "New beans in the kitchen, a washed Ethiopian. Very bright.");
   beans.attachments = vec![image(&BEANS, "coffee-beans.jpg")];
   chat.add(beans);

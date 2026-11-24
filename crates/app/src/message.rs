@@ -2473,6 +2473,32 @@ mod tests {
     assert_eq!(build_rows(&messages, "me", seen)[0].thread.map(|info| info.new), Some(1));
     let caught_up = |_: &str| Some(2);
     assert_eq!(build_rows(&messages, "me", caught_up)[0].thread.map(|info| info.new), Some(0));
+
+    // A space moved over from the older threading: the message that started a thread has an id of its own.
+    let starter = Arc::new(Message {
+      reply: false,
+      ..(*msg("m1", "t1", "me", 4)).clone()
+    });
+    let moved = [starter, msg("m2", "t1", "you", 5)];
+    let rows = build_rows(&moved, "me", |_| None);
+    assert_eq!(rows.iter().map(|row| row.msg.id.as_str()).collect::<Vec<_>>(), vec!["m1"]);
+    assert_eq!(rows[0].thread.map(|info| info.count), Some(1));
+    let panel = super::build_thread_rows(&moved, "t1", "me").expect("the thread's starter");
+    assert_eq!(
+      panel.iter().map(|row| row.msg.id.as_str()).collect::<Vec<_>>(),
+      vec!["m1", "m2"]
+    );
+    // The new reply stands for its starter's row.
+    let line = super::new_line(&moved, &rows, "me", 4, false);
+    assert_eq!(line.map(|(id, _)| id.to_string()).as_deref(), Some("m1"));
+
+    // Up in an empty composer takes the user's newest message of that composer's list.
+    let last = |messages, topic| super::last_own(messages, "me", topic).map(|m| m.id.as_str());
+    assert_eq!(last(&messages[..], None), Some("t"));
+    assert_eq!(last(&messages[..], Some("t")), None);
+    let answered = [msg("t", "t", "you", 1), msg("r", "t", "me", 2), msg("n", "n", "you", 3)];
+    assert_eq!(last(&answered[..], None), None);
+    assert_eq!(last(&answered[..], Some("t")), Some("r"));
   }
 
   #[test]

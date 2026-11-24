@@ -1061,11 +1061,7 @@ async fn read_conversation(engine: &Arc<Engine>, reads: &Reads, arguments: Value
 
 /// One thread of a conversation, found among its latest pages.
 async fn read_thread(engine: &Arc<Engine>, group: &Group, thread: &str, me: &str) -> Result<String, String> {
-  let in_thread = |messages: &Vec<Arc<Message>>| {
-    messages
-      .first()
-      .is_some_and(|first| first.id == thread || first.topic_id == thread)
-  };
+  let in_thread = |messages: &Vec<Arc<Message>>| messages.first().is_some_and(|first| first.topic() == thread);
   let mut page = engine.topics(&group.id, Page::Latest).await.map_err(offline)?;
   // The thread is usually recent: look a few pages back at most.
   for _ in 0..4 {
