@@ -264,6 +264,18 @@ pub fn arrived(messages: &[Arc<Message>], previous: &str, me_id: &str) -> usize 
     .count()
 }
 
+/// The user's newest message that can be changed from a composer: the main one's (`topic` None) takes the messages
+/// of the main list, a thread panel's the replies of its topic. One with no text, or still going out, does not count.
+pub fn last_own<'a>(messages: &'a [Arc<Message>], me_id: &str, topic: Option<&str>) -> Option<&'a Arc<Message>> {
+  messages.iter().rev().find(|m| {
+    let here = match topic {
+      Some(topic) => m.is_thread_reply() && m.topic_id == topic,
+      None => !m.is_thread_reply(),
+    };
+    here && m.sender_id == me_id && !m.pending && !m.failed && !m.system && !m.text.trim().is_empty()
+  })
+}
+
 /// Where the New line goes among `rows`, the main list's or a thread panel's, built from `messages`: the id of the
 /// row it sits above, and whether a message past it mentions the user (`receipt_logic::new_line`). A reply the rows
 /// do not show stands for the row of the message that started its thread, and a message without either for nothing;

@@ -1605,6 +1605,26 @@ impl ConversationView {
     }
   }
 
+  /// Up in an empty composer: the user's last message there goes into it to be changed. Anything else is left to
+  /// the composer, which moves the caret.
+  fn edit_last(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
+    let Some(in_thread) = self.focused_composer(window, cx) else {
+      return;
+    };
+    let (composer, files, topic) = match (&self.thread, in_thread) {
+      (Some(thread), true) => (&thread.composer, &thread.files, Some(thread.topic.as_str())),
+      _ => (&self.composer, &self.files, None),
+    };
+    if self.editing.is_some() || !files.is_empty() || composer.read(cx).text().len() > 0 {
+      return;
+    }
+    let Some(message) = message::last_own(&self.messages, &self.me_id, topic).cloned() else {
+      return;
+    };
+    cx.stop_propagation();
+    self.on_act(Act::Edit, &message, window, cx);
+  }
+
   /// Paste in a composer: files and pictures on the clipboard are attached; text is left to the composer.
   fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
     let Some(in_thread) = self.focused_composer(window, cx) else {
@@ -2331,6 +2351,7 @@ impl ConversationView {
     root
       // Before the composer sees the paste, so files never land in it as text.
       .capture_action(cx.listener(Self::paste))
+      .capture_action(cx.listener(Self::edit_last))
       .on_action(cx.listener(|this, _: &FormatBold, window, cx| this.format_key(Format::Bold, window, cx)))
       .on_action(cx.listener(|this, _: &FormatItalic, window, cx| this.format_key(Format::Italic, window, cx)))
       .on_action(cx.listener(|this, _: &FormatStrikethrough, window, cx| {
