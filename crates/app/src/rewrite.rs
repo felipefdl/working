@@ -90,6 +90,22 @@ pub fn earlier<'a>(newest_first: impl Iterator<Item = (&'a str, &'a str)>) -> Ve
   found
 }
 
+/// Whether `draft` has nothing a rewrite could change: it is blank, or every word of it is a link.
+pub fn nothing_to_rewrite(draft: &str) -> bool {
+  draft.split_whitespace().all(|word| {
+    ["https://", "http://"]
+      .iter()
+      .any(|scheme| word.strip_prefix(scheme).is_some_and(|rest| !rest.is_empty()))
+  })
+}
+
+/// The text to send when `draft` starts with `!`, which asks Always rewrite to send it as written: the draft without
+/// that mark. A `!` with nothing after it is a message of its own.
+pub fn as_written(draft: &str) -> Option<&str> {
+  let text = draft.trim_start().strip_prefix('!')?.trim_start();
+  (!text.is_empty()).then_some(text)
+}
+
 /// Runs the configured CLI on `draft` and answers the rewritten text, or why it failed. With `context`, the CLI also
 /// reads those messages and writes in their language unless told otherwise. `choice` names the model and effort, each
 /// the CLI's own when absent.
@@ -428,9 +444,21 @@ mod ui {
       });
     })
   }
+
+  /// Takes the `!` off a draft that asks to go out as written (undoable), and says whether it did.
+  pub fn unmark(composer: &Entity<TextareaState>, window: &mut Window, cx: &mut App) -> bool {
+    let draft = composer.read(cx).value().to_string();
+    let Some(text) = super::as_written(&draft) else {
+      return false;
+    };
+    composer.update(cx, |state, cx| {
+      state.replace_all(text.to_owned(), window, cx);
+    });
+    true
+  }
 }
 
-pub use ui::{button, spawn};
+pub use ui::{button, spawn, unmark};
 
 struct Invocation {
   args: Vec<String>,
@@ -984,6 +1012,22 @@ SET PATHEXT=%PATHEXT:;.JS;=;%\r\n)\r\n\r\nendLocal & goto #_undefined_# 2>NUL ||
     let kind = prompt.find("The text is an email body").unwrap();
     let extra = prompt.find("Be brief.").unwrap();
     assert!(prompt.starts_with(DRAFT) && kind < extra);
+  }
+
+  #[test]
+  fn only_links_or_blank_has_nothing_to_rewrite() {
+    assert!(nothing_to_rewrite("  \n"));
+    assert!(nothing_to_rewrite(" https://example.com/a?b=1\nhttp://example.com "));
+    assert!(!nothing_to_rewrite("see https://example.com"));
+    assert!(!nothing_to_rewrite("https://"));
+  }
+
+  #[test]
+  fn a_leading_mark_asks_for_the_draft_as_written() {
+    assert_eq!(as_written(" ! colar isso\nassim "), Some("colar isso\nassim "));
+    assert_eq!(as_written("!!wow"), Some("!wow"));
+    assert_eq!(as_written("wow!"), None);
+    assert_eq!(as_written("! "), None);
   }
 
   #[test]

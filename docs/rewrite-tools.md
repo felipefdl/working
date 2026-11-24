@@ -4,6 +4,8 @@ The composer's Rewrite runs a coding CLI that is already installed on the comput
 
 With Conversation context on (Settings, Rewrite; on by default), the CLI also reads the latest messages of the conversation the draft goes into, six at most and each cut to 1,000 characters: the Chat conversation or thread, or the email thread a reply answers. A new email has none. They go on stdin inside `<conversation>` tags, before the draft, and the prompt asks for the rewrite in that conversation's language. The user's instructions come after that in the prompt, so a language they name, or one the draft asks for (the default instructions' `|<language>` suffix), wins.
 
+A draft that is blank or only links (`http://` or `https://` words) never reaches the CLI: the button does nothing and Always rewrite sends it as it is. With Always rewrite on, a draft that starts with `!` is sent as written, without the `!` and without a rewrite, for text pasted from elsewhere; `!!` sends a message that starts with `!`.
+
 ## Rule
 
 A tool is offered only when one headless call can run with none of these:
@@ -23,8 +25,8 @@ Tests in `rewrite.rs` pin the flags below.
 | Tool | How it is isolated | What still reaches it |
 | --- | --- | --- |
 | Pi | `--no-tools --no-context-files --no-extensions --no-mcp --no-skills --no-prompt-templates --no-session` | Nothing. A probe reported a clean context. |
-| Claude Code | `--setting-sources ""` (no user, project, or local settings: no `CLAUDE.md`, hooks, or plugins), `--tools ""`, `--strict-mcp-config`, `--disallowedTools "mcp__*"`, `--disable-slash-commands`, `--system-prompt` | Organization managed policy, by design, and the account email Claude Code attaches. `--bare` would also drop those, but it requires an API key in place of a subscription login. |
-| Codex | `--ignore-user-config` (drops the MCP servers in `config.toml`), `--ignore-rules`, `--disable hooks`, `--disable plugins`, `--disable memories`, `--disable skill_search`, `-c skills.include_instructions=false`, `-c project_doc_max_bytes=0`, a read-only sandbox, and the shell and other tool features disabled | The global `$CODEX_HOME/AGENTS.md`. Codex loads it on every run with no switch (`codex-rs/codex-home/src/instructions/mod.rs`). |
+| Claude Code | `--setting-sources ""` (no user, project, or local settings: no `CLAUDE.md`, hooks, or plugins), `--tools ""`, `--strict-mcp-config`, `--disallowedTools "mcp__*"`, `--disable-slash-commands`, `--no-session-persistence`, `--system-prompt` | Organization managed policy, by design, and the account email Claude Code attaches. `--bare` would also drop those, but it requires an API key in place of a subscription login. |
+| Codex | `--ephemeral` (no session saved), `--ignore-user-config` (drops the MCP servers in `config.toml`), `--ignore-rules`, `--disable hooks`, `--disable plugins`, `--disable memories`, `--disable skill_search`, `-c skills.include_instructions=false`, `-c project_doc_max_bytes=0`, a read-only sandbox, and the shell and other tool features disabled | The global `$CODEX_HOME/AGENTS.md`. Codex loads it on every run with no switch (`codex-rs/codex-home/src/instructions/mod.rs`). |
 
 ## Model and effort
 

@@ -1850,7 +1850,8 @@ impl SettingsView {
       .child(
         Self::row(
           "Always rewrite",
-          "Rewrite every Chat message or email before it sends. Right-click the rewrite button to switch.",
+          "Rewrite every Chat message or email before it sends, except one that is only links. Start one with ! to \
+           send it as written. Right-click the rewrite button to switch.",
           false,
         )
         .child(

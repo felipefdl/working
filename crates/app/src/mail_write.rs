@@ -202,7 +202,9 @@ impl MailView {
       return;
     }
     let settings = cx.global::<crate::settings::Settings>();
-    if settings.rewrite_always && settings.rewrite != crate::settings::RewriteTool::Off {
+    let always = settings.rewrite_always && settings.rewrite != crate::settings::RewriteTool::Off;
+    let editor = self.reply.as_ref().map(|reply| reply.editor.clone());
+    if always && !editor.is_some_and(|editor| crate::rewrite::unmark(&editor, window, cx)) {
       self.rewrite_body(true, window, cx);
       return;
     }
@@ -336,7 +338,7 @@ impl MailView {
     } else {
       return;
     };
-    if composer.read(cx).value().trim().is_empty() {
+    if crate::rewrite::nothing_to_rewrite(&composer.read(cx).value()) {
       if then_send {
         if composing {
           self.dispatch_compose(cx);

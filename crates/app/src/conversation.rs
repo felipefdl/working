@@ -1735,14 +1735,30 @@ impl ConversationView {
     self.rewrite(self.thread.is_some(), false, window, cx);
   }
 
-  /// Enter in a composer: sends, or with "Always rewrite" on, rewrites first and sends the result.
+  /// Enter in a composer: sends, or with "Always rewrite" on, rewrites first and sends the result. A draft that
+  /// starts with `!` goes out as written, without the mark.
   fn submit(&mut self, in_thread: bool, window: &mut Window, cx: &mut Context<Self>) {
     let settings = cx.global::<Settings>();
-    if settings.rewrite_always && settings.rewrite != RewriteTool::Off {
-      self.rewrite(in_thread, true, window, cx);
-    } else {
+    if !settings.rewrite_always || settings.rewrite == RewriteTool::Off {
       self.send_from(in_thread, window, cx);
+      return;
     }
+    let composer = match (&self.thread, in_thread) {
+      (Some(thread), true) => thread.composer.clone(),
+      _ => self.composer.clone(),
+    };
+    let tokens = composer.read(cx).tokens().to_vec();
+    if !crate::rewrite::unmark(&composer, window, cx) {
+      self.rewrite(in_thread, true, window, cx);
+      return;
+    }
+    let text = composer.read(cx).value().to_string();
+    composer.update(cx, |state, cx| {
+      for (range, token) in completion::reattach(&text, &tokens) {
+        state.replace_range_with_token(range, token, window, cx).ok();
+      }
+    });
+    self.send_from(in_thread, window, cx);
   }
 
   fn send_from(&mut self, in_thread: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -1770,8 +1786,8 @@ impl ConversationView {
     };
     let draft = composer.read(cx).value().to_string();
     let tokens = composer.read(cx).tokens().to_vec();
-    if draft.trim().is_empty() {
-      // Files alone have nothing to rewrite.
+    if crate::rewrite::nothing_to_rewrite(&draft) {
+      // Files or links alone have nothing to rewrite.
       if then_send {
         self.send_from(in_thread, window, cx);
       }

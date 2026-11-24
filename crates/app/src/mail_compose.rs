@@ -333,9 +333,9 @@ impl MailView {
     let Some(form) = self.compose.as_ref() else {
       return;
     };
-    let text = form.body.read(cx).value().to_string();
+    let body = form.body.clone();
     let settings = cx.global::<Settings>();
-    if settings.rewrite_always && settings.rewrite != RewriteTool::Off && !text.trim().is_empty() {
+    if settings.rewrite_always && settings.rewrite != RewriteTool::Off && !crate::rewrite::unmark(&body, window, cx) {
       self.rewrite_body(true, window, cx);
       return;
     }
