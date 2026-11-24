@@ -523,6 +523,9 @@ pub struct Settings {
   /// Ids of the calendars unchecked in that list: their events are not shown.
   #[serde(default)]
   pub calendar_hidden: Vec<String>,
+  /// The version whose changelog was last seen: start-up stores the running version, and after an update opens What's
+  /// New once (`changelog::startup`). Absent on a fresh install and in settings files from before it.
+  pub changelog_seen: Option<String>,
   /// Linux: whether the app may put its desktop entry and icon in the user's data directory (`desktop_entry.rs`).
   #[cfg(target_os = "linux")]
   pub desktop_entry: crate::desktop_entry::Choice,
@@ -580,6 +583,7 @@ impl Default for Settings {
       calendar_mode: crate::calendar_layout::Mode::default(),
       calendar_panel_closed: false,
       calendar_hidden: Vec::new(),
+      changelog_seen: None,
       #[cfg(target_os = "linux")]
       desktop_entry: crate::desktop_entry::Choice::NotAsked,
     }

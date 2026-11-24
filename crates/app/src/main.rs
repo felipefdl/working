@@ -52,6 +52,7 @@ mod call {
     false
   }
 }
+mod changelog;
 mod choice_picker;
 mod chrome;
 mod clock;
@@ -192,6 +193,7 @@ fn main() {
     #[cfg(target_os = "linux")]
     emoji_font::register(cx);
     cx.set_global(Settings::load());
+    let whats_new = changelog::after_update(cx);
     #[cfg(target_os = "linux")]
     desktop_entry::start(cx);
     settings::apply_appearance(cx);
@@ -249,13 +251,14 @@ fn main() {
     let images = Images::new(core.clone(), cx);
     let store = cx.new(|_| Store::new(core.clone(), images));
     #[cfg(target_os = "macos")]
-    {
+    let window = {
       let window = open_main(core.clone(), store.clone(), cx);
       cx.set_global(Main { window, core, store });
-    }
+      window
+    };
     // Only macOS brings a closed main window back (from the Dock): elsewhere closing it quits.
     #[cfg(not(target_os = "macos"))]
-    {
+    let window = {
       let window = open_main(core, store, cx);
       cx.on_window_closed(move |cx, closed| {
         if closed == window.window_id() {
@@ -263,6 +266,11 @@ fn main() {
         }
       })
       .detach();
+      window
+    };
+    // The first run after an update shows what changed, once.
+    if whats_new && let Some(window) = window.downcast::<RootView>() {
+      let _ = window.update(cx, RootView::open_whats_new);
     }
     // `Working https://meet.google.com/<code>` also opens that meeting.
     if let Some(url) = std::env::args()

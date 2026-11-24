@@ -116,6 +116,11 @@ release version:
     echo "version must be X.Y.Z or X.Y.Z-pre" >&2
     exit 1
   fi
+  # A stable release needs its section in CHANGELOG.md, which the app shows in What's New.
+  if [[ "{{version}}" != *-* ]] && ! awk -v heading="## {{version}} - " 'index($0, heading) == 1 { found = 1 } END { exit !found }' CHANGELOG.md; then
+    echo "CHANGELOG.md has no '## {{version}} - <YYYY-MM-DD>' section: write it first" >&2
+    exit 1
+  fi
   if [[ "$(git branch --show-current)" != main ]]; then
     echo "release from main" >&2
     exit 1

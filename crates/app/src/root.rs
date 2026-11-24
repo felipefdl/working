@@ -22,6 +22,7 @@ use std::rc::Rc;
 
 use crate::about::{About, AboutEvent};
 use crate::calendar::{CalendarView, OpenCalendar};
+use crate::changelog::{WhatsNew, WhatsNewEvent};
 use crate::choice_picker::{Choice, ChoicePicker, ChoicePickerEvent};
 use crate::chrome;
 use crate::conv_list::ConvList;
@@ -57,6 +58,7 @@ actions!(
     OpenLayoutPicker,
     OpenMessageStylePicker,
     OpenAbout,
+    OpenWhatsNew,
     OpenSettings,
     GoHome,
     Quit,
@@ -140,6 +142,7 @@ pub fn menus(cx: &App) -> Vec<Menu> {
   };
   let mut app = vec![
     MenuItem::action("About Working", OpenAbout),
+    MenuItem::action("What's New", OpenWhatsNew),
     MenuItem::separator(),
     MenuItem::action("Settings...", OpenSettings),
     MenuItem::action("Color Theme…", OpenThemePicker),
@@ -246,6 +249,7 @@ pub fn bind_menu_commands(cx: &mut App, on_main: fn(&mut App, MenuCommand)) {
   bind::<OpenLayoutPicker>(cx, on_main, RootView::open_choice_picker::<Layout>);
   bind::<OpenMessageStylePicker>(cx, on_main, RootView::open_choice_picker::<settings::MessageStyle>);
   bind::<OpenAbout>(cx, on_main, RootView::open_about);
+  bind::<OpenWhatsNew>(cx, on_main, RootView::open_whats_new);
   bind::<FindInChat>(cx, on_main, RootView::find_in_chat);
   bind::<FindNext>(cx, on_main, RootView::find_next);
   bind::<FindPrevious>(cx, on_main, RootView::find_previous);
@@ -337,6 +341,7 @@ pub struct RootView {
   theme_picker: Option<(Entity<ThemePicker>, Subscription)>,
   choice_picker: Option<OpenChoicePicker>,
   about: Option<(Entity<About>, Subscription)>,
+  whats_new: Option<(Entity<WhatsNew>, Subscription)>,
   settings: Option<(Entity<SettingsView>, Subscription)>,
   new_chat: Option<(Entity<NewChat>, Subscription)>,
   welcome: Option<Entity<WelcomeView>>,
@@ -502,6 +507,7 @@ impl RootView {
       theme_picker: None,
       choice_picker: None,
       about: None,
+      whats_new: None,
       settings: None,
       new_chat: None,
       welcome: None,
@@ -632,6 +638,32 @@ impl RootView {
       return;
     }
     self.refocus(window, cx);
+    cx.notify();
+  }
+
+  /// Opens What's New over the window, and over Settings when it is open there.
+  pub fn open_whats_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    if self.whats_new.is_some() {
+      return;
+    }
+    let logo = self.logo.clone();
+    let dialog = cx.new(|cx| WhatsNew::new(logo, window, cx));
+    let sub = cx.subscribe_in(&dialog, window, |this, _, _: &WhatsNewEvent, window, cx| {
+      this.close_whats_new(window, cx);
+    });
+    self.whats_new = Some((dialog, sub));
+    cx.notify();
+  }
+
+  /// Closes What's New, giving the keyboard back to what had it.
+  fn close_whats_new(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    let Some((dialog, _)) = self.whats_new.take() else {
+      return;
+    };
+    match dialog.read(cx).previous_focus.clone() {
+      Some(focus) => window.focus(&focus, cx),
+      None => self.refocus(window, cx),
+    }
     cx.notify();
   }
 
@@ -1048,6 +1080,8 @@ impl RootView {
       self.composer.update(cx, |composer, cx| composer.close(window, cx));
     } else if self.emoji.read(cx).is_open() {
       self.emoji.update(cx, |emoji, cx| emoji.close(window, cx));
+    } else if self.whats_new.is_some() {
+      self.close_whats_new(window, cx);
     } else if self.settings.take().is_some() {
       cx.notify();
     } else if self.menu.read(cx).is_open() {
@@ -1102,6 +1136,7 @@ impl RootView {
       || self.theme_picker.is_some()
       || self.choice_picker.is_some()
       || self.about.is_some()
+      || self.whats_new.is_some()
       || self.new_chat.is_some()
       || self.calendar.read(cx).has_modal()
   }
@@ -1549,6 +1584,7 @@ impl Render for RootView {
         this.open_choice_picker::<settings::MessageStyle>(window, cx);
       }))
       .on_action(cx.listener(|this, _: &OpenAbout, window, cx| this.open_about(window, cx)))
+      .on_action(cx.listener(|this, _: &OpenWhatsNew, window, cx| this.open_whats_new(window, cx)))
       .on_action(cx.listener(|this, _: &OpenSettings, window, cx| this.open_settings(window, cx)))
       .on_action(cx.listener(|this, _: &OpenNotificationSettings, window, cx| this.open_settings_at(true, window, cx)))
       .on_action(cx.listener(|this, _: &GoHome, window, cx| this.go_home(window, cx)))
@@ -1607,6 +1643,7 @@ impl Render for RootView {
       .children(self.new_chat.as_ref().map(|(view, _)| view.clone()))
       .children(self.thread_popup(window, cx))
       .children(self.settings.as_ref().map(|(view, _)| view.clone()))
+      .children(self.whats_new.as_ref().map(|(dialog, _)| dialog.clone()))
       .children(self.calendar.read(cx).overlays())
       .child(self.viewer.clone())
       .child(self.composer.clone())

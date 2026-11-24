@@ -2159,11 +2159,16 @@ impl Render for SettingsView {
           .child(section.title()),
       );
     }
+    // The version opens What's New, which the window root draws over Settings.
     sections = sections.child(div().flex_1()).child(
       div()
+        .id("settings-version")
         .px_3()
         .text_size(px(12.))
         .text_color(rgb(MUTED))
+        .cursor_pointer()
+        .hover(|version| version.text_color(rgb(TEXT)))
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(crate::root::OpenWhatsNew), cx))
         .child(concat!("Working ", env!("CARGO_PKG_VERSION"))),
     );
 
