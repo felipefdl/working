@@ -36,10 +36,11 @@ use crate::http::{Http, ServiceSession, SignedOut, request_header};
 use crate::markup;
 use crate::mcp;
 use crate::model::{
-  Attachment, AttachmentKind, CardAction, Command, Connection, DndFor, DndSchedule, DndSchedules, EditScope, Event,
-  EventDraft, Group, GroupId, GroupKind, MailAddress, MailCompose, MailDraft, MailDraftSent, MailForward, MailLabel,
-  MailMessage, MailReply, MailSignature, MailThread, Mailbox, McpConfig, McpStatus, Message, Micros, MyStatus, Notify,
-  PersonStatus, Placement, Presence, Quote, Reaction, ReadReceipt, Rsvp, SearchHit, Shortcut, Snippet, User,
+  Attachment, AttachmentKind, CardAction, Chip, Command, Connection, DndFor, DndSchedule, DndSchedules, EditScope,
+  Event, EventDraft, Group, GroupId, GroupKind, MailAddress, MailCompose, MailDraft, MailDraftSent, MailForward,
+  MailLabel, MailMessage, MailReply, MailSignature, MailThread, Mailbox, McpConfig, McpStatus, Message, Micros,
+  MyStatus, Notify, PersonStatus, Placement, Presence, Quote, Reaction, ReadReceipt, Rsvp, SearchHit, Shortcut,
+  Snippet, User,
 };
 use crate::proto;
 
@@ -2690,12 +2691,19 @@ impl Engine {
   /// Joined members of a conversation, people and apps, by name, without the signed-in user. Members whose
   /// profile the answer leaves out are looked up.
   async fn load_members(self: &Arc<Self>, group: GroupId) -> Result<()> {
+    let users = self.members(&group).await?;
+    self.emit(Event::Members { group, users: Arc::new(users) });
+    Ok(())
+  }
+
+  /// Joined members of a conversation, as `load_members` gives them to the UI.
+  pub(crate) async fn members(self: &Arc<Self>, group: &GroupId) -> Result<Vec<User>> {
     let mut ids = Vec::new();
     let mut page_token = None;
     loop {
       let request = proto::ListMembersRequest {
         request_header: Some(request_header()),
-        group_id: Some(convert::proto_group_id(&group)),
+        group_id: Some(convert::proto_group_id(group)),
         page_size: Some(500),
         page_token: page_token.take(),
         ..Default::default()
@@ -2745,8 +2753,7 @@ impl Engine {
         .collect()
     };
     users.sort_by_cached_key(|user| user.name.to_lowercase());
-    self.emit(Event::Members { group, users: Arc::new(users) });
-    Ok(())
+    Ok(users)
   }
 
   /// The commands of the apps in a conversation. The web app's other `/` entries (Drive, Calendar, Docs) are not
@@ -3095,19 +3102,20 @@ impl Engine {
   }
 
   /// Sends a message and waits for the server to take it. The app shows it like one typed there, and its text is
-  /// read for Google Chat's markers in the same way.
+  /// read for Google Chat's markers in the same way. `chips` are the mentions in `text`.
   pub(crate) async fn send_now(
     self: &Arc<Self>,
     group: &GroupId,
     topic_id: Option<&str>,
     text: &str,
+    chips: &[Chip],
     files: Vec<PathBuf>,
   ) -> Result<()> {
     if self.readonly {
       return Err(anyhow!("Working runs in read-only mode"));
     }
     let attached = files.iter().map(|path| local_attachment(path)).collect();
-    let typed = markup::parse(text, &[]);
+    let typed = markup::parse(text, chips);
     let pending = self
       .add_pending(group, topic_id, &typed, None, attached)
       .ok_or_else(|| anyhow!("the account is not loaded yet"))?;

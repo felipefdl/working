@@ -31,7 +31,7 @@ use super::shared::{
 };
 use crate::engine::{Engine, Page};
 use crate::fuzzy::Fuzzy;
-use crate::model::{AttachmentKind, Group, GroupId, GroupKind, Message, Micros, Notify};
+use crate::model::{AttachmentKind, Chip, ChipKind, Group, GroupId, GroupKind, Message, Micros, Notify, User};
 
 /// The chat part of the server's instructions: how to name conversations and that reads do not mark messages read.
 pub(super) const INSTRUCTIONS: &str = "Google Chat: catch up with inbox. To answer someone the user did not name, \
@@ -206,7 +206,7 @@ Read the conversation with read_conversation first: a send to a conversation not
         "type": "object",
         "properties": {
           "conversation": { "type": "string", "description": "The conversation's id (dm/… or space/…) or its full name." },
-          "text": { "type": "string", "description": "The message. Google Chat formatting works: *bold*, _italic_, `code`." },
+          "text": { "type": "string", "description": "The message. Google Chat formatting works: *bold*, _italic_, `code`. To mention a member, write @ and their full name as read_conversation shows it (@Jordan Park); in a space or a group chat, @all mentions everyone there." },
           "files": { "type": "array", "items": { "type": "string" }, "description": "Files to attach: absolute paths on this computer (~ works), such as ~/Documents/report.pdf." },
           "thread": { "type": "string", "description": "Reply in a thread: the #id that ends a top-level message in read_conversation." }
         },
@@ -1190,8 +1190,18 @@ async fn send_message(engine: &Arc<Engine>, reads: &Reads, arguments: Value) -> 
     1 => " with 1 file".to_string(),
     count => format!(" with {count} files"),
   };
+  // The members are asked for only when the text can hold a mention.
+  let members = if text.contains('@') {
+    engine
+      .members(&group.id)
+      .await
+      .map_err(|error| format!("Nothing was sent: the members of {} did not load ({error:#}).", label(&group)))?
+  } else {
+    Vec::new()
+  };
+  let mentions = mentions(text, group.kind, &members);
   engine
-    .send_now(&group.id, thread, text, files)
+    .send_now(&group.id, thread, text, &mentions, files)
     .await
     .map_err(|error| format!("Nothing was sent: {error:#}."))?;
   reads.clear();
@@ -1206,10 +1216,58 @@ async fn send_message(engine: &Arc<Engine>, reads: &Reads, arguments: Value) -> 
   ))
 }
 
+/// The mentions of a message written as plain text: each `@` that starts a word and is followed by the full name
+/// of a member (the longest that fits, in any case) or, in a conversation that has it (a space or a group chat), by
+/// `all`. A name two members share mentions neither. Without these the message says "@all" and mentions no one.
+fn mentions(text: &str, kind: GroupKind, members: &[User]) -> Vec<Chip> {
+  let everyone = matches!(kind, GroupKind::Space | GroupKind::GroupDm);
+  let word = |next: char| next.is_alphanumeric() || next == '_';
+  // What follows the `@` at `at` when it starts with `name` as whole words: where the name ends.
+  let named = |at: usize, name: &str| {
+    let end = at + 1 + name.len();
+    let said = text.get(at + 1..end)?;
+    let after = text.get(end..)?;
+    (said.eq_ignore_ascii_case(name) && !after.starts_with(word)).then_some(end)
+  };
+  let mut chips: Vec<Chip> = Vec::new();
+  for (at, _) in text.match_indices('@') {
+    let inside = chips.last().is_some_and(|chip| at < chip.range.end);
+    if inside || text.get(..at).is_some_and(|before| before.ends_with(char::is_alphanumeric)) {
+      continue;
+    }
+    let mut people: Vec<(usize, &User)> = members
+      .iter()
+      .filter(|user| !user.name.is_empty())
+      .filter_map(|user| Some((named(at, &user.name)?, user)))
+      .collect();
+    people.sort_by_key(|(end, _)| Reverse(*end));
+    let chip = match people.as_slice() {
+      [(end, _), (other, _), ..] if end == other => None,
+      [(end, user), ..] => Some(Chip {
+        range: at..*end,
+        kind: ChipKind::Mention {
+          user_id: user.id.clone(),
+          bot: user.is_bot,
+        },
+      }),
+      [] => named(at, "all").filter(|_| everyone).map(|end| Chip {
+        range: at..end,
+        kind: ChipKind::MentionAll,
+      }),
+    };
+    chips.extend(chip);
+  }
+  chips
+}
+
 #[cfg(test)]
 mod tests {
-  use super::{InboxArgs, MINUTE, ago, id_text, involvement, keep_newest, keep_oldest, list, parse, parse_id};
-  use crate::model::{Group, GroupId, GroupKind, Message, Micros, Notify, Placement, Reaction, Span, SpanKind};
+  use super::{
+    InboxArgs, MINUTE, ago, id_text, involvement, keep_newest, keep_oldest, list, mentions, parse, parse_id,
+  };
+  use crate::model::{
+    ChipKind, Group, GroupId, GroupKind, Message, Micros, Notify, Placement, Reaction, Span, SpanKind, User,
+  };
   use serde_json::json;
   use std::sync::Arc;
 
@@ -1295,6 +1353,69 @@ mod tests {
       kind: SpanKind::Mention(ME.into()),
     }];
     message
+  }
+
+  fn member(id: &str, name: &str) -> User {
+    User {
+      id: id.into(),
+      name: name.into(),
+      first_name: String::new(),
+      email: String::new(),
+      avatar_url: None,
+      is_bot: false,
+      deleted: false,
+    }
+  }
+
+  #[test]
+  fn at_all_is_a_mention_where_the_conversation_has_one() {
+    let found = |text: &str, kind| -> Vec<usize> {
+      let chips = mentions(text, kind, &[]);
+      chips.iter().map(|chip| chip.range.start).collect()
+    };
+    assert_eq!(found("@all standup moved, sorry @all.", GroupKind::Space), [0, 26]);
+    assert_eq!(found("(@all)", GroupKind::GroupDm), [1]);
+    // Part of another word or of an address, it is text.
+    assert_eq!(
+      found("@allison, jpark@all.example.com, @all_hands", GroupKind::Space),
+      [0_usize; 0]
+    );
+    // A conversation of two has no @all.
+    assert_eq!(found("@all", GroupKind::Dm), [0_usize; 0]);
+  }
+
+  #[test]
+  fn a_members_full_name_after_an_at_is_a_mention() {
+    let members = [
+      member("jp", "Jordan Park"),
+      member("j", "Jordan"),
+      member("rb1", "Riley Brooks"),
+      member("rb2", "Riley Brooks"),
+    ];
+    let found = |text: &str| -> Vec<(String, Option<String>)> {
+      mentions(text, GroupKind::Space, &members)
+        .into_iter()
+        .map(|chip| {
+          let who = match chip.kind {
+            ChipKind::Mention { user_id, .. } => Some(user_id),
+            _ => None,
+          };
+          (text[chip.range].to_string(), who)
+        })
+        .collect()
+    };
+    let mention = |said: &str, id: &str| (said.to_string(), Some(id.to_string()));
+    // The longest name that fits, in any case, up to the end of a word.
+    assert_eq!(
+      found("@Jordan Park, @jordan and @Jordan Parker"),
+      [mention("@Jordan Park", "jp"), mention("@jordan", "j"), mention("@Jordan", "j")]
+    );
+    assert_eq!(
+      found("thanks @Jordan Park's team, @all"),
+      [mention("@Jordan Park", "jp"), ("@all".to_string(), None)]
+    );
+    // A name two members share, someone who is not a member, and an address mention no one.
+    assert_eq!(found("@Riley Brooks @Sam Okafor jordan@Jordan"), []);
   }
 
   fn thread(messages: Vec<Message>) -> (Micros, Vec<Arc<Message>>) {
