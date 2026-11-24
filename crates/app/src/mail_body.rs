@@ -15,7 +15,7 @@ use wry::http::Response;
 use wry::{NewWindowResponse, RequestAsyncResponder};
 
 use crate::mail::MailView;
-use crate::mail_page::{self, Colors, PAGE_PATH, PAGE_URL, Report, SCHEME, image_request, image_type};
+use crate::mail_page::{self, Colors, PAGE_PATH, PAGE_URL, Report, SCHEME, image_request};
 use crate::settings::Settings;
 use crate::theme::{ACCENT, PANEL, TEXT, hex};
 use crate::webview;
@@ -293,7 +293,7 @@ impl MailView {
 pub async fn serve_image(core: Core, url: String, responder: RequestAsyncResponder) {
   let response = match core.fetch(url).await {
     Ok(bytes) => Response::builder()
-      .header("Content-Type", image_type(&bytes))
+      .header("Content-Type", gchat_core::image_type(&bytes))
       .body(Cow::Owned(bytes.to_vec())),
     Err(_) => Response::builder().status(404).body(Cow::Borrowed(&[][..])),
   };

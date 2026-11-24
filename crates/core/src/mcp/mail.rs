@@ -4,10 +4,15 @@
 //! app (`Engine::mail_on`); otherwise it answers that Mail is off, without contacting Gmail.
 #![allow(clippy::too_many_lines, reason = "tool schemas are verbose JSON")]
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::hash::{DefaultHasher, Hash as _, Hasher as _};
-use std::path::Path;
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -26,7 +31,9 @@ use crate::model::{
 /// The mail part of the server's instructions: what every mail tool shares, said once.
 pub(super) const INSTRUCTIONS: &str = "Gmail: the mail tools answer only while Mail is on in Working. mail_inbox \
 lists a mailbox or one of the user's labels and mail_search finds threads with Gmail's own search words, both 50 \
-threads a page; mail_read_thread reads a thread's emails, mail_attachment opens a file of one, and mail_labels names \
+threads a page; mail_read_thread reads a thread's emails as plain text, mail_html saves them as HTML pages that look \
+as they do in Gmail, mail_eml saves them as .eml files exactly as they were sent, mail_attachment opens a file of \
+one, and mail_labels names \
 the labels. Reading changes nothing: threads stay unread. When the user allowed it, the other mail tools write: \
 mail_send sends a new email, mail_reply answers in a thread, mail_forward sends an email of a thread on to others \
 (without its files), mail_draft saves an email in Gmail's Drafts and mail_send_draft sends it, and mail_archive, \
@@ -34,10 +41,12 @@ mail_mark, mail_star, and mail_label change threads. Writes are real and show in
 reaches its recipients at once: send only what the user asked for.";
 
 /// The tools that read, each answering only while Mail is on (`Engine::mail_on`).
-const TOOLS: [&str; 5] = [
+const TOOLS: [&str; 7] = [
   "mail_inbox",
   "mail_search",
   "mail_read_thread",
+  "mail_html",
+  "mail_eml",
   "mail_labels",
   "mail_attachment",
 ];
@@ -69,8 +78,11 @@ const READ_ONLY_MODE: &str = "Working runs in read-only mode: nothing was change
 
 /// Threads in one page of Gmail's list.
 const PAGE_SIZE: usize = 50;
-/// The largest file `mail_attachment` downloads, in bytes.
+/// The largest file `mail_attachment` and `mail_eml` save, and the most images `mail_html` embeds in one email, in
+/// bytes.
 const MAX_FILE: u64 = 25 * 1024 * 1024;
+/// What a saved email's page may load: its images and styles only. Nothing of the email runs.
+const SAVED_CSP: &str = "default-src 'none'; img-src data: https: http:; style-src 'unsafe-inline'; font-src data:";
 
 /// Tool descriptors; the ones that change mail only when `writable`.
 pub(super) fn list(writable: bool) -> Vec<Value> {
@@ -123,7 +135,8 @@ pub(super) fn list(writable: bool) -> Vec<Value> {
       "description": "Read the emails of one Gmail thread, oldest first, as plain text: each one's id, who wrote it, \
     to and copied whom, when, its files numbered (mail_attachment opens one), and its text. Each email's text leaves \
     out the earlier emails it quotes unless `quotes` is true. For a long thread, `last` reads only the newest emails \
-    and `message` one email by its id. A draft not sent yet is marked as one.",
+    and `message` one email by its id. A draft not sent yet is marked as one. For an email as it looks, to print it \
+    or make a PDF of it, call mail_html.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -131,6 +144,48 @@ pub(super) fn list(writable: bool) -> Vec<Value> {
           "message": { "type": "string", "description": "Read only this email: its id from an earlier mail_read_thread." },
           "last": { "type": "integer", "description": "Read only the newest this many emails." },
           "quotes": { "type": "boolean", "description": "Keep the earlier emails each one quotes. Default false." }
+        },
+        "required": ["thread"],
+        "additionalProperties": false
+      },
+      "annotations": read_only,
+    }),
+    json!({
+      "name": "mail_html",
+      "title": "Save emails as HTML pages",
+      "description": "Save the emails of one Gmail thread as HTML pages on this computer, one page an email, in \
+    Working's own folder, which Working empties when it starts. Each page is the email as it looks in Gmail, quoted \
+    emails included, under who wrote it, to and copied whom, and when; the images inside the email that only the \
+    user's Gmail session opens are embedded in the page, and images from the web stay as addresses a browser loads. \
+    Answers where each page was saved, never the HTML itself: open the page in a browser, or print it to a PDF with \
+    one. `last` saves only the newest emails and `message` one email by its id.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "thread": { "type": "string", "description": "The thread id that mail_inbox or mail_search gave, such as thread-f:1794896454636." },
+          "message": { "type": "string", "description": "Save only this email: its id from mail_read_thread." },
+          "last": { "type": "integer", "description": "Save only the newest this many emails." }
+        },
+        "required": ["thread"],
+        "additionalProperties": false
+      },
+      "annotations": read_only,
+    }),
+    json!({
+      "name": "mail_eml",
+      "title": "Save emails as .eml files",
+      "description": "Save the emails of one Gmail thread as .eml files on this computer, one file an email, in \
+    Working's own folder, which Working empties when it starts. A file is the email exactly as it was sent (RFC 5322): \
+    every header, its plain text and HTML parts, the images inside it, and its attached files. Use it to archive an \
+    email, move it to another mail program, or read its headers; to read an email use mail_read_thread, and to see \
+    or print it mail_html. Answers where each file was saved, never its contents. `last` saves only the newest \
+    emails and `message` one email by its id. A draft not sent has no such file, and one over 25 MB is refused.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "thread": { "type": "string", "description": "The thread id that mail_inbox or mail_search gave, such as thread-f:1794896454636." },
+          "message": { "type": "string", "description": "Save only this email: its id from mail_read_thread." },
+          "last": { "type": "integer", "description": "Save only the newest this many emails." }
         },
         "required": ["thread"],
         "additionalProperties": false
@@ -408,6 +463,8 @@ pub(super) async fn call(engine: &Arc<Engine>, writable: bool, name: &str, argum
     "mail_inbox" => mail_inbox(engine, arguments).await,
     "mail_search" => mail_search(engine, arguments).await,
     "mail_read_thread" => mail_read_thread(engine, arguments).await,
+    "mail_html" => mail_html(engine, arguments).await,
+    "mail_eml" => mail_eml(engine, arguments).await,
     "mail_attachment" => mail_attachment(engine, arguments).await,
     "mail_send" => mail_send(engine, arguments).await,
     "mail_reply" => mail_reply(engine, arguments).await,
@@ -470,6 +527,16 @@ struct MailReadArgs {
   last: Option<usize>,
   #[serde(default, deserialize_with = "loose_flag")]
   quotes: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MailSaveArgs {
+  thread: String,
+  #[serde(default, deserialize_with = "loose_text")]
+  message: Option<String>,
+  #[serde(default, deserialize_with = "loose_count")]
+  last: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -1006,12 +1073,11 @@ struct Reading<'a> {
   quotes: bool,
 }
 
-/// What `mail_read_thread` answers: the emails `reading` asks for, oldest first, as plain text.
-fn thread_text(thread: &str, messages: &[MailMessage], reading: &Reading<'_>) -> Result<String, String> {
+/// Where in a thread the emails `reading` asks for are.
+fn span(thread: &str, messages: &[MailMessage], reading: &Reading<'_>) -> Result<Range<usize>, String> {
   let count = messages.len();
-  let plural = if count == 1 { "" } else { "s" };
-  let (start, end, mut out) = match (reading.message, reading.last) {
-    (Some(_), Some(_)) => return Err("Pass `message` or `last`, not both.".into()),
+  match (reading.message, reading.last) {
+    (Some(_), Some(_)) => Err("Pass `message` or `last`, not both.".into()),
     (Some(id), None) => {
       let index = messages.iter().position(|message| message.id == id).ok_or_else(|| {
         let ids: Vec<&str> = messages.iter().map(|message| message.id.as_str()).collect();
@@ -1020,21 +1086,31 @@ fn thread_text(thread: &str, messages: &[MailMessage], reading: &Reading<'_>) ->
           ids.join(", ")
         )
       })?;
-      (index, index + 1, String::new())
+      Ok(index..index + 1)
     },
-    (None, Some(last)) if last < count => {
-      let start = count - last.max(1);
-      let older: Vec<&str> = messages.iter().take(start).map(|message| message.id.as_str()).collect();
-      let out = format!(
-        "The newest {} of {count} emails, oldest first. {} older left out: mail_read_thread thread=\"{thread}\" \
-         last={count} reads them all, or message=\"<id>\" one of them ({}).\n",
-        count - start,
-        start,
-        older.join(", ")
-      );
-      (start, count, out)
-    },
-    (None, _) => (0, count, format!("{count} email{plural}, oldest first.\n")),
+    (None, Some(last)) if last < count => Ok(count - last.max(1)..count),
+    (None, _) => Ok(0..count),
+  }
+}
+
+/// What `mail_read_thread` answers: the emails `reading` asks for, oldest first, as plain text.
+fn thread_text(thread: &str, messages: &[MailMessage], reading: &Reading<'_>) -> Result<String, String> {
+  let count = messages.len();
+  let plural = if count == 1 { "" } else { "s" };
+  let Range { start, end } = span(thread, messages, reading)?;
+  let mut out = if reading.message.is_some() {
+    String::new()
+  } else if start > 0 {
+    let older: Vec<&str> = messages.iter().take(start).map(|message| message.id.as_str()).collect();
+    format!(
+      "The newest {} of {count} emails, oldest first. {} older left out: mail_read_thread thread=\"{thread}\" \
+       last={count} reads them all, or message=\"<id>\" one of them ({}).\n",
+      count - start,
+      start,
+      older.join(", ")
+    )
+  } else {
+    format!("{count} email{plural}, oldest first.\n")
   };
   for (offset, message) in messages.get(start..end).unwrap_or_default().iter().enumerate() {
     email_text(&mut out, thread, message, start + offset + 1, count, reading.quotes);
@@ -1096,6 +1172,177 @@ async fn mail_read_thread(engine: &Arc<Engine>, arguments: Value) -> Result<Stri
     quotes: args.quotes,
   };
   Ok(keep_end(thread_text(&thread, &messages, &reading)?))
+}
+
+// ---- Saving emails as pages ----
+
+/// An image's bytes as the `data:` address a page carries it in.
+fn data_address(bytes: &[u8]) -> String {
+  format!("data:{};base64,{}", crate::mail::image_type(bytes), BASE64.encode(bytes))
+}
+
+/// `html` with each image address `data` has an embedded form for (`addresses` is `mail::image_addresses` of it)
+/// replaced by that form. The others stay as they are.
+fn with_images(html: &str, addresses: &[(Range<usize>, String)], data: &HashMap<&str, Option<String>>) -> String {
+  let mut out = String::with_capacity(html.len());
+  let mut copied = 0;
+  for (span, address) in addresses {
+    let Some(Some(embedded)) = data.get(address.as_str()) else {
+      continue;
+    };
+    out.push_str(html.get(copied..span.start).unwrap_or_default());
+    out.push_str(embedded);
+    copied = span.end;
+  }
+  out.push_str(html.get(copied..).unwrap_or_default());
+  out
+}
+
+/// An email's HTML with the images only Gmail's cookies open (`mail::is_mail_url`) embedded, how many were, and how
+/// many could not be: one that did not download, or that would take the email's images past `MAX_FILE`.
+async fn embed_images(engine: &Arc<Engine>, html: &str) -> (String, usize, usize) {
+  let addresses = crate::mail::image_addresses(html);
+  let mut data: HashMap<&str, Option<String>> = HashMap::new();
+  let mut room = usize::try_from(MAX_FILE).unwrap_or(usize::MAX);
+  for (_, address) in &addresses {
+    if !crate::mail::is_mail_url(address) || data.contains_key(address.as_str()) {
+      continue;
+    }
+    let image = engine.mail_file(address).await.ok().filter(|bytes| bytes.len() <= room);
+    if let Some(bytes) = &image {
+      room -= bytes.len();
+    }
+    data.insert(address, image.as_deref().map(data_address));
+  }
+  let embedded = data.values().flatten().count();
+  (with_images(html, &addresses, &data), embedded, data.len() - embedded)
+}
+
+/// The page `mail_html` saves for an email: who wrote it, to whom, and when, then `body`, its HTML (its plain text
+/// when it has none).
+fn email_page(message: &MailMessage, body: &str) -> String {
+  let mut head = String::new();
+  let mut row = |name: &str, value: &str| {
+    let _ = write!(head, "<tr><th>{name}</th><td>{}</td></tr>", crate::mail::escape_html(value));
+  };
+  row("From", &person(&message.from));
+  for (name, addresses) in [("To", &message.to), ("Cc", &message.cc), ("Bcc", &message.bcc)] {
+    if !addresses.is_empty() {
+      row(name, &people(addresses));
+    }
+  }
+  row("Date", &stamp(message.time));
+  let text;
+  let body = if body.is_empty() {
+    text = format!("<pre id=\"working-text\">{}</pre>", crate::mail::escape_html(&message.text));
+    &text
+  } else {
+    body
+  };
+  format!(
+    "<!doctype html><html><head><meta charset=\"utf-8\">\
+     <meta http-equiv=\"Content-Security-Policy\" content=\"{SAVED_CSP}\"><title>{}</title>\
+     <style>body{{margin:24px;font:14px/1.45 system-ui,sans-serif}}img{{max-width:100%;height:auto}}\
+     #working-head{{width:100%;margin:0 0 16px;border-bottom:1px solid #ccc;border-collapse:collapse}}\
+     #working-head th{{width:1%;padding:0 12px 4px 0;text-align:left;vertical-align:top;white-space:nowrap}}\
+     #working-head td{{padding:0 0 4px}}#working-text{{font:inherit;white-space:pre-wrap}}</style></head>\
+     <body><table id=\"working-head\">{head}</table><div>{body}</div></body></html>",
+    crate::mail::escape_html(&person(&message.from))
+  )
+}
+
+/// Saves `bytes` in `paths::scratch_dir()` under `name` (a `scratch_name`), and gives them back with where.
+async fn save_scratch(name: String, bytes: Vec<u8>) -> Result<(PathBuf, Vec<u8>), String> {
+  let path = crate::paths::scratch_dir().join(name);
+  tokio::task::spawn_blocking(move || crate::paths::write_private(&path, &bytes).map(|()| (path, bytes)))
+    .await
+    .map_err(|error| format!("The file could not be saved: {error}."))?
+    .map_err(|error| format!("The file could not be saved: {error}."))
+}
+
+async fn mail_html(engine: &Arc<Engine>, arguments: Value) -> Result<String, String> {
+  let args: MailSaveArgs = parse(arguments)?;
+  let thread = thread_arg(&args.thread)?;
+  let messages = thread_messages(engine, &thread).await?;
+  let reading = Reading {
+    message: args.message.as_deref(),
+    last: args.last,
+    quotes: true,
+  };
+  let Range { start, end } = span(&thread, &messages, &reading)?;
+  let count = messages.len();
+  let mut out = format!(
+    "{} of the thread's {count} saved as HTML pages, oldest first. Open one in a browser, or print it to a PDF with \
+     one. Working empties that folder when it starts.\n",
+    end - start
+  );
+  for (offset, message) in messages.get(start..end).unwrap_or_default().iter().enumerate() {
+    let (body, embedded, missed) = embed_images(engine, &message.html).await;
+    let name = scratch_name(&format!("{thread}/{}", message.id), &format!("{}.html", message.id));
+    let (path, page) = save_scratch(name, email_page(message, &body).into_bytes()).await?;
+    let size = u64::try_from(page.len()).unwrap_or(u64::MAX);
+    let _ = writeln!(out, "\n--- Email {} of {count} (id {}) ---", start + offset + 1, message.id);
+    let _ = writeln!(out, "From: {}", person(&message.from));
+    let _ = writeln!(out, "Date: {}", stamp(message.time));
+    let _ = writeln!(out, "Saved at: {} ({})", path.display(), size_text(size));
+    if embedded > 0 {
+      let _ = writeln!(out, "Images embedded: {embedded}");
+    }
+    if missed > 0 {
+      let _ = writeln!(out, "Images that could not be embedded and stay as Gmail addresses: {missed}");
+    }
+  }
+  Ok(out)
+}
+
+async fn mail_eml(engine: &Arc<Engine>, arguments: Value) -> Result<String, String> {
+  let args: MailSaveArgs = parse(arguments)?;
+  let thread = thread_arg(&args.thread)?;
+  let messages = thread_messages(engine, &thread).await?;
+  let reading = Reading {
+    message: args.message.as_deref(),
+    last: args.last,
+    quotes: true,
+  };
+  let Range { start, end } = span(&thread, &messages, &reading)?;
+  let count = messages.len();
+  let mut out = String::new();
+  let mut saved = 0;
+  for (offset, message) in messages.get(start..end).unwrap_or_default().iter().enumerate() {
+    let _ = writeln!(out, "\n--- Email {} of {count} (id {}) ---", start + offset + 1, message.id);
+    let _ = writeln!(out, "From: {}", person(&message.from));
+    let _ = writeln!(out, "Date: {}", stamp(message.time));
+    if message.draft {
+      let _ = writeln!(out, "Not saved: a draft not sent has no .eml file.");
+      continue;
+    }
+    let bytes = match engine.mail_original(&message.id).await {
+      Ok(bytes) => bytes,
+      Err(error) => {
+        let _ = writeln!(out, "Not saved: {error:#}.");
+        continue;
+      },
+    };
+    let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    if size > MAX_FILE {
+      let _ = writeln!(
+        out,
+        "Not saved: it is {}, and mail_eml saves files up to 25 MB.",
+        size_text(size)
+      );
+      continue;
+    }
+    let name = scratch_name(&format!("{thread}/{}/eml", message.id), &format!("{}.eml", message.id));
+    let (path, _) = save_scratch(name, bytes).await?;
+    let _ = writeln!(out, "Saved at: {} ({})", path.display(), size_text(size));
+    saved += 1;
+  }
+  if saved == 0 {
+    return Err(format!("No email was saved.\n{out}"));
+  }
+  Ok(format!(
+    "{saved} of the thread's {count} saved as .eml files, oldest first. Working empties that folder when it starts.\n{out}"
+  ))
 }
 
 /// A thread's emails read now, with an error that says what to pass instead.
@@ -1258,12 +1505,7 @@ async fn mail_attachment(engine: &Arc<Engine>, arguments: Value) -> Result<Strin
   if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_FILE {
     return Err(too_big(file));
   }
-  let path = crate::paths::scratch_dir().join(scratch_name(&file.url, &file.name));
-  let target = path.clone();
-  let bytes = tokio::task::spawn_blocking(move || crate::paths::write_private(&target, &bytes).map(|()| bytes))
-    .await
-    .map_err(|error| format!("The file could not be saved: {error}."))?
-    .map_err(|error| format!("The file could not be saved: {error}."))?;
+  let (path, bytes) = save_scratch(scratch_name(&file.url, &file.name), bytes).await?;
   Ok(file_answer(file, &bytes, &path))
 }
 
@@ -1746,10 +1988,10 @@ mod tests {
   use super::{
     Batch, Gate, MAIL_OFF, MailArchiveArgs, MailAttachmentArgs, MailDraftArgs, MailForwardArgs, MailInboxArgs,
     MailLabelArgs, MailMarkArgs, MailReadArgs, MailReplyArgs, MailSendArgs, MailStarArgs, READ_ONLY_MODE, Reading,
-    TOOLS, WRITE_OFF, WRITE_TOOLS, address_of, compose_of, draft_answer, file_answer, file_text, find_label,
-    forward_answer, forwarded, is_text, label_change, label_lines, label_note, list, page_answer, page_arg, pick_file,
-    recipients, refusal, reply_plan, scratch_name, send_text, sent_draft_answer, size_text, thread_arg, thread_args,
-    thread_list, thread_text,
+    TOOLS, WRITE_OFF, WRITE_TOOLS, address_of, compose_of, data_address, draft_answer, email_page, file_answer,
+    file_text, find_label, forward_answer, forwarded, is_text, label_change, label_lines, label_note, list,
+    page_answer, page_arg, pick_file, recipients, refusal, reply_plan, scratch_name, send_text, sent_draft_answer,
+    size_text, thread_arg, thread_args, thread_list, thread_text, with_images,
   };
   use crate::mail::ThreadPage;
   use crate::mcp::shared::parse;
@@ -1757,6 +1999,7 @@ mod tests {
     MailAddress, MailAttachment, MailDraft, MailDraftSent, MailLabel, MailMessage, MailReply, MailThread,
   };
   use serde_json::json;
+  use std::collections::HashMap;
 
   fn names(tools: &[serde_json::Value]) -> Vec<&str> {
     tools.iter().filter_map(|tool| tool["name"].as_str()).collect()
@@ -2090,6 +2333,38 @@ mod tests {
     sent.bcc = vec![avery()];
     let text = thread_text("thread-f:9", &[sent], &Reading::default()).unwrap();
     assert!(text.contains("\nCc: rbrooks@example.com\nBcc: Avery Morgan <amorgan@example.com>\nDate: "));
+  }
+
+  #[test]
+  fn a_saved_page_embeds_the_images_gmail_holds_and_escapes_its_heading() {
+    let inline = "https://mail.google.com/mail/u/0/?ui=2&view=fimg&attid=0.1";
+    let html = "<p>Beans</p><img src=\"https://mail.google.com/mail/u/0/?ui=2&amp;view=fimg&amp;attid=0.1\">\
+                <img src=\"https://ci3.googleusercontent.com/proxy/abc\">\
+                <img src='https://mail.google.com/mail/u/0/?attid=0.2'>";
+    let addresses = crate::mail::image_addresses(html);
+    let mut data = HashMap::new();
+    data.insert(inline, Some(data_address(&[0x89, b'P', b'N', b'G'])));
+    // One that did not download stays as its address.
+    data.insert("https://mail.google.com/mail/u/0/?attid=0.2", None);
+    let body = with_images(html, &addresses, &data);
+    assert_eq!(
+      body,
+      "<p>Beans</p><img src=\"data:image/png;base64,iVBORw==\">\
+       <img src=\"https://ci3.googleusercontent.com/proxy/abc\">\
+       <img src='https://mail.google.com/mail/u/0/?attid=0.2'>"
+    );
+
+    let mut from = jordan();
+    from.name = "Jordan <Park>".into();
+    let mut message = email("msg-f:1", from, vec![riley()], Vec::new());
+    let page = email_page(&message, &body);
+    assert!(page.contains("<tr><th>From</th><td>Jordan &lt;Park&gt; &lt;jpark@example.com&gt;</td></tr>"));
+    assert!(page.contains("<tr><th>To</th><td>rbrooks@example.com</td></tr><tr><th>Date</th>"));
+    assert!(!page.contains("<th>Cc</th>"));
+    assert!(page.find("Content-Security-Policy").unwrap() < page.find("<p>Beans</p>").unwrap());
+    // An email with no HTML is saved as its text.
+    message.text = "Noon? <3".into();
+    assert!(email_page(&message, "").contains("<pre id=\"working-text\">Noon? &lt;3</pre>"));
   }
 
   fn conversation() -> Vec<MailMessage> {

@@ -47,6 +47,14 @@ const groups: Group[] = [
         "mail_read_thread",
         "The emails of one thread, oldest first, as plain text: each email's id, who wrote it, to, copied, and hidden copies on your own sent emails, when, its files numbered, and its body without the earlier emails it quotes. A draft not sent is marked as one.",
       ],
+      [
+        "mail_html",
+        "Saves the emails of one thread as HTML pages in Working's own folder, one page an email, as the email looks in Gmail, with the pictures inside it embedded. An agent opens a page in a browser or prints it to a PDF.",
+      ],
+      [
+        "mail_eml",
+        "Saves the emails of one thread as .eml files in Working's own folder, each the email exactly as it was sent, with every header, part, and attached file, for archiving it or opening it in another mail program. A draft has none, and files over 25 MB are refused.",
+      ],
       ["mail_labels", "Your own labels, nested ones as Parent/Child, with their unread counts."],
       [
         "mail_attachment",

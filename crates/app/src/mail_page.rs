@@ -105,81 +105,20 @@ pub fn page(html: &str, colors: Colors) -> String {
 /// The email with each image the core fetches (`src` and `background` attributes inside tags, `fetched_by_app`)
 /// asked of the app instead, which fetches it through the core: `/image?u=…`. Other values stay as they are.
 pub fn route_images(html: &str) -> String {
-  let lower = html.to_ascii_lowercase();
   let mut out = String::with_capacity(html.len());
   let mut copied = 0;
-  let mut from = 0;
-  while let Some((start, end)) = next_remote_value(&lower, from) {
-    let remote = unescape(&html[start..end]);
-    out.push_str(&html[copied..start]);
+  for (span, remote) in gchat_core::image_addresses(html) {
+    if !fetched_by_app(&remote) {
+      continue;
+    }
+    out.push_str(&html[copied..span.start]);
     out.push_str(IMAGE_PATH);
     out.push_str("?u=");
     out.push_str(&percent_encode(remote.trim()));
-    copied = end;
-    from = end;
+    copied = span.end;
   }
   out.push_str(&html[copied..]);
   out
-}
-
-/// The span of the next `src` or `background` value inside a tag, from byte `from` on, that names an address
-/// `fetched_by_app` takes. `lower` is the HTML in ASCII lowercase, so its offsets are those of the HTML.
-fn next_remote_value(lower: &str, mut from: usize) -> Option<(usize, usize)> {
-  let bytes = lower.as_bytes();
-  loop {
-    let (at, name) = ["src", "background"]
-      .iter()
-      .filter_map(|name| lower[from..].find(name).map(|at| (from + at, *name)))
-      .min_by_key(|(at, _)| *at)?;
-    from = at + name.len();
-    // An attribute: after a space, inside a tag (a `<` after the last `>`).
-    let after_space = at > 0 && bytes[at - 1].is_ascii_whitespace();
-    // `None < Some(_)`: no `>` before the `<` still counts as inside it.
-    let in_tag = lower[..at].rfind('<') > lower[..at].rfind('>');
-    if !after_space || !in_tag {
-      continue;
-    }
-    let mut cursor = from;
-    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-      cursor += 1;
-    }
-    if bytes.get(cursor) != Some(&b'=') {
-      continue;
-    }
-    cursor += 1;
-    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
-      cursor += 1;
-    }
-    let (start, end) = match bytes.get(cursor) {
-      Some(&quote @ (b'"' | b'\'')) => {
-        let start = cursor + 1;
-        let end = lower[start..].find(char::from(quote)).map(|len| start + len)?;
-        (start, end)
-      },
-      Some(_) => {
-        let end = lower[cursor..]
-          .find(|c: char| c.is_ascii_whitespace() || c == '>')
-          .map_or(lower.len(), |len| cursor + len);
-        (cursor, end)
-      },
-      None => return None,
-    };
-    from = end;
-    if fetched_by_app(lower[start..end].trim_start()) {
-      return Some((start, end));
-    }
-  }
-}
-
-/// An attribute value as the browser reads it: the character references email HTML puts in addresses decoded.
-fn unescape(value: &str) -> String {
-  value
-    .replace("&amp;", "&")
-    .replace("&#38;", "&")
-    .replace("&quot;", "\"")
-    .replace("&#39;", "'")
-    .replace("&lt;", "<")
-    .replace("&gt;", ">")
 }
 
 /// `text` with every byte but letters, digits, and `-_.~` as `%XX`.
@@ -234,21 +173,6 @@ fn fetched_by_app(url: &str) -> bool {
   ["http://", "https://", "demo:image/"]
     .iter()
     .any(|scheme| lower.starts_with(scheme))
-}
-
-/// The content type of an image by its first bytes, for the page's image responses.
-pub fn image_type(bytes: &[u8]) -> &'static str {
-  match bytes {
-    [0x89, b'P', b'N', b'G', ..] => "image/png",
-    [0xff, 0xd8, 0xff, ..] => "image/jpeg",
-    [b'G', b'I', b'F', b'8', ..] => "image/gif",
-    [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
-    [b'B', b'M', ..] => "image/bmp",
-    _ if bytes.trim_ascii_start().starts_with(b"<svg") || bytes.trim_ascii_start().starts_with(b"<?xml") => {
-      "image/svg+xml"
-    },
-    _ => "application/octet-stream",
-  }
 }
 
 /// Whether a link of an email opens in the browser: web pages and mail addresses only.
@@ -380,16 +304,6 @@ mod tests {
     assert_eq!(image_request("/image", Some("u=demo%3Afile%2Fnotes.txt")), None);
     assert_eq!(image_request("/image", Some("u=demo%3Aupload%2F%2Ftmp%2Fx.png")), None);
     assert_eq!(image_request("/image", Some("u=javascript%3Aalert(1)")), None);
-  }
-
-  #[test]
-  fn images_are_typed_by_their_first_bytes() {
-    assert_eq!(image_type(&[0x89, b'P', b'N', b'G', 0x0d]), "image/png");
-    assert_eq!(image_type(&[0xff, 0xd8, 0xff, 0xe0]), "image/jpeg");
-    assert_eq!(image_type(b"GIF89a"), "image/gif");
-    assert_eq!(image_type(b"RIFF\0\0\0\0WEBPVP8 "), "image/webp");
-    assert_eq!(image_type(b"  <svg xmlns=\"http://www.w3.org/2000/svg\"/>"), "image/svg+xml");
-    assert_eq!(image_type(b"???"), "application/octet-stream");
   }
 
   #[test]

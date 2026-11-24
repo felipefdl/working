@@ -4555,6 +4555,11 @@ impl Engine {
     self.mail.fetch(url).await
   }
 
+  /// An email as it was sent (`mail::Client::original`), downloaded now, for agents. Callers check `mail_on` first.
+  pub(crate) async fn mail_original(&self, message: &str) -> Result<Vec<u8>> {
+    self.mail.original(message).await
+  }
+
   /// The user's labels for agents: as last told, or read now from the inbox's first page when none were. Callers
   /// check `mail_on` first.
   pub(crate) async fn mail_labels(&self) -> Result<Vec<MailLabel>> {

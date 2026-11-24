@@ -362,6 +362,20 @@ impl Client {
     self.with_session(|session| async move { session.fetch(url).await }).await
   }
 
+  /// An email as it was sent (RFC 5322: every header and part, what Gmail's "Download message" saves), by its id.
+  pub async fn original(&self, message: &str) -> Result<Vec<u8>> {
+    self
+      .with_session(|session| async move {
+        let bytes = session.fetch(&original_url(&session.id_key, message)?).await?;
+        // Gmail answers an id it does not know with a page, not with a message.
+        if bytes.trim_ascii_start().starts_with(b"<") {
+          bail!("Gmail has no original of this email");
+        }
+        Ok(bytes)
+      })
+      .await
+  }
+
   /// The account's signatures as the session's page gave them; a new session (after a 400 or 401, or `close`) reads
   /// them again.
   pub(crate) async fn signatures(&self) -> Result<Signatures> {
@@ -600,6 +614,8 @@ impl<'a> NewText<'a> {
 struct Session {
   http: reqwest::Client,
   xsrf: String,
+  /// The page's id key (`ik`), which Gmail's download addresses name.
+  id_key: String,
   /// The `x-gmail-btai` header with this session's fields; `BTAI_NOW` is set per call.
   btai: Value,
   /// The `c` parameter: the page's sync calls count up from 0.
@@ -650,9 +666,11 @@ impl Session {
     let config = PageConfig::parse(&page)?;
     let offset_ms = i64::from(jiff::ZonedDateTime::now().offset().seconds()) * 1000;
     let btai = config.btai(USER_AGENT, offset_ms, &crate::engine::device_time_zone());
+    let id_key = config.id_key;
     Ok(Self {
       http,
       xsrf: config.xsrf,
+      id_key,
       btai,
       calls: AtomicU64::new(0),
       me: config.me,
@@ -859,6 +877,18 @@ impl Session {
     }
     Ok(response.bytes().await?.to_vec())
   }
+}
+
+/// Where Gmail serves an email as it was sent: the address of its "Download message", for the page's id key.
+fn original_url(id_key: &str, message: &str) -> Result<String> {
+  let params = [
+    ("ik", id_key),
+    ("view", "att"),
+    ("permmsgid", message),
+    ("disp", "comp"),
+    ("safe", "1"),
+  ];
+  Ok(reqwest::Url::parse_with_params(PAGE, params)?.into())
 }
 
 /// A request that failed: one that ran out of time says how long it waited, safe to show.
@@ -1661,7 +1691,7 @@ fn forward_subject(subject: &str) -> String {
 }
 
 /// `text` with the characters HTML gives meaning to written as references.
-fn escape_html(text: &str) -> String {
+pub(crate) fn escape_html(text: &str) -> String {
   let mut out = String::with_capacity(text.len());
   for character in text.chars() {
     match character {
@@ -2239,6 +2269,95 @@ pub(crate) fn looks_like_image(bytes: &[u8]) -> bool {
     || bytes.starts_with(b"MM\0*")
     || (at(0..4) == b"RIFF" && at(8..12) == b"WEBP")
     || (at(4..8) == b"ftyp" && [&b"avif"[..], b"avis", b"heic", b"heix", b"mif1"].contains(&at(8..12)))
+}
+
+/// The content type of an image by its first bytes, for a page's image responses and `data:` addresses.
+pub fn image_type(bytes: &[u8]) -> &'static str {
+  match bytes {
+    [0x89, b'P', b'N', b'G', ..] => "image/png",
+    [0xff, 0xd8, 0xff, ..] => "image/jpeg",
+    [b'G', b'I', b'F', b'8', ..] => "image/gif",
+    [b'R', b'I', b'F', b'F', _, _, _, _, b'W', b'E', b'B', b'P', ..] => "image/webp",
+    [b'B', b'M', ..] => "image/bmp",
+    _ if bytes.trim_ascii_start().starts_with(b"<svg") || bytes.trim_ascii_start().starts_with(b"<?xml") => {
+      "image/svg+xml"
+    },
+    _ => "application/octet-stream",
+  }
+}
+
+/// Where an email's HTML names its images, in order.
+///
+/// Each is the span of a `src` or `background` value inside a tag, with the address as the browser reads it (the
+/// character references email HTML puts in addresses decoded). Text that only reads like an attribute is not one.
+pub fn image_addresses(html: &str) -> Vec<(std::ops::Range<usize>, String)> {
+  let lower = html.to_ascii_lowercase();
+  let mut found = Vec::new();
+  let mut from = 0;
+  while let Some((start, end)) = next_image_value(&lower, from) {
+    let address = html
+      .get(start..end)
+      .unwrap_or_default()
+      .replace("&amp;", "&")
+      .replace("&#38;", "&")
+      .replace("&quot;", "\"")
+      .replace("&#39;", "'")
+      .replace("&lt;", "<")
+      .replace("&gt;", ">");
+    found.push((start..end, address));
+    from = end;
+  }
+  found
+}
+
+/// The span of the next `src` or `background` value inside a tag, from byte `from` on. `lower` is the HTML in ASCII
+/// lowercase, so its offsets are those of the HTML.
+fn next_image_value(lower: &str, mut from: usize) -> Option<(usize, usize)> {
+  let bytes = lower.as_bytes();
+  let after = |at: usize| lower.get(at..).unwrap_or_default();
+  loop {
+    let (at, name) = ["src", "background"]
+      .iter()
+      .filter_map(|name| after(from).find(name).map(|at| (from + at, *name)))
+      .min_by_key(|(at, _)| *at)?;
+    from = at + name.len();
+    // An attribute: after a space, inside a tag (a `<` after the last `>`).
+    let after_space = at
+      .checked_sub(1)
+      .and_then(|before| bytes.get(before))
+      .is_some_and(u8::is_ascii_whitespace);
+    // `None < Some(_)`: no `>` before the `<` still counts as inside it.
+    let before = lower.get(..at).unwrap_or_default();
+    let in_tag = before.rfind('<') > before.rfind('>');
+    if !after_space || !in_tag {
+      continue;
+    }
+    let mut cursor = from;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+      cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'=') {
+      continue;
+    }
+    cursor += 1;
+    while bytes.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+      cursor += 1;
+    }
+    return match bytes.get(cursor) {
+      Some(&quote @ (b'"' | b'\'')) => {
+        let start = cursor + 1;
+        let end = after(start).find(char::from(quote)).map(|len| start + len)?;
+        Some((start, end))
+      },
+      Some(_) => {
+        let end = after(cursor)
+          .find(|c: char| c.is_ascii_whitespace() || c == '>')
+          .map_or(lower.len(), |len| cursor + len);
+        Some((cursor, end))
+      },
+      None => None,
+    };
+  }
 }
 
 #[cfg(test)]
@@ -2873,6 +2992,24 @@ mod tests {
     assert!(!looks_like_image(b"%PDF-1.7"));
     assert!(!looks_like_image(b"\x1f\x8b\x08"));
     assert!(!looks_like_image(b""));
+  }
+
+  #[test]
+  fn an_original_is_asked_for_by_its_message_id() {
+    assert_eq!(
+      original_url("a1b2", "msg-f:1794896454636").unwrap(),
+      "https://mail.google.com/mail/u/0/?ik=a1b2&view=att&permmsgid=msg-f%3A1794896454636&disp=comp&safe=1"
+    );
+  }
+
+  #[test]
+  fn images_are_typed_by_their_first_bytes() {
+    assert_eq!(image_type(&[0x89, b'P', b'N', b'G', 0x0d]), "image/png");
+    assert_eq!(image_type(&[0xff, 0xd8, 0xff, 0xe0]), "image/jpeg");
+    assert_eq!(image_type(b"GIF89a"), "image/gif");
+    assert_eq!(image_type(b"RIFF\0\0\0\0WEBPVP8 "), "image/webp");
+    assert_eq!(image_type(b"  <svg xmlns=\"http://www.w3.org/2000/svg\"/>"), "image/svg+xml");
+    assert_eq!(image_type(b"???"), "application/octet-stream");
   }
 
   fn person(name: &str, email: &str) -> MailAddress {

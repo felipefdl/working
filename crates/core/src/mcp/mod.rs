@@ -532,10 +532,12 @@ mod tests {
       .collect()
   }
 
-  const MAIL_READS: [&str; 5] = [
+  const MAIL_READS: [&str; 7] = [
     "mail_inbox",
     "mail_search",
     "mail_read_thread",
+    "mail_html",
+    "mail_eml",
     "mail_labels",
     "mail_attachment",
   ];
