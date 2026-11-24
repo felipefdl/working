@@ -7,7 +7,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gchat_core::{
-  Attachment, AttachmentKind, Card, Command, Core, GroupId, Message, Micros, ReadReceipt, Span, SpanKind,
+  Attachment, AttachmentKind, Card, Command, Core, GroupId, Message, Micros, Reaction, ReadReceipt, Span, SpanKind,
+  User,
 };
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{h_flex, v_flex};
@@ -424,6 +425,8 @@ pub struct MsgCtx<'a> {
   pub new_line: Option<bool>,
   /// The window's pixels per point: thumbnails are decoded for the size they are drawn at.
   pub scale: f32,
+  /// Who reacted with each emoji, as asked by hovering a reaction: the conversation's, shared by its lists.
+  pub reactors: &'a Entity<Reactors>,
 }
 
 /// What a message's toolbar asks the conversation to do.
@@ -682,7 +685,7 @@ fn push_extras(
     body.push(card_view(card, msg, ctx, cx, i));
   }
   if !msg.reactions.is_empty() {
-    body.push(reactions_view(msg, &row.id, ctx.core));
+    body.push(reactions_view(msg, &row.id, ctx));
   }
   if msg.failed {
     body.push(
@@ -2262,10 +2265,106 @@ fn card_view(card: &Card, msg: &Arc<Message>, ctx: &MsgCtx, cx: &App, ix: usize)
   body.into_any_element()
 }
 
-fn reactions_view(msg: &Arc<Message>, id: &SharedString, core: &Core) -> AnyElement {
+/// Who reacted with each emoji, as the conversation asked the core (`Command::LoadReactors`), by message id. Each
+/// answer is for the count and `mine` the reaction had when asked; once either changes it is dropped (`prune`), and
+/// the next hover asks again. The tooltips read it, so an answer that arrives redraws the one open.
+#[derive(Default)]
+pub struct Reactors {
+  asked: HashMap<String, Vec<Asked>>,
+}
+
+struct Asked {
+  emoji: String,
+  count: u32,
+  mine: bool,
+  answer: Answer,
+}
+
+enum Answer {
+  Waiting,
+  People(Arc<Vec<User>>),
+  Failed,
+}
+
+impl Asked {
+  fn is_for(&self, reaction: &Reaction) -> bool {
+    self.emoji == reaction.emoji && self.count == reaction.count && self.mine == reaction.mine
+  }
+}
+
+impl Reactors {
+  /// Asks who reacted with `reaction`, unless an answer for it as it is now is held or on its way.
+  fn want(&mut self, core: &Core, msg: &Message, reaction: &Reaction, cx: &mut Context<Self>) {
+    if msg.pending
+      || self
+        .asked
+        .get(&msg.id)
+        .is_some_and(|asked| asked.iter().any(|asked| asked.is_for(reaction)))
+    {
+      return;
+    }
+    let asked = self.asked.entry(msg.id.clone()).or_default();
+    asked.retain(|asked| asked.emoji != reaction.emoji);
+    asked.push(Asked {
+      emoji: reaction.emoji.clone(),
+      count: reaction.count,
+      mine: reaction.mine,
+      answer: Answer::Waiting,
+    });
+    core.send(Command::LoadReactors {
+      group: msg.group.clone(),
+      topic_id: msg.topic_id.clone(),
+      message_id: msg.id.clone(),
+      emoji: reaction.emoji.clone(),
+    });
+    cx.notify();
+  }
+
+  /// Takes the core's answer (`Event::Reactors`): `None` when the list could not be read. An answer nobody waits for
+  /// any more (its reaction changed) is dropped.
+  pub fn answer(&mut self, message_id: &str, emoji: &str, users: Option<Arc<Vec<User>>>, cx: &mut Context<Self>) {
+    let Some(asked) = self
+      .asked
+      .get_mut(message_id)
+      .and_then(|asked| asked.iter_mut().find(|asked| asked.emoji == emoji))
+    else {
+      return;
+    };
+    asked.answer = users.map_or(Answer::Failed, Answer::People);
+    cx.notify();
+  }
+
+  /// Drops what was asked for reactions that changed or went, against the conversation's messages as they are now.
+  pub fn prune(&mut self, messages: &[Arc<Message>], cx: &mut Context<Self>) {
+    let before: usize = self.asked.values().map(Vec::len).sum();
+    self.asked.retain(|id, asked| {
+      let reactions = messages
+        .iter()
+        .rev()
+        .find(|msg| msg.id == *id)
+        .map_or(&[][..], |msg| msg.reactions.as_slice());
+      asked.retain(|asked| reactions.iter().any(|reaction| asked.is_for(reaction)));
+      !asked.is_empty()
+    });
+    if self.asked.values().map(Vec::len).sum::<usize>() != before {
+      cx.notify();
+    }
+  }
+
+  fn of(&self, message_id: &str, emoji: &str) -> Option<&Answer> {
+    let asked = self.asked.get(message_id)?.iter().find(|asked| asked.emoji == emoji)?;
+    Some(&asked.answer)
+  }
+}
+
+/// The reactions under a message. Hovering one asks who reacted with it, once, and shows them in its tooltip.
+fn reactions_view(msg: &Arc<Message>, id: &SharedString, ctx: &MsgCtx) -> AnyElement {
   let mut row = h_flex().flex_wrap().gap_1();
   for (i, reaction) in msg.reactions.iter().enumerate() {
-    let (core, target) = (core.clone(), msg.clone());
+    let (core, target) = (ctx.core.clone(), msg.clone());
+    let (asker, core_asks, hovered) = (ctx.reactors.clone(), ctx.core.clone(), msg.clone());
+    let (reactors, images, message_id) = (ctx.reactors.clone(), ctx.images.clone(), msg.id.clone());
+    let emoji = SharedString::from(reaction.emoji.clone());
     row = row.child(
       h_flex()
         .id((id.clone(), PART_REACTION + i))
@@ -2279,6 +2378,19 @@ fn reactions_view(msg: &Arc<Message>, id: &SharedString, core: &Core) -> AnyElem
         .cursor_pointer()
         .when(reaction.mine, |d| d.bg(rgb(ACCENT_BG)).border_color(rgb(ACCENT)))
         .when(!reaction.mine, |d| d.border_color(rgb(BORDER)).hover(|s| s.bg(rgb(ROW_HOVER))))
+        .on_hover(move |hovering, _, cx| {
+          if *hovering && let Some(reaction) = hovered.reactions.get(i) {
+            asker.update(cx, |reactors, cx| reactors.want(&core_asks, &hovered, reaction, cx));
+          }
+        })
+        .tooltip({
+          let emoji = emoji.clone();
+          move |window, cx| {
+            let (reactors, images, message_id, emoji) =
+              (reactors.clone(), images.clone(), message_id.clone(), emoji.clone());
+            Tooltip::element(move |_, cx| reactors_tip(&reactors, &images, &message_id, &emoji, cx)).build(window, cx)
+          }
+        })
         .on_click(move |_, _, _| {
           if let Some(reaction) = target.reactions.get(i) {
             react(
@@ -2291,11 +2403,38 @@ fn reactions_view(msg: &Arc<Message>, id: &SharedString, core: &Core) -> AnyElem
             );
           }
         })
-        .child(emoji_font::text(reaction.emoji.clone()))
+        .child(emoji_font::text(emoji))
         .child(reaction.count.to_string()),
     );
   }
   row.into_any_element()
+}
+
+/// Size of the emoji heading a reaction's tooltip, and of the avatars beside the names under it.
+const REACTORS_EMOJI: f32 = 28.;
+const REACTOR_FACE: f32 = 20.;
+
+/// A reaction's tooltip: the emoji large, then each person who reacted with it, avatar and name. "Loading…" while the
+/// answer is on its way; the emoji alone when it failed or was dropped. Reading `reactors` here is what redraws it in
+/// place when the answer comes.
+fn reactors_tip(reactors: &Entity<Reactors>, images: &Images, message_id: &str, emoji: &SharedString, cx: &App) -> Div {
+  let tip = v_flex().py_1().gap_1().child(
+    div()
+      .text_size(px(REACTORS_EMOJI))
+      .line_height(px(REACTORS_EMOJI * 1.25))
+      .child(emoji_font::text(emoji.clone())),
+  );
+  match reactors.read(cx).of(message_id, emoji) {
+    Some(Answer::Waiting) => tip.child(div().text_color(rgb(MUTED)).child("Loading…")),
+    Some(Answer::People(users)) => tip.children(users.iter().map(|user| {
+      h_flex()
+        .gap_2()
+        .whitespace_nowrap()
+        .child(avatar(images, cx, user.avatar_url.as_deref(), None, &user.name, REACTOR_FACE))
+        .child(emoji_font::text(user.name.clone()))
+    })),
+    Some(Answer::Failed) | None => tip,
+  }
 }
 
 fn react(core: &Core, group: &GroupId, topic: &str, id: &str, emoji: &str, add: bool) {

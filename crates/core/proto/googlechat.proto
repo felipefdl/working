@@ -2161,6 +2161,22 @@ message UpdateReactionResponse {
 	optional WriteRevision group_revision = 1;
 }
 
+// `list_reactors`: who reacted to a message with one emoji. A non-empty `next_page_token` means more pages.
+message ListReactorsRequest {
+	optional MessageId message_id = 1;
+	optional Emoji emoji = 2;
+	optional int32 page_size = 3;
+	optional string page_token = 4;
+	optional RequestHeader request_header = 100;
+}
+
+message ListReactorsResponse {
+	repeated UserId reactors = 1;
+	optional string next_page_token = 2;
+	optional ReadRevision group_revision = 3;
+	optional Reaction reaction = 4;
+}
+
 
 // used in the /webchannel/events
 message StreamEventsRequest {

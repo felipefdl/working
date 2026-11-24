@@ -922,6 +922,13 @@ impl Store {
             view.update(cx, |view, cx| view.set_slash_commands(commands, cx));
           }
         },
+        Event::Reactors { group, message_id, emoji, users } => {
+          if self.is_open(&group)
+            && let Some(view) = &self.conv
+          {
+            view.update(cx, |view, cx| view.set_reactors(&message_id, &emoji, users, cx));
+          }
+        },
         Event::ChatStarting(group) => {
           // A chat made for a call is not opened: the call goes on in its own window.
           let for_call = self

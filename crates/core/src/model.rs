@@ -1237,6 +1237,18 @@ pub enum Event {
     /// Commands that answer in the conversation. Commands that open a dialog are left out.
     commands: Arc<Vec<SlashCommand>>,
   },
+  /// Who reacted to a message with one emoji: answer to `Command::LoadReactors`, one per command.
+  Reactors {
+    /// Conversation.
+    group: GroupId,
+    /// Message the reaction is on.
+    message_id: String,
+    /// Emoji characters, as asked.
+    emoji: String,
+    /// The people in the order Google Chat lists them, the signed-in user included when they reacted; people
+    /// without a name are left out. `None` when the list could not be read.
+    users: Option<Arc<Vec<User>>>,
+  },
   /// `Command::CreateChat` is creating this chat: it is shown at once, under `GroupId::starting`, and is in no list.
   /// `OpenChat` follows with the conversation it became, or `ChatFailed`.
   ChatStarting(Group),
@@ -1469,6 +1481,17 @@ pub enum Command {
     emoji: String,
     /// True to add, false to remove.
     add: bool,
+  },
+  /// Fetch who reacted to a message with one emoji. Answers `Event::Reactors`.
+  LoadReactors {
+    /// Conversation.
+    group: GroupId,
+    /// Topic the message belongs to.
+    topic_id: String,
+    /// Message the reaction is on.
+    message_id: String,
+    /// Emoji characters.
+    emoji: String,
   },
   /// Typing notice for the open conversation.
   SetTyping {

@@ -2013,19 +2013,8 @@ impl Engine {
         tokio::spawn(async move {
           let request = proto::UpdateReactionRequest {
             request_header: Some(request_header()),
-            message_id: Some(proto::MessageId {
-              parent_id: Some(proto::MessageParentId {
-                topic_id: Some(proto::TopicId {
-                  group_id: Some(convert::proto_group_id(&group)),
-                  topic_id: Some(topic_id),
-                }),
-              }),
-              message_id: Some(message_id.clone()),
-            }),
-            emoji: Some(proto::Emoji {
-              unicode: Some(emoji.clone()),
-              ..Default::default()
-            }),
+            message_id: Some(wire_message_id(&group, topic_id, message_id.clone())),
+            emoji: Some(wire_emoji(&emoji)),
             option: Some(
               (if add {
                 proto::ReactionOption::Add
@@ -2042,6 +2031,21 @@ impl Engine {
             engine.apply_reaction(&group, &message_id, &emoji, &me, !add);
           }
           engine.report(result.map(|_| ()));
+        });
+      },
+      Command::LoadReactors { group, topic_id, message_id, emoji } => {
+        tokio::spawn(async move {
+          let users = match engine.reactors(&group, &topic_id, &message_id, &emoji).await {
+            Ok(users) => Some(Arc::new(users)),
+            Err(error) => {
+              match error.downcast_ref::<SignedOut>() {
+                Some(signed_out) => engine.emit(Event::SignedOut(signed_out.0.clone())),
+                None => tracing::warn!("the reactors were not read: {error:#}"),
+              }
+              None
+            },
+          };
+          engine.emit(Event::Reactors { group, message_id, emoji, users });
         });
       },
       Command::SetTyping { group, typing } => {
@@ -2694,6 +2698,55 @@ impl Engine {
     let users = self.members(&group).await?;
     self.emit(Event::Members { group, users: Arc::new(users) });
     Ok(())
+  }
+
+  /// Who reacted to a message with one emoji, every page of `list_reactors` followed, in the server's order. Ids the
+  /// users map does not know are looked up; people without a name are left out.
+  async fn reactors(
+    self: &Arc<Self>,
+    group: &GroupId,
+    topic_id: &str,
+    message_id: &str,
+    emoji: &str,
+  ) -> Result<Vec<User>> {
+    let mut ids: Vec<String> = Vec::new();
+    let mut page_token: Option<String> = None;
+    loop {
+      let request = proto::ListReactorsRequest {
+        message_id: Some(wire_message_id(group, topic_id.to_string(), message_id.to_string())),
+        emoji: Some(wire_emoji(emoji)),
+        page_size: None,
+        page_token: page_token.clone(),
+        request_header: Some(request_header()),
+      };
+      let response: proto::ListReactorsResponse = self.http.api("list_reactors", &request).await?;
+      for id in response.reactors.into_iter().filter_map(|user| user.id) {
+        if !ids.contains(&id) {
+          ids.push(id);
+        }
+      }
+      match response.next_page_token.filter(|token| !token.is_empty()) {
+        // A token the server already gave would loop forever.
+        Some(token) if page_token.as_ref() != Some(&token) => page_token = Some(token),
+        _ => break,
+      }
+    }
+    let unknown: Vec<String> = {
+      let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+      ids.iter().filter(|id| !state.users.contains_key(*id)).cloned().collect()
+    };
+    if !unknown.is_empty() {
+      self.fetch_users(unknown).await?;
+    }
+    let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(
+      ids
+        .iter()
+        .filter_map(|id| state.users.get(id))
+        .filter(|user| !user.name.is_empty())
+        .cloned()
+        .collect(),
+    )
   }
 
   /// Joined members of a conversation, as `load_members` gives them to the UI.
@@ -5147,6 +5200,27 @@ fn page_group_id(group: &GroupId) -> serde_json::Value {
   match group {
     GroupId::Space(id) => serde_json::json!([format!("space/{id}"), id, 2]),
     GroupId::Dm(id) => serde_json::json!([format!("dm/{id}"), id, 5]),
+  }
+}
+
+/// A message's id on the wire: the message inside its topic inside its conversation.
+fn wire_message_id(group: &GroupId, topic_id: String, message_id: String) -> proto::MessageId {
+  proto::MessageId {
+    parent_id: Some(proto::MessageParentId {
+      topic_id: Some(proto::TopicId {
+        group_id: Some(convert::proto_group_id(group)),
+        topic_id: Some(topic_id),
+      }),
+    }),
+    message_id: Some(message_id),
+  }
+}
+
+/// A reaction's emoji on the wire, as the model holds it: Unicode characters.
+fn wire_emoji(emoji: &str) -> proto::Emoji {
+  proto::Emoji {
+    unicode: Some(emoji.to_string()),
+    ..Default::default()
   }
 }
 

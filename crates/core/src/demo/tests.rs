@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use super::data::{APPROVE, BUILD_BOT, ME};
@@ -5,7 +6,7 @@ use super::{Action, Demo, Window};
 use crate::mail::SignaturePlace;
 use crate::model::{
   AttachmentKind, Chip, ChipKind, Command, Event, GroupId, MailAddress, MailCompose, MailReply, MailThread, Mailbox,
-  Message, ReadReceipt, Shortcut, SpanKind,
+  Message, Reaction, ReadReceipt, Shortcut, SpanKind,
 };
 
 fn demo() -> (Demo, flume::Receiver<Event>) {
@@ -1453,4 +1454,65 @@ fn a_newsletter_names_where_answers_go() {
   );
   let ordinary = emails(&mut demo, &events, "demo-mail-interview-loop");
   assert!(ordinary.iter().all(|email| email.reply_to.is_empty()));
+}
+
+#[test]
+fn reactors_honor_count_and_mine_and_stay_the_same() {
+  let (mut demo, events) = demo();
+  let reacted: Vec<(GroupId, Arc<Message>)> = demo
+    .histories
+    .iter()
+    .flat_map(|(group, messages)| messages.iter().map(move |message| (group.clone(), Arc::clone(message))))
+    .filter(|(_, message)| !message.reactions.is_empty())
+    .collect();
+  assert_ne!(reacted.len(), 0, "the demo has reactions");
+  for (group, message) in reacted {
+    let others = demo.members[&group].iter().filter(|id| *id != ME).count();
+    for reaction in &message.reactions {
+      let mut answers = Vec::new();
+      for _ in 0..2 {
+        demo.handle(Command::LoadReactors {
+          group: group.clone(),
+          topic_id: message.topic_id.clone(),
+          message_id: message.id.clone(),
+          emoji: reaction.emoji.clone(),
+        });
+        let answer = drain(&events);
+        let [Event::Reactors { users: Some(users), .. }] = answer.as_slice() else {
+          panic!("one Reactors answer with people");
+        };
+        answers.push(Arc::clone(users));
+      }
+      let users = &answers[0];
+      assert_eq!(answers[0], answers[1], "the same people every time");
+      assert_eq!(users.iter().any(|user| user.id == ME), reaction.mine);
+      let count = usize::try_from(reaction.count).unwrap_or(usize::MAX);
+      assert_eq!(users.len(), count.min(others + usize::from(reaction.mine)));
+      let mut ids: Vec<&str> = users.iter().map(|user| user.id.as_str()).collect();
+      ids.sort_unstable();
+      ids.dedup();
+      assert_eq!(ids.len(), users.len(), "nobody twice");
+    }
+  }
+}
+
+#[test]
+fn reactor_ids_leave_the_demo_user_out_when_not_mine() {
+  let members: Vec<String> = ["demo-jordan", "demo-riley"].map(String::from).to_vec();
+  let mine = Reaction {
+    emoji: "👍".into(), count: 2, mine: true
+  };
+  assert_eq!(
+    super::reactor_ids(&members, &mine, "m1👍").first().map(String::as_str),
+    Some(ME)
+  );
+  assert_eq!(super::reactor_ids(&members, &mine, "m1👍").len(), 2);
+  let theirs = Reaction {
+    emoji: "👍".into(),
+    count: 5,
+    mine: false,
+  };
+  let ids = super::reactor_ids(&members, &theirs, "m1👍");
+  assert_eq!(ids.len(), 2);
+  assert!(!ids.iter().any(|id| id == ME));
 }

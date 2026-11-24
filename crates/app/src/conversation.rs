@@ -20,7 +20,7 @@ use crate::conv_list::{buffer_name, hint};
 use crate::emoji_font;
 use crate::format_logic::Format;
 use crate::images::{self, Images};
-use crate::message::{self, Act, Actor, MsgCtx, Opener, Readers, Row};
+use crate::message::{self, Act, Actor, MsgCtx, Opener, Reactors, Readers, Row};
 use crate::settings::{Layout, MessageStyle, RewriteTool, Settings, SidebarSide, ThreadView};
 use crate::store::{History, Store};
 use crate::text_panel::TextPanelHandle;
@@ -175,6 +175,8 @@ struct ListParts {
   open_person: Opener,
   on_tools: Rc<Cell<bool>>,
   me_avatar: Option<String>,
+  /// The conversation's `Reactors`: the reaction tooltips read it.
+  reactors: Entity<Reactors>,
 }
 
 /// A message list as a view of its own, which the conversation draws cached: typing in a composer, the `@` menu and
@@ -382,6 +384,7 @@ impl MessageList {
         .filter(|(line, _)| *line == row.id)
         .map(|(_, mention)| *mention),
       scale: window.scale_factor(),
+      reactors: &self.parts.reactors,
     };
     message::render_row(row, &ctx, cx)
   }
@@ -452,6 +455,8 @@ pub struct ConversationView {
   _focus_clear: Option<Task<()>>,
   /// The user asked for the latest messages: scroll to the end when they arrive.
   to_latest: bool,
+  /// Who reacted to the messages here, as hovering a reaction asked (`Command::LoadReactors`).
+  reactors: Entity<Reactors>,
   /// The conversation's read time as it was when it opened unread: what the New line of each list is placed by, and
   /// what thread replies count as new from (`thread_seen`). None when it opened read, and once the user writes in it.
   read_at_open: Option<Micros>,
@@ -539,6 +544,7 @@ impl ConversationView {
       })
     };
     let on_tools = Rc::new(Cell::new(false));
+    let reactors = cx.new(|_| Reactors::default());
     let parts = ListParts {
       images: images.clone(),
       core: core.clone(),
@@ -546,6 +552,7 @@ impl ConversationView {
       open_person: open_person.clone(),
       on_tools: on_tools.clone(),
       me_avatar: me_avatar.clone(),
+      reactors: reactors.clone(),
     };
     let threads = group.kind == GroupKind::Space;
     let main = cx.new(|cx| MessageList::new(rows, parts, Some(opener), threads, cx));
@@ -585,6 +592,7 @@ impl ConversationView {
       images,
       group,
       me_id,
+      reactors,
       me_avatar,
       messages,
       taken_last: None,
@@ -754,6 +762,13 @@ impl ConversationView {
     }
   }
 
+  /// Takes the core's answer to `Command::LoadReactors` for a message here; the tooltip showing it redraws.
+  pub fn set_reactors(&self, message_id: &str, emoji: &str, users: Option<Arc<Vec<User>>>, cx: &mut App) {
+    self
+      .reactors
+      .update(cx, |reactors, cx| reactors.answer(message_id, emoji, users, cx));
+  }
+
   /// Takes who has read the conversation, and whether Google Chat has read receipts on in it: with them off, nobody's
   /// avatar shows. Each avatar sits on the last message its person has read, in the main list and in the thread panel,
   /// over the rows rather than in them, so people reading on never measure the lists again.
@@ -803,6 +818,8 @@ impl ConversationView {
       self.load.unseen.set(self.load.unseen.get().saturating_add(arrived));
     }
     self.messages = messages;
+    let held = self.messages.clone();
+    self.reactors.update(cx, |reactors, cx| reactors.prune(&held, cx));
     self.loaded = true;
     self.rebuild(prepended, cx);
 
@@ -1430,6 +1447,7 @@ impl ConversationView {
       open_person: self.open_person.clone(),
       on_tools: self.on_tools.clone(),
       me_avatar: self.me_avatar.clone(),
+      reactors: self.reactors.clone(),
     };
     let receipts = self.receipts.clone();
     let view = cx.new(|cx| {

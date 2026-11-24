@@ -313,6 +313,7 @@ impl Demo {
       Command::React { group, message_id, emoji, add, .. } => {
         self.change_message(&group, &message_id, |message| react(&mut message.reactions, &emoji, add));
       },
+      Command::LoadReactors { group, message_id, emoji, .. } => self.load_reactors(group, message_id, emoji),
       Command::LoadMembers(group) => self.load_members(group),
       Command::LoadSlashCommands(group) => self.load_slash_commands(group),
       Command::CreateChat { user_ids } => self.create_chat(user_ids),
@@ -1085,6 +1086,33 @@ impl Demo {
     self.emit(Event::Members { group, users: Arc::new(users) });
   }
 
+  /// Who reacted, made up from the conversation's members (`reactor_ids`).
+  fn load_reactors(&self, group: GroupId, message_id: String, emoji: String) {
+    let reaction = self
+      .held(&group, &message_id)
+      .and_then(|message| message.reactions.iter().find(|reaction| reaction.emoji == emoji).cloned());
+    let members = self.members.get(&group).map_or(&[][..], Vec::as_slice);
+    let users = reaction
+      .map_or_else(Vec::new, |reaction| {
+        reactor_ids(members, &reaction, &format!("{message_id}{emoji}"))
+      })
+      .iter()
+      .filter_map(|id| {
+        if id == ME {
+          Some(self.me.clone())
+        } else {
+          self.users.get(id).cloned()
+        }
+      })
+      .collect();
+    self.emit(Event::Reactors {
+      group,
+      message_id,
+      emoji,
+      users: Some(Arc::new(users)),
+    });
+  }
+
   fn hit(message: &Message) -> SearchHit {
     SearchHit {
       group: message.group.clone(),
@@ -1201,6 +1229,26 @@ fn mcp_status(config: Option<&McpConfig>) -> McpStatus {
     },
     _ => McpStatus::Off,
   }
+}
+
+/// The ids behind a reaction in the demo: the demo user first exactly when it is `mine`, then members other than the
+/// demo user up to `count` in all (fewer when the conversation has fewer), starting at a place `seed` picks, so the
+/// same reaction always lists the same people.
+fn reactor_ids(members: &[String], reaction: &Reaction, seed: &str) -> Vec<String> {
+  let others: Vec<&String> = members.iter().filter(|id| *id != ME).collect();
+  let start = seed
+    .bytes()
+    .fold(0_usize, |hash, byte| hash.wrapping_mul(31).wrapping_add(usize::from(byte)))
+    .checked_rem(others.len())
+    .unwrap_or(0);
+  let wanted = usize::try_from(reaction.count).unwrap_or(usize::MAX);
+  let mut ids: Vec<String> = Vec::new();
+  if reaction.mine && wanted > 0 {
+    ids.push(ME.to_string());
+  }
+  let rest = wanted.saturating_sub(ids.len()).min(others.len());
+  ids.extend(others.iter().cycle().skip(start).take(rest).map(|id| (*id).clone()));
+  ids
 }
 
 /// The signed-in user's reaction toggled on a message.

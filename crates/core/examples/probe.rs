@@ -316,6 +316,10 @@ fn main() {
           .len(),
         commands.iter().all(|command| command.name.starts_with('/'))
       ),
+      Event::Reactors { users, .. } => match users {
+        Some(users) => println!("[{at}ms] reactors: {}", users.len()),
+        None => println!("[{at}ms] reactors: failed"),
+      },
       Event::OpenChat(id) => println!("[{at}ms] open chat: {id:?}"),
       Event::ChatStarting(group) => println!("[{at}ms] chat starting: {} members", group.member_ids.len()),
       Event::ChatFailed(error) => println!("[{at}ms] chat failed: {error}"),
