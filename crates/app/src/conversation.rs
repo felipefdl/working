@@ -2067,7 +2067,7 @@ impl ConversationView {
     }
     let members = self.members.as_deref().unwrap_or_default();
     let commands = self.commands.as_deref().map_or(&[][..], Vec::as_slice);
-    let all = self.group.kind == GroupKind::Space;
+    let all = matches!(self.group.kind, GroupKind::Space | GroupKind::GroupDm);
     let items = completion::items(trigger, &query, members, all, commands);
     if items.is_empty() {
       self.menu = None;

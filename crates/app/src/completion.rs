@@ -108,7 +108,7 @@ impl Member {
   }
 }
 
-/// The rows for `query` (the text after the trigger). `all` offers @all, which only spaces have.
+/// The rows for `query` (the text after the trigger). `all` offers @all, which spaces and group chats have.
 pub fn items(trigger: Trigger, query: &str, members: &[Member], all: bool, commands: &[SlashCommand]) -> Vec<Item> {
   let query = query.to_lowercase();
   let mut items: Vec<Item> = match trigger {
