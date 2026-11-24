@@ -1786,8 +1786,17 @@ impl ConversationView {
     };
     let draft = composer.read(cx).value().to_string();
     let tokens = composer.read(cx).tokens().to_vec();
-    if crate::rewrite::nothing_to_rewrite(&draft) {
-      // Files or links alone have nothing to rewrite.
+    // Mentions and slash commands are chips the CLI must not change: only the words around them count.
+    let mut words = String::new();
+    let mut from = 0;
+    for span in &tokens {
+      let range = span.range();
+      words.extend([draft.get(from..range.start).unwrap_or_default(), " "]);
+      from = range.end;
+    }
+    words.push_str(draft.get(from..).unwrap_or_default());
+    if crate::rewrite::nothing_to_rewrite(&words) {
+      // Files, links, or mentions alone have nothing to rewrite.
       if then_send {
         self.send_from(in_thread, window, cx);
       }
