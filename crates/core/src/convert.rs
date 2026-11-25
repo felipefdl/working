@@ -687,7 +687,7 @@ fn annotations(text: &str, annotations: &[proto::Annotation]) -> (Vec<Span>, Vec
           kind: AttachmentKind::Drive,
           name: drive.title.clone().unwrap_or_default(),
           mime: drive.mimetype.clone().unwrap_or_default(),
-          url: format!("https://drive.google.com/open?id={}", urlencoding::encode(id)),
+          url: crate::http::drive_open_url(id),
           thumb_url: drive.thumbnail_url.as_deref().and_then(absolute),
           width: positive(drive.thumbnail_width),
           height: positive(drive.thumbnail_height),

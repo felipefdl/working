@@ -253,6 +253,21 @@ impl ServiceSession {
   }
 }
 
+/// Where a Drive file opens in a browser: the address its attachment carries.
+const DRIVE_OPEN: &str = "https://drive.google.com/open?id=";
+
+/// The browser address of the Drive file `id`.
+pub(crate) fn drive_open_url(id: &str) -> String {
+  format!("{DRIVE_OPEN}{}", urlencoding::encode(id))
+}
+
+/// The download address of the Drive file a `drive_open_url` address opens; `None` for any other address.
+pub(crate) fn drive_download_url(url: &str) -> Option<String> {
+  let id = url.strip_prefix(DRIVE_OPEN)?;
+  (!id.is_empty() && !id.contains('&'))
+    .then(|| format!("https://drive.usercontent.google.com/download?id={id}&export=download"))
+}
+
 pub struct Http {
   /// Short requests: API calls and downloads.
   client: reqwest::Client,
@@ -600,6 +615,26 @@ impl Http {
       bail!("GET answered {status}");
     }
     // Reuses the answer's buffer when it holds it alone.
+    Ok(Vec::from(response.bytes().await?))
+  }
+
+  /// A Drive file's bytes from its `drive_download_url`. Drive serves a file as `application/octet-stream`, so an
+  /// answer that is a page is never the file: it asks to sign in, to request access, or to confirm a file too large
+  /// for its virus scan.
+  pub async fn get_drive_file(&self, url: &str) -> Result<Vec<u8>> {
+    let response = self.client.get(url).send().await?;
+    let status = response.status();
+    if !status.is_success() {
+      bail!("Drive answered {status}");
+    }
+    let page = response
+      .headers()
+      .get(reqwest::header::CONTENT_TYPE)
+      .and_then(|value| value.to_str().ok())
+      .is_some_and(|kind| kind.starts_with("text/html"));
+    if page {
+      bail!("Drive answered with a page, not the file");
+    }
     Ok(Vec::from(response.bytes().await?))
   }
 

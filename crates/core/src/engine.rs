@@ -692,8 +692,12 @@ async fn serve_fetches(engine: Arc<Engine>, fetches: flume::Receiver<(String, Fe
     let engine = engine.clone();
     let network = network.clone();
     tokio::spawn(async move {
+      // A Drive file is read from Drive each time: the same address can hold a newer version.
+      let drive = crate::http::drive_download_url(&url);
       let cache = engine.cache.clone();
-      let cached = {
+      let cached = if drive.is_some() {
+        None
+      } else {
         let url = url.clone();
         tokio::task::spawn_blocking(move || cache.image(&url)).await.ok().flatten()
       };
@@ -703,7 +707,9 @@ async fn serve_fetches(engine: Arc<Engine>, fetches: flume::Receiver<(String, Fe
         let _permit = network.acquire().await;
         // Gmail's attachments and the images inside emails open only with Gmail's own cookies.
         let mail = crate::mail::is_mail_url(&url);
-        let downloaded = if mail {
+        let downloaded = if let Some(file) = &drive {
+          engine.http.get_drive_file(file).await
+        } else if mail {
           engine.mail.fetch(&url).await
         } else {
           engine.http.get_bytes(&url).await
@@ -712,7 +718,7 @@ async fn serve_fetches(engine: Arc<Engine>, fetches: flume::Receiver<(String, Fe
           Ok(bytes) => {
             let bytes = Arc::new(bytes);
             // An attachment that is not a picture stays out of the image cache.
-            if !mail || crate::mail::looks_like_image(&bytes) {
+            if drive.is_none() && (!mail || crate::mail::looks_like_image(&bytes)) {
               let cache = engine.cache.clone();
               let stored = bytes.clone();
               tokio::task::spawn_blocking(move || cache.save_image(&url, &stored));
