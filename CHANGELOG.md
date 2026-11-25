@@ -2,6 +2,10 @@
 
 What changed in each release of Working, newest first, written for the people who use it. The app shows this file in its What's New dialog, so it keeps one shape: a `## <version> - <YYYY-MM-DD>` heading for each release, then one `- ` line for each change. A change may start with a short `**title.**` in bold; the rest is plain text, with no other Markdown.
 
+## 0.11.1 - 2026-11-24
+
+- What's New shows each release as a plain list, without a box around every change.
+
 ## 0.11.0 - 2026-11-24
 
 - **See who reacted.** Hold the pointer over a reaction under a message to see the people who reacted with it.

@@ -157,7 +157,9 @@ impl WhatsNew {
     }
   }
 
-  fn release(release: &Release<'static>, today: Date) -> Div {
+  /// One release: its version and date, then its changes as a bulleted list. A rule sets it off from the release
+  /// above it.
+  fn release(release: &Release<'static>, first: bool, today: Date) -> Div {
     let line = h_flex()
       .gap_2()
       .items_baseline()
@@ -174,18 +176,26 @@ impl WhatsNew {
           .text_color(rgb(MUTED))
           .child(date_label(release.date, today)),
       );
-    v_flex().gap_2().child(line).children(release.entries.iter().map(|entry| {
-      v_flex()
-        .p_3()
-        .gap_1()
-        .rounded(px(9.))
-        .border_1()
-        .border_color(rgb(BORDER))
+    let changes = release.entries.iter().map(|entry| {
+      h_flex()
+        .items_start()
+        .gap_2()
         .text_size(px(13.))
         .text_color(rgb(TEXT))
-        .children(entry.title.map(|title| div().font_weight(FontWeight::SEMIBOLD).child(title)))
-        .when(!entry.text.is_empty(), |card| card.child(div().child(entry.text)))
-    }))
+        .child(div().flex_shrink_0().text_color(rgb(MUTED)).child("•"))
+        .child(
+          v_flex()
+            .flex_1()
+            .min_w_0()
+            .children(entry.title.map(|title| div().font_weight(FontWeight::SEMIBOLD).child(title)))
+            .when(!entry.text.is_empty(), |change| change.child(div().child(entry.text))),
+        )
+    });
+    v_flex()
+      .gap_3()
+      .when(!first, |release| release.pt_5().border_t_1().border_color(rgb(BORDER)))
+      .child(line)
+      .children(changes)
   }
 }
 
@@ -268,7 +278,13 @@ impl Render for WhatsNew {
               .p_4()
               .gap_5()
               .overflow_y_scroll()
-              .children(self.releases.iter().map(|release| Self::release(release, today))),
+              .children(
+                self
+                  .releases
+                  .iter()
+                  .enumerate()
+                  .map(|(index, release)| Self::release(release, index == 0, today)),
+              ),
           )
           .child(
             h_flex()
