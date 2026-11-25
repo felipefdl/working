@@ -308,6 +308,9 @@ message ClientFeatureCapabilities {
 	optional CapabilityLevel add_existing_apps_level = 45;
 	optional CapabilityLevel auto_translation_level = 46;
 	optional CapabilityLevel voice_transcript_level = 47;
+	// Observed: the web client sends it FULLY_SUPPORTED, and without it `create_topic` stores a forward (a FORWARD
+	// `reply_to`) as a quote in reply.
+	optional CapabilityLevel forward_level = 53;
 }
 
 message RequestHeader {
@@ -1078,6 +1081,15 @@ message QuotedMessageMetadata {
 	optional User updater_profile = 12;
 	optional int64 create_time_micros = 13;
 	optional int64 last_edit_time_micros = 14;
+	// Observed in the web client's forwards: 1 on every quote in reply, 2 on a forward.
+	optional MessageInfo.ReplyTo.QuoteType quote_type = 15;
+	// Observed on forwards only: the conversation the message was forwarded from.
+	message ForwardedFrom {
+		optional GroupId group_id = 1;
+		// The conversation's display name, also for a forward within one conversation.
+		optional string name = 5;
+	}
+	optional ForwardedFrom forwarded_from = 17;
 }
 
 message MessageParentId {
@@ -1657,13 +1669,26 @@ message TopicCreatedEvent {
 
 message MessageInfo {
 	optional bool accept_format_annotations = 1;
-	// Observed in the web client ("Quote in reply"): the message this one quotes.
+	// Observed in the web client: the message this one quotes ("Quote in reply", type REPLY) or forwards ("Forward
+	// message", type FORWARD), by its own id in its own conversation.
 	message ReplyTo {
 		optional MessageId id = 1;
 		optional int64 last_update_time_micros = 2;
-		optional int32 type = 4;
+		enum QuoteType {
+			QUOTE_TYPE_UNSPECIFIED = 0;
+			REPLY = 1;
+			FORWARD = 2;
+		}
+		optional QuoteType type = 4;
 	}
 	optional ReplyTo reply_to = 3;
+	// Observed in the web client's "Forward message", next to a FORWARD `reply_to`: a fresh id the client mints for each
+	// forward (11 characters, the alphabet of its local message ids) and the destination conversation.
+	message Forward {
+		optional string id = 1;
+		optional GroupId destination = 2;
+	}
+	optional Forward forward = 5;
 }
 
 message DeleteMessageRequest {

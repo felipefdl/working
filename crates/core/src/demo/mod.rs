@@ -18,7 +18,7 @@ use crate::engine::{FetchReply, Fetcher};
 use crate::model::{
   Attachment, AttachmentKind, CardAction, Chip, ChipKind, Command, Connection, DndFor, DndSchedule, DndSchedules,
   Event, Group, GroupId, GroupKind, MailCompose, MailReply, Mailbox, McpConfig, McpStatus, Message, Micros, MyStatus,
-  Notify, PersonStatus, Placement, Quote, Reaction, ReadReceipt, SearchHit, Shortcut, Snippet, User,
+  Notify, PersonStatus, Placement, Quote, Quoting, Reaction, ReadReceipt, SearchHit, Shortcut, Snippet, User,
 };
 use data::{APPROVE, BUILD_BOT, CANCEL, ME, World};
 
@@ -286,7 +286,20 @@ impl Demo {
         files,
         chips,
       } => {
-        let mut draft = self.draft(&group, topic_id.as_deref(), &text, quote.as_deref());
+        if matches!(quote, Some(Quoting::Forward { .. })) && topic_id.is_some() {
+          return self.emit(Event::Error("A message can be forwarded only as a new message.".into()));
+        }
+        let quote = match quote {
+          None => None,
+          Some(Quoting::Reply(id)) => self.held(&group, &id).map(|quoted| (quoted, None)),
+          Some(Quoting::Forward { group: source, message_id }) => {
+            let Some(quoted) = self.held(&source, &message_id) else {
+              return self.emit(Event::Error("The message to forward is no longer loaded.".into()));
+            };
+            Some((quoted, self.groups.get(&source).map(|held| held.name.clone())))
+          },
+        };
+        let mut draft = self.draft(&group, topic_id.as_deref(), &text, quote);
         draft.attachments = files.iter().map(|path| local_attachment(path)).collect();
         self.send(draft, &chips);
       },
@@ -866,12 +879,20 @@ impl Demo {
     }
   }
 
-  /// The user's message as it shows before the server answers. An empty `topic_id` starts a topic.
-  fn draft(&self, group: &GroupId, topic_id: Option<&str>, text: &str, quote: Option<&str>) -> Message {
+  /// The user's message as it shows before the server answers. An empty `topic_id` starts a topic. `quote` is the
+  /// message it carries and, for a forward, the name of the conversation it comes from.
+  fn draft(
+    &self,
+    group: &GroupId,
+    topic_id: Option<&str>,
+    text: &str,
+    quote: Option<(Arc<Message>, Option<String>)>,
+  ) -> Message {
     let mut draft = data::message(group, "", topic_id.unwrap_or_default(), &self.me, now_micros(), text);
-    draft.quote = quote.and_then(|id| self.held(group, id)).map(|quoted| Quote {
+    draft.quote = quote.map(|(quoted, forwarded_from)| Quote {
       sender_name: quoted.sender_name.clone(),
       text: quoted.text.clone(),
+      forwarded_from,
     });
     draft.pending = true;
     draft

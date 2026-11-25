@@ -69,6 +69,8 @@ pub enum Icon {
   SmilePlus,
   Pencil,
   Reply,
+  /// Forward message, and a forwarded message's quote.
+  Forward,
   Thread,
   /// A spool of thread, as Google Chat draws "Reply in thread".
   Spool,
@@ -210,6 +212,7 @@ impl Icon {
         r#"<path d="M21.174 6.812a1 1 0 0 0-3.986-3.987L3.842 16.174a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="m15 5 4 4"/>"#
       ),
       Self::Reply => lucide!(r#"<path d="M20 18v-2a4 4 0 0 0-4-4H4"/><path d="m9 17-5-5 5-5"/>"#),
+      Self::Forward => lucide!(r#"<path d="m15 17 5-5-5-5"/><path d="M4 18v-2a4 4 0 0 1 4-4h12"/>"#),
       Self::Thread => lucide!(
         r#"<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M13 8H7"/><path d="M17 12H7"/>"#
       ),

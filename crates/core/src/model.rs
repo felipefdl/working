@@ -306,6 +306,22 @@ pub struct Quote {
   pub sender_name: String,
   /// Quoted text.
   pub text: String,
+  /// Name of the conversation the message was forwarded from; `None` when it is a quote in reply.
+  pub forwarded_from: Option<String>,
+}
+
+/// The message a sent one carries along.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Quoting {
+  /// Quote in reply: a message id in the destination conversation.
+  Reply(String),
+  /// Forward: a message of another (or the same) conversation.
+  Forward {
+    /// Conversation the message is in.
+    group: GroupId,
+    /// Its id.
+    message_id: String,
+  },
 }
 
 /// App card, its widgets reduced to text lines and buttons per section.
@@ -1358,7 +1374,8 @@ pub enum Command {
     time: Micros,
   },
   /// Sends a message. With `topic_id`, it is a reply in that thread; without, a new top-level message, which
-  /// can quote the message with id `quote`. `files` are uploaded first and go out attached to it.
+  /// can quote or forward the message `quote` names. A forward may have empty `text`. `files` are uploaded first and
+  /// go out attached to it.
   Send {
     /// Destination conversation.
     group: GroupId,
@@ -1366,8 +1383,8 @@ pub enum Command {
     topic_id: Option<String>,
     /// Message body.
     text: String,
-    /// Message id to quote, when quoting.
-    quote: Option<String>,
+    /// The message it quotes in reply or forwards, only on a top-level message.
+    quote: Option<Quoting>,
     /// Local files to upload and attach.
     files: Vec<PathBuf>,
     /// Mentions and the slash command in `text`.

@@ -2,6 +2,11 @@
 
 What changed in each release of Working, newest first, written for the people who use it. The app shows this file in its What's New dialog, so it keeps one shape: a `## <version> - <YYYY-MM-DD>` heading for each release, then one `- ` line for each change. A change may start with a short `**title.**` in bold; the rest is plain text, with no other Markdown.
 
+## 0.12.0 - 2026-11-24
+
+- **Forward a message.** Choose Forward message in a message's More menu, pick a conversation, and send it there, with a note of your own if you want one. A forwarded message shows the conversation it came from.
+- **Reply in thread in direct messages and group chats.** The Reply in thread button shows wherever Google Chat has threads turned on, not only in spaces, and has a spool icon as in Google Chat. It no longer shows in spaces that have threads turned off.
+
 ## 0.11.1 - 2026-11-24
 
 - What's New shows each release as a plain list, without a box around every change.

@@ -17,6 +17,7 @@ use gpui_kit::*;
 
 use crate::emoji_font;
 use crate::emoji_picker;
+use crate::forward;
 use crate::images::Images;
 use crate::menu::{self, MenuItem};
 use crate::receipt_logic;
@@ -588,6 +589,7 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
           .border_color(rgb(MUTED))
           .text_size(px(12.5))
           .text_color(rgb(MUTED))
+          .children(quote.forwarded_from.as_deref().map(forwarded_from))
           .child(div().font_weight(FontWeight::SEMIBOLD).child(quote.sender_name.clone()))
           .child(div().child(clipped.clone())),
       );
@@ -916,7 +918,10 @@ fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
         text.on_click(move |event, window, cx| text_panel::show(event.position(), &msg.text, window, cx))
       });
     if let Some(quote) = &prepared.irc_quote {
-      text = text.child(div().max_w_full().truncate().text_color(rgb(MUTED)).child(quote.clone()));
+      let forwarded = msg.quote.as_ref().and_then(|quote| quote.forwarded_from.as_deref());
+      text = text
+        .children(forwarded.map(|from| forwarded_from(from).text_color(rgb(MUTED))))
+        .child(div().max_w_full().truncate().text_color(rgb(MUTED)).child(quote.clone()));
     }
     if has_text {
       let rich = rich_text(row, &prepared, ctx);
@@ -1127,6 +1132,16 @@ fn quick_reactions(msg: &Arc<Message>, id: &SharedString, core: &Core) -> Div {
   pill
 }
 
+/// The line over a forwarded message's quote: the forward glyph and the conversation it came from.
+fn forwarded_from(from: &str) -> Div {
+  h_flex()
+    .max_w_full()
+    .gap_1()
+    .items_center()
+    .child(icon(Icon::Forward, 12., MUTED))
+    .child(div().min_w_0().truncate().child(emoji_font::text(from.to_owned())))
+}
+
 /// The buttons that float over a message under the pointer: react, edit, reply in thread, quote, more.
 fn toolbar(row: &Row, ctx: &MsgCtx) -> Div {
   let msg = &row.msg;
@@ -1192,7 +1207,15 @@ fn toolbar(row: &Row, ctx: &MsgCtx) -> Div {
   let (core, own, target) = (ctx.core.clone(), row.own, msg.clone());
   tools.child(
     tool(id(PART_MORE), Icon::More).on_mouse_down(MouseButton::Left, move |event, window, cx| {
-      let mut items = Vec::new();
+      // First, as Google Chat lists it after its own quote entry. Any message can go to another conversation: one of a
+      // thread panel too.
+      let forwarded = target.clone();
+      let mut items = vec![
+        MenuItem::new("Forward message", move |window, cx| {
+          forward::show(forwarded.clone(), window, cx)
+        })
+        .icon(Icon::Forward),
+      ];
       if !target.text.trim().is_empty() {
         let msg = target.clone();
         items.push(MenuItem::new("Copy Text", move |_, cx| {
@@ -1293,7 +1316,8 @@ fn thread_divider(info: ThreadInfo) -> AnyElement {
     .into_any_element()
 }
 
-fn clip(text: &str, max: usize) -> String {
+/// The first `max` characters of `text`, with an ellipsis when it goes on.
+pub fn clip(text: &str, max: usize) -> String {
   match text.char_indices().nth(max) {
     Some((end, _)) => format!("{}…", &text[..end]),
     None => text.to_string(),

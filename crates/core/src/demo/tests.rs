@@ -6,7 +6,7 @@ use super::{Action, Demo, Window};
 use crate::mail::SignaturePlace;
 use crate::model::{
   AttachmentKind, Chip, ChipKind, Command, Event, GroupId, MailAddress, MailCompose, MailReply, MailThread, Mailbox,
-  Message, Reaction, ReadReceipt, Shortcut, SpanKind,
+  Message, Quoting, Reaction, ReadReceipt, Shortcut, SpanKind,
 };
 
 fn demo() -> (Demo, flume::Receiver<Event>) {
@@ -116,6 +116,7 @@ fn send_confirms_and_the_person_replies() {
   )));
 }
 
+#[test]
 fn a_direct_message_has_a_thread_and_its_person_answers_in_it() {
   let (mut demo, events) = demo();
   let group = GroupId::Dm("demo-riley-dm".into());
@@ -149,6 +150,55 @@ fn a_direct_message_has_a_thread_and_its_person_answers_in_it() {
 }
 
 #[test]
+fn a_forward_lands_with_the_source_conversation_named() {
+  let (mut demo, events) = demo();
+  let source = GroupId::Space("demo-release".into());
+  let original = demo.messages(&source).last().cloned().expect("Release train has messages");
+  let group = GroupId::Dm("demo-riley-dm".into());
+  demo.handle(Command::Open(group.clone()));
+  drain(&events);
+  demo.handle(Command::Send {
+    group: group.clone(),
+    topic_id: None,
+    text: String::new(),
+    quote: Some(Quoting::Forward {
+      group: source,
+      message_id: original.id.clone(),
+    }),
+    files: Vec::new(),
+    chips: Vec::new(),
+  });
+  run_all(&mut demo);
+  let sent = drain(&events).into_iter().find_map(|event| match event {
+    Event::MessageUpsert { message, .. } if !message.pending && message.group == group && message.sender_id == ME => {
+      Some(message)
+    },
+    _ => None,
+  });
+  let quote = sent
+    .and_then(|message| message.quote.clone())
+    .expect("the forward lands quoted");
+  assert_eq!(quote.forwarded_from.as_deref(), Some("Release train"));
+  assert_eq!(
+    (quote.sender_name, quote.text),
+    (original.sender_name.clone(), original.text.clone())
+  );
+
+  // A forward goes out only as a new message.
+  demo.handle(Command::Send {
+    group,
+    topic_id: Some("any-topic".into()),
+    text: String::new(),
+    quote: Some(Quoting::Forward {
+      group: GroupId::Space("demo-release".into()),
+      message_id: original.id.clone(),
+    }),
+    files: Vec::new(),
+    chips: Vec::new(),
+  });
+  assert!(drain(&events).iter().any(|event| matches!(event, Event::Error(_))));
+}
+
 /// A demo made at the real clock's now, so what the user sends during a test is the newest message of a conversation.
 /// (`demo` is dated after the clock, where a message sent now would sort before the whole workspace.)
 fn live_demo() -> (Demo, flume::Receiver<Event>) {

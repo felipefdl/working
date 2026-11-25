@@ -8,7 +8,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gchat_core::{Command, Core, Group, GroupKind, Message, Micros, ReadReceipt, SlashCommand, User};
+use gchat_core::{Command, Core, Group, GroupKind, Message, Micros, Quoting, ReadReceipt, SlashCommand, User};
 use gpui_kit::component::input::{Input, InputEvent, InputState, MoveUp, Paste, RopeExt as _, Textarea, TextareaState};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{FocusTrapElement as _, h_flex, v_flex};
@@ -22,7 +22,7 @@ use crate::format_logic::Format;
 use crate::images::{self, Images};
 use crate::message::{self, Act, Actor, MsgCtx, Opener, Reactors, Readers, Row};
 use crate::settings::{Layout, MessageStyle, RewriteTool, Settings, SidebarSide, ThreadView};
-use crate::store::{History, Store};
+use crate::store::{Forwarding, History, Store};
 use crate::text_panel::TextPanelHandle;
 use crate::theme::{
   ACCENT, ACCENT_BG, BORDER, FIELD, MUTED, PANEL, PLACEHOLDER, POPOVER, ROW_HOVER, ROW_SELECTED, TEXT, mono, rgb,
@@ -425,6 +425,8 @@ pub struct ConversationView {
   actor: Actor,
   /// The message the next one sent from the main composer quotes.
   quoting: Option<Arc<Message>>,
+  /// The message the next one sent from the main composer forwards: the store's `forwarding` for this conversation.
+  forwarding: Option<Forwarding>,
   editing: Option<Editing>,
   /// Files that go out with the next message from the main composer.
   files: Vec<Attached>,
@@ -602,6 +604,7 @@ impl ConversationView {
       open_person,
       actor,
       quoting: None,
+      forwarding: None,
       editing: None,
       files: Vec::new(),
       hovered: None,
@@ -1257,8 +1260,9 @@ impl ConversationView {
     }
     let (text, chips) = completion::message(&self.composer.read(cx).content());
     let editing = self.editing.as_ref().is_some_and(|editing| !editing.in_thread);
-    // Files alone make a message; a change to an existing one needs text.
-    if text.is_empty() && (editing || self.files.is_empty()) {
+    let forwarding = !editing && self.forwarding.is_some();
+    // Files alone make a message, and so does a forward; a change to an existing one needs text.
+    if text.is_empty() && (editing || (self.files.is_empty() && !forwarding)) {
       return;
     }
     let group = self.group.id.clone();
@@ -1273,7 +1277,14 @@ impl ConversationView {
       if !self.load.at_end.get() {
         self.jump_latest(cx);
       }
-      let quote = self.quoting.take().map(|message| message.id.clone());
+      // A forward goes out on a new message of its own, never in a thread: the main composer has no topic.
+      let quote = match self.take_forward(cx) {
+        Some(forwarding) => Some(Quoting::Forward {
+          group: forwarding.from,
+          message_id: forwarding.message.id.clone(),
+        }),
+        None => self.quoting.take().map(|message| Quoting::Reply(message.id.clone())),
+      };
       let files = std::mem::take(&mut self.files);
       self.command(Command::Send {
         group,
@@ -1335,6 +1346,7 @@ impl ConversationView {
         if self.editing.take_if(|editing| !editing.in_thread).is_some() {
           self.composer.update(cx, |state, cx| state.set_value("", window, cx));
         }
+        self.take_forward(cx);
         self.quoting = Some(message.clone());
         self.composer.update(cx, |state, cx| state.focus(window, cx));
       },
@@ -1348,6 +1360,7 @@ impl ConversationView {
         let composer = panel.map_or_else(|| self.composer.clone(), |thread| thread.composer.clone());
         if !in_thread {
           self.quoting = None;
+          self.take_forward(cx);
         }
         self.editing = Some(Editing {
           message_id: message.id.clone(),
@@ -1365,12 +1378,40 @@ impl ConversationView {
     cx.notify();
   }
 
-  /// Drops a pending quote or edit. Returns false when there was none.
+  /// Holds the forward the store keeps for this conversation, over the main composer. It replaces a pending quote and
+  /// a change to a message there. Called by the store while it is being updated: it must not reach the store.
+  pub fn set_forward(&mut self, forwarding: Forwarding, window: &mut Window, cx: &mut Context<Self>) {
+    self.quoting = None;
+    if self.editing.take_if(|editing| !editing.in_thread).is_some() {
+      self.composer.update(cx, |state, cx| state.set_value("", window, cx));
+    }
+    self.forwarding = Some(forwarding);
+    // A thread pop-up would cover the chip: it closes, giving the keyboard to the main composer.
+    if !self.close_thread_popup(window, cx) {
+      self.composer.update(cx, |state, cx| state.focus(window, cx));
+    }
+    cx.notify();
+  }
+
+  /// Drops the forward held here, and the store's for this conversation. Returns it.
+  fn take_forward(&mut self, cx: &mut Context<Self>) -> Option<Forwarding> {
+    let forwarding = self.forwarding.take()?;
+    self
+      .store
+      .update(cx, |store, _| {
+        store.forwarding.take_if(|held| held.to == forwarding.to);
+      })
+      .ok();
+    Some(forwarding)
+  }
+
+  /// Drops a pending quote, forward, or edit. Returns false when there was none.
   pub fn cancel_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
     let quoting = self.quoting.take().is_some();
+    let forwarding = self.take_forward(cx).is_some();
     let Some(editing) = self.editing.take() else {
       cx.notify();
-      return quoting;
+      return quoting || forwarding;
     };
     let composer = match (&self.thread, editing.in_thread) {
       (Some(thread), true) => thread.composer.clone(),
@@ -1381,15 +1422,30 @@ impl ConversationView {
     true
   }
 
-  /// The line above a composer that says what it is about to do: change a message, or quote one.
+  /// The line above a composer that says what it is about to do: change a message, quote one, or forward one.
   fn draft_banner(&self, in_thread: bool, cx: &mut Context<Self>) -> Option<AnyElement> {
     let editing = self.editing.as_ref().is_some_and(|editing| editing.in_thread == in_thread);
-    let (glyph, label) = match (&self.quoting, editing) {
-      (_, true) => (Icon::Pencil, "Editing message".to_string()),
-      (Some(quoted), false) if !in_thread => {
+    let line = |text: String| div().flex_1().min_w_0().truncate().child(text);
+    let (glyph, label) = match (&self.quoting, &self.forwarding, editing) {
+      (_, _, true) => (Icon::Pencil, line("Editing message".to_string())),
+      (Some(quoted), _, false) if !in_thread => {
         let text: String = quoted.text.chars().take(120).map(|c| if c == '\n' { ' ' } else { c }).collect();
-        (Icon::Reply, format!("Replying to {}: {text}", quoted.sender_name))
+        (Icon::Reply, line(format!("Replying to {}: {text}", quoted.sender_name)))
       },
+      (_, Some(forwarding), false) if !in_thread => (
+        Icon::Forward,
+        v_flex()
+          .flex_1()
+          .min_w_0()
+          .child(
+            div()
+              .truncate()
+              .font_weight(FontWeight::SEMIBOLD)
+              .text_color(rgb(TEXT))
+              .child(emoji_font::text(forwarding.from_name.clone())),
+          )
+          .child(div().truncate().child(forward_preview(&forwarding.message, &self.me_id))),
+      ),
       _ => return None,
     };
     Some(
@@ -1403,7 +1459,7 @@ impl ConversationView {
         .text_size(px(12.))
         .text_color(rgb(MUTED))
         .child(icon(glyph, 13., MUTED))
-        .child(div().flex_1().min_w_0().truncate().child(label))
+        .child(label)
         .child(
           div()
             .id(("cancel-draft", usize::from(in_thread)))
@@ -2754,9 +2810,31 @@ fn release(files: Vec<Attached>, window: &mut Window, cx: &mut App) -> Vec<PathB
     .collect()
 }
 
+/// The second line of a forward's chip: who sent the message ("You" for the user), then the start of its text with
+/// its newlines as spaces, or the name of its file when it has no text.
+fn forward_preview(message: &Message, me_id: &str) -> String {
+  let sender = if message.sender_id == me_id {
+    "You"
+  } else {
+    message.sender_name.as_str()
+  };
+  let body = if message.text.trim().is_empty() {
+    message.attachments.first().map_or("", |file| file.name.as_str())
+  } else {
+    message.text.as_str()
+  };
+  forward_line(sender, body)
+}
+
+/// `sender: body`, the body on one line and cut after 120 characters.
+fn forward_line(sender: &str, body: &str) -> String {
+  let body = body.trim().replace(['\r', '\n'], " ");
+  format!("{sender}: {}", message::clip(&body, 120))
+}
+
 #[cfg(test)]
 mod tests {
-  use super::is_image;
+  use super::{forward_line, is_image};
   use std::path::Path;
 
   #[test]
@@ -2765,5 +2843,12 @@ mod tests {
     assert!(is_image(Path::new("a.jpeg")));
     assert!(!is_image(Path::new("notes.txt")));
     assert!(!is_image(Path::new("noext")));
+  }
+
+  #[test]
+  fn forward_line_is_one_clipped_line() {
+    assert_eq!(forward_line("Jordan Park", "Lunch?\nAt noon"), "Jordan Park: Lunch? At noon");
+    let long = "a".repeat(130);
+    assert_eq!(forward_line("You", &long), format!("You: {}…", "a".repeat(120)));
   }
 }

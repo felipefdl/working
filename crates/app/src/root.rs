@@ -28,6 +28,7 @@ use crate::chrome;
 use crate::conv_list::ConvList;
 use crate::emoji_font;
 use crate::emoji_picker::{EmojiHandle, EmojiPicker};
+use crate::forward::{ForwardDialog, ForwardHandle};
 use crate::home::HomeView;
 use crate::keys::{self, Hotkey1, Hotkey2, Hotkey3, Hotkey4, Hotkey5, Hotkey6, Hotkey7, Hotkey8, Hotkey9};
 use crate::mail::{MailView, OpenMail};
@@ -335,6 +336,7 @@ pub struct RootView {
   viewer: Entity<Viewer>,
   menu: Entity<ContextMenu>,
   text_panel: Entity<TextPanel>,
+  forward: Entity<ForwardDialog>,
   emoji: Entity<EmojiPicker>,
   composer: Entity<StatusComposer>,
   switcher: Option<(Entity<Switcher>, Subscription)>,
@@ -379,11 +381,13 @@ impl RootView {
     let viewer = cx.new(|cx| Viewer::new(core.clone(), images, cx));
     let menu = cx.new(ContextMenu::new);
     let text_panel = cx.new(|cx| TextPanel::new(store.clone(), window, cx));
+    let forward = cx.new(|cx| ForwardDialog::new(store.clone(), window, cx));
     let emoji = cx.new(|cx| EmojiPicker::new(window, cx));
     let composer = cx.new(|cx| StatusComposer::new(core.clone(), window, cx));
     cx.set_global(ViewerHandle(viewer.clone()));
     cx.set_global(MenuHandle(menu.clone()));
     cx.set_global(TextPanelHandle(text_panel.clone()));
+    cx.set_global(ForwardHandle(forward.clone()));
     cx.set_global(EmojiHandle(emoji.clone()));
     cx.set_global(ComposerHandle(composer.clone()));
 
@@ -427,6 +431,7 @@ impl RootView {
       cx.observe(&menu, |_, _, cx| cx.notify()),
       cx.observe(&viewer, |_, _, cx| cx.notify()),
       cx.observe(&text_panel, |_, _, cx| cx.notify()),
+      cx.observe(&forward, |_, _, cx| cx.notify()),
       cx.observe(&emoji, |_, _, cx| cx.notify()),
       cx.observe(&composer, |_, _, cx| cx.notify()),
       // Mail's labels popover is one of them.
@@ -501,6 +506,7 @@ impl RootView {
       viewer,
       menu,
       text_panel,
+      forward,
       emoji,
       composer,
       switcher: None,
@@ -1090,6 +1096,8 @@ impl RootView {
       // The event editor or card closed.
     } else if self.viewer.read(cx).is_open() {
       self.viewer.update(cx, |viewer, cx| viewer.close(window, cx));
+    } else if self.forward.read(cx).is_open() {
+      self.forward.update(cx, |forward, cx| forward.close(window, cx));
     } else if self.new_chat.is_some() {
       self.close_new_chat(window, cx);
     } else if self.switcher.is_some() {
@@ -1132,6 +1140,7 @@ impl RootView {
   fn modal_open(&self, cx: &App) -> bool {
     self.settings.is_some()
       || self.text_panel.read(cx).is_open()
+      || self.forward.read(cx).is_open()
       || self.switcher.is_some()
       || self.theme_picker.is_some()
       || self.choice_picker.is_some()
@@ -1642,6 +1651,7 @@ impl Render for RootView {
       .children(self.about.as_ref().map(|(about, _)| about.clone()))
       .children(self.new_chat.as_ref().map(|(view, _)| view.clone()))
       .children(self.thread_popup(window, cx))
+      .child(self.forward.clone())
       .children(self.settings.as_ref().map(|(view, _)| view.clone()))
       .children(self.whats_new.as_ref().map(|(dialog, _)| dialog.clone()))
       .children(self.calendar.read(cx).overlays())

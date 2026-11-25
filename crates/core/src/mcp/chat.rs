@@ -425,7 +425,11 @@ fn line(message: &Message, me: &str) -> String {
   };
   let mut out = format!("[{}] {who}:", local(message.time).strftime("%H:%M"));
   if let Some(quote) = &message.quote {
-    let _ = write!(out, " (quoting {}: \"{}\")", quote.sender_name, clip(&quote.text, 80));
+    let what = match &quote.forwarded_from {
+      Some(source) => format!("forwarded from {source}, "),
+      None => "quoting ".into(),
+    };
+    let _ = write!(out, " ({what}{}: \"{}\")", quote.sender_name, clip(&quote.text, 80));
   }
   let text = message.text.trim();
   if !text.is_empty() {

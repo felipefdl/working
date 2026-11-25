@@ -39,8 +39,8 @@ use crate::model::{
   Attachment, AttachmentKind, CardAction, Chip, Command, Connection, DndFor, DndSchedule, DndSchedules, EditScope,
   Event, EventDraft, Group, GroupId, GroupKind, MailAddress, MailCompose, MailDraft, MailDraftSent, MailForward,
   MailLabel, MailMessage, MailReply, MailSignature, MailThread, Mailbox, McpConfig, McpStatus, Message, Micros,
-  MyStatus, Notify, PersonStatus, Placement, Presence, Quote, Reaction, ReadReceipt, Rsvp, SearchHit, Shortcut,
-  Snippet, User,
+  MyStatus, Notify, PersonStatus, Placement, Presence, Quote, Quoting, Reaction, ReadReceipt, Rsvp, SearchHit,
+  Shortcut, Snippet, User,
 };
 use crate::proto;
 
@@ -447,6 +447,52 @@ pub(crate) struct TopicPage {
   pub topics: Vec<(Micros, Vec<Arc<Message>>)>,
   pub reached_start: bool,
   pub reached_end: bool,
+}
+
+/// The message a sent one quotes in reply or forwards, and the conversation it is in.
+struct Carried {
+  message: Arc<Message>,
+  group: GroupId,
+  forward: bool,
+}
+
+/// The `MessageInfo` of a new topic in `destination`, with the quote or forward it carries, as the web client sends
+/// them: a quote is `reply_to` with type `REPLY`; a forward is `reply_to` with type `FORWARD` and `forward`, a fresh id
+/// minted for it with the destination conversation.
+fn wire_message_info(destination: &GroupId, carried: Option<&Carried>) -> proto::MessageInfo {
+  use proto::message_info::reply_to::QuoteType;
+  let reply_to = carried.map(|carried| {
+    let quoted = &carried.message;
+    let kind = if carried.forward {
+      QuoteType::Forward
+    } else {
+      QuoteType::Reply
+    };
+    proto::message_info::ReplyTo {
+      id: Some(proto_message_id(&carried.group, &quoted.topic_id, &quoted.id)),
+      last_update_time_micros: Some(if quoted.update_time > 0 {
+        quoted.update_time
+      } else {
+        quoted.time
+      }),
+      r#type: Some(kind as i32),
+    }
+  });
+  let forward = carried.filter(|carried| carried.forward).map(|_| proto::message_info::Forward {
+    id: Some(client_id()),
+    destination: Some(convert::proto_group_id(destination)),
+  });
+  proto::MessageInfo {
+    accept_format_annotations: Some(true),
+    reply_to,
+    forward,
+  }
+}
+
+/// A fresh id as the web client mints them: 11 characters of the URL-safe base64 alphabet.
+fn client_id() -> String {
+  use base64::Engine as _;
+  base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<u64>().to_le_bytes())
 }
 
 #[derive(Default)]
@@ -1746,10 +1792,27 @@ impl Engine {
         if self.readonly {
           return self.emit(Event::Error("Read-only mode: the message was not sent.".into()));
         }
-        let quoted = quote.and_then(|id| self.held(&group, &id));
-        let shown = quoted.as_ref().map(|quoted| Quote {
-          sender_name: quoted.sender_name.clone(),
-          text: quoted.text.clone(),
+        let carried = match quote {
+          None => None,
+          Some(Quoting::Reply(id)) => self.held(&group, &id).map(|message| Carried {
+            message,
+            group: group.clone(),
+            forward: false,
+          }),
+          Some(Quoting::Forward { .. }) if topic_id.is_some() => {
+            return self.emit(Event::Error("A message can be forwarded only as a new message.".into()));
+          },
+          Some(Quoting::Forward { group: source, message_id }) => {
+            let Some(message) = self.held(&source, &message_id) else {
+              return self.emit(Event::Error("The message to forward is no longer loaded.".into()));
+            };
+            Some(Carried { message, group: source, forward: true })
+          },
+        };
+        let shown = carried.as_ref().map(|carried| Quote {
+          sender_name: carried.message.sender_name.clone(),
+          text: carried.message.text.clone(),
+          forwarded_from: carried.forward.then(|| self.group_name(&carried.group)).flatten(),
         });
         let attached = files.iter().map(|path| local_attachment(path)).collect();
         let typed = markup::parse(&text, &chips);
@@ -1760,7 +1823,7 @@ impl Engine {
           let result = async {
             let uploads = engine.upload_files(&group, files).await?;
             engine
-              .send_message(&group, topic_id.as_deref(), &typed, quoted.as_deref(), uploads, &pending)
+              .send_message(&group, topic_id.as_deref(), &typed, carried.as_ref(), uploads, &pending)
               .await
           }
           .await;
@@ -2170,6 +2233,12 @@ impl Engine {
   fn group(&self, id: &GroupId) -> Option<Group> {
     let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     state.groups.get(id).cloned()
+  }
+
+  /// A conversation's display name as held now (for a 1:1 DM, the other person's).
+  fn group_name(&self, id: &GroupId) -> Option<String> {
+    let state = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.groups.get(id).map(|group| group.name.clone())
   }
 
   /// When "Mark as unread" marked this conversation, as the server last listed it; 0 when it is not marked.
@@ -2628,7 +2697,7 @@ impl Engine {
     group: &GroupId,
     topic_id: Option<&str>,
     typed: &markup::Parsed,
-    quoted: Option<&Message>,
+    carried: Option<&Carried>,
     uploads: Vec<proto::UploadMetadata>,
     local_id: &str,
   ) -> Result<()> {
@@ -2668,18 +2737,7 @@ impl Engine {
           annotations,
           local_id: Some(local_id.to_string()),
           history_v2: Some(true),
-          message_info: Some(proto::MessageInfo {
-            accept_format_annotations: Some(true),
-            reply_to: quoted.map(|quoted| proto::message_info::ReplyTo {
-              id: Some(proto_message_id(group, &quoted.topic_id, &quoted.id)),
-              last_update_time_micros: Some(if quoted.update_time > 0 {
-                quoted.update_time
-              } else {
-                quoted.time
-              }),
-              r#type: Some(1),
-            }),
-          }),
+          message_info: Some(wire_message_info(group, carried)),
           ..Default::default()
         };
         let response: proto::CreateTopicResponse = self.http.api("create_topic", &request).await?;

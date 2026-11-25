@@ -972,6 +972,14 @@ pub fn message(message: &proto::Message, users: &Users) -> Option<Message> {
       })
       .unwrap_or_default(),
     text: quoted.text_body.clone().unwrap_or_default(),
+    // A forward (quote type 2) names the conversation it comes from, the same one too.
+    forwarded_from: (quoted.quote_type == Some(proto::message_info::reply_to::QuoteType::Forward as i32)).then(|| {
+      quoted
+        .forwarded_from
+        .as_ref()
+        .and_then(|source| source.name.clone())
+        .unwrap_or_default()
+    }),
   });
   Some(Message {
     id: id.message_id.clone()?,
@@ -1242,6 +1250,43 @@ mod tests {
     assert!(reply.is_thread_reply());
     assert_eq!((starter.id.as_str(), starter.topic()), ("message-1", "topic-1"));
     assert_eq!((reply.id.as_str(), reply.topic()), ("message-2", "topic-1"));
+  }
+
+  #[test]
+  fn a_quote_of_type_forward_names_the_conversation_it_comes_from() {
+    use proto::message_info::reply_to::QuoteType;
+    let id = |group: &GroupId, message: &str| proto::MessageId {
+      parent_id: Some(proto::MessageParentId {
+        topic_id: Some(proto::TopicId {
+          group_id: Some(proto_group_id(group)),
+          topic_id: Some(message.into()),
+        }),
+      }),
+      message_id: Some(message.into()),
+    };
+    let here = GroupId::Space("AAAAlaunch1".into());
+    // As the server answers a forward within one space: quote type 2 and the source conversation in field 17.
+    let quoting = |kind: QuoteType, source: Option<&str>| proto::Message {
+      id: Some(id(&here, "msgForward1")),
+      quoted_message_metadata: Some(proto::QuotedMessageMetadata {
+        message_id: Some(id(&here, "msgQuoted01")),
+        text_body: Some("Launch moves to Tuesday.".into()),
+        quote_type: Some(kind as i32),
+        forwarded_from: source.map(|name| proto::quoted_message_metadata::ForwardedFrom {
+          group_id: Some(proto_group_id(&here)),
+          name: Some(name.into()),
+        }),
+        ..Default::default()
+      }),
+      ..Default::default()
+    };
+    let users = Users::default();
+    let forwarded_from = |wire: &proto::Message| message(wire, &users)?.quote?.forwarded_from;
+    assert_eq!(
+      forwarded_from(&quoting(QuoteType::Forward, Some("Product launch"))).as_deref(),
+      Some("Product launch")
+    );
+    assert_eq!(forwarded_from(&quoting(QuoteType::Reply, None)), None);
   }
 
   #[test]

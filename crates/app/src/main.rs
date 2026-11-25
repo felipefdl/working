@@ -68,6 +68,7 @@ mod emoji_picker;
 mod event_card;
 mod event_editor;
 mod format_logic;
+mod forward;
 mod home;
 mod images;
 mod keys;

@@ -694,6 +694,8 @@ pub fn request_header() -> proto::RequestHeader {
       named_gdms_support_level: full,
       // Without it, messages come back without their labels, and so without the user's star.
       starred_shortcut_level: full,
+      // Without it, a forward is stored as a quote in reply.
+      forward_level: full,
       ..Default::default()
     }),
     ..Default::default()

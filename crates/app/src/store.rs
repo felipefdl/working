@@ -410,6 +410,19 @@ struct OpenReceipts {
   receipts: Arc<Vec<ReadReceipt>>,
 }
 
+/// A message on its way to another conversation (Forward message): held for `to` until it is sent from that
+/// conversation's main composer or dropped, whatever the user opens meanwhile. The view of `to` keeps a copy
+/// (`ConversationView::set_forward`), handed to it each time it opens.
+#[derive(Clone)]
+pub struct Forwarding {
+  /// The conversation it goes to.
+  pub to: GroupId,
+  /// The conversation it comes from, and its name as the chip shows it.
+  pub from: GroupId,
+  pub from_name: SharedString,
+  pub message: Arc<Message>,
+}
+
 /// A message search: `hits` is `None` until the core answers.
 pub struct Search {
   pub query: String,
@@ -577,6 +590,8 @@ pub struct Store {
   /// Back or Forward is moving: the view change it makes is not a new step in the history.
   moving: bool,
   pub conv: Option<Entity<ConversationView>>,
+  /// The message the user is forwarding, held for the conversation it goes to (`forward`).
+  pub forwarding: Option<Forwarding>,
   pub query: String,
   /// The message search started by Enter in the search field, shown under the conversation matches.
   pub search: Option<Search>,
@@ -656,6 +671,7 @@ impl Store {
       starting: None,
       moving: false,
       conv: None,
+      forwarding: None,
       query: String::new(),
       search: None,
       shortcut: None,
@@ -1852,6 +1868,7 @@ impl Store {
     let (core, images, me) = (self.core.clone(), self.images.clone(), self.me.clone());
     self.conv = Some(cx.new(|cx| ConversationView::new(store, core, images, group, me, history, window, cx)));
     self.set_view(View::Conversation(id.clone()));
+    self.hand_forward(window, cx);
     // The open conversation is never held back as older.
     self.rebuild_lists();
     self.drop_shortcut(cx);
@@ -1859,6 +1876,31 @@ impl Store {
     self.clear_notifications(&id);
     self.core.send(Command::MarkRead(id));
     cx.notify();
+  }
+
+  /// Holds `forwarding` for its conversation and opens it there, with the chip over the main composer. It replaces a
+  /// forward held for any conversation, and the conversation's pending quote.
+  pub fn forward(&mut self, forwarding: Forwarding, window: &mut Window, cx: &mut Context<Self>) {
+    let to = forwarding.to.clone();
+    if !self.groups.contains_key(&to) {
+      return;
+    }
+    let opened = self.is_open(&to);
+    self.forwarding = Some(forwarding);
+    self.open(to, window, cx);
+    // A view that was already open is kept: it takes the forward now. A new one took it as it opened.
+    if opened {
+      self.hand_forward(window, cx);
+    }
+  }
+
+  /// Gives the conversation on screen the forward held for it, if any.
+  fn hand_forward(&self, window: &mut Window, cx: &mut Context<Self>) {
+    let held = self.forwarding.as_ref().filter(|forwarding| self.is_open(&forwarding.to));
+    if let (Some(forwarding), Some(view)) = (held, &self.conv) {
+      let forwarding = forwarding.clone();
+      view.update(cx, |view, cx| view.set_forward(forwarding, window, cx));
+    }
   }
 
   /// Switches the view, recording the one it leaves as a step Back can return to. A change of the open conversation
@@ -2309,6 +2351,7 @@ impl Store {
       let (core, images, me) = (self.core.clone(), self.images.clone(), self.me.clone());
       self.conv = Some(cx.new(|cx| ConversationView::new(store, core, images, group, me, None, window, cx)));
       self.set_view(View::Conversation(hit.group.clone()));
+      self.hand_forward(window, cx);
       self.drop_shortcut(cx);
     }
     self.core.send(Command::Jump {

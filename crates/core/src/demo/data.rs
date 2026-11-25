@@ -545,6 +545,14 @@ fn riley(b: &mut Builder) {
     4 * HOUR + 50 * MINUTE,
     "Yes. CI runs in UTC and my laptop does not, so only the Sunday cases broke.",
   );
+  // A forward: what Sam posted in Release train, sent on with a line of Riley's own.
+  let mut forwarded = chat.post(&riley, 4 * HOUR + 30 * MINUTE, "Heads up, this one touches your module.");
+  forwarded.quote = Some(Quote {
+    sender_name: b.user("demo-sam").name,
+    text: "Branch cut for 2.41.0 is Thursday. Anything not merged by noon waits for 2.42.".into(),
+    forwarded_from: Some("Release train".into()),
+  });
+  chat.add(forwarded);
   chat.say(&me, 4 * HOUR, "Nice catch 🙌");
   b.group(group, &["demo-riley"], chat, 0);
 }
@@ -561,6 +569,7 @@ fn priya(b: &mut Builder) {
   quoted.quote = Some(Quote {
     sender_name: priya.name.clone(),
     text: "Option B tested better with every group.".into(),
+    forwarded_from: None,
   });
   chat.add(quoted);
   b.group(group, &["demo-priya"], chat, 0);
