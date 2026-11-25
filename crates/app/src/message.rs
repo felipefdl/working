@@ -2124,7 +2124,8 @@ fn meet_card(att: &Attachment, id: ElementId) -> AnyElement {
     .into_any_element()
 }
 
-/// A file row: icon and name. Opens the viewer (or the browser for Drive files, Meet links and link previews).
+/// A file row: an icon for its kind of file, and its name. Opens the viewer; a file that opens in the browser instead
+/// (`viewer::opens_in_app`) says so with a mark after its name.
 fn chip(msg: &Arc<Message>, i: usize, id: ElementId, viewer_first: bool) -> AnyElement {
   let Some(att) = msg.attachments.get(i) else {
     return div().into_any_element();
@@ -2134,6 +2135,8 @@ fn chip(msg: &Arc<Message>, i: usize, id: ElementId, viewer_first: bool) -> AnyE
   } else {
     att.name.clone()
   };
+  let glyph = viewer::file_icon(att);
+  let leaves = viewer_first && !viewer::opens_in_app(att);
   let msg = msg.clone();
   h_flex()
     .id(id)
@@ -2156,8 +2159,9 @@ fn chip(msg: &Arc<Message>, i: usize, id: ElementId, viewer_first: bool) -> AnyE
         cx.open_url(&att.url);
       }
     })
-    .child(icon(Icon::File, 16., MUTED))
-    .child(div().text_size(px(13.)).text_color(rgb(TEXT)).truncate().child(label))
+    .child(icon(glyph, 16., MUTED))
+    .child(div().min_w_0().text_size(px(13.)).text_color(rgb(TEXT)).truncate().child(label))
+    .when(leaves, |chip| chip.child(icon(Icon::ExternalLink, 12., MUTED)))
     .into_any_element()
 }
 

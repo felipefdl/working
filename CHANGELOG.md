@@ -2,6 +2,13 @@
 
 What changed in each release of Working, newest first, written for the people who use it. The app shows this file in its What's New dialog, so it keeps one shape: a `## <version> - <YYYY-MM-DD>` heading for each release, then one `- ` line for each change. A change may start with a short `**title.**` in bold; the rest is plain text, with no other Markdown.
 
+## 0.13.0 - 2026-11-25
+
+- **Google Drive files open in the app.** A PDF, picture, video, sound, or text file kept in Drive opens in the media viewer, like a file uploaded to the chat. Docs, Sheets, Slides, and Forms still open in your browser, and so does a file Drive does not hand over.
+- **Open a file in its own app.** The media viewer has a button that opens the file in the app your system uses for it, such as Preview for a PDF.
+- **File chips show the kind of file.** A document, picture, video, sound, spreadsheet, or archive has its own icon, in chats and in Mail. A file that opens in your browser has a small mark after its name.
+- The media viewer's buttons say what they do while the pointer is on them.
+
 ## 0.12.0 - 2026-11-24
 
 - **Forward a message.** Choose Forward message in a message's More menu, pick a conversation, and send it there, with a note of your own if you want one. A forwarded message shows the conversation it came from.

@@ -33,18 +33,58 @@ pub struct ViewerHandle(pub Entity<Viewer>);
 
 impl Global for ViewerHandle {}
 
-/// Opens an attachment the way the user expects: images and files in the viewer, Drive files in the browser,
-/// Meet links in the call window or the browser.
+/// Opens an attachment the way the user expects: images and files in the viewer, Meet links in the call window or
+/// the browser, and what the viewer cannot show (`opens_in_app`) in the browser.
 pub fn open_attachment(att: &Attachment, window: &mut Window, cx: &mut App) {
-  let att = att.clone();
+  if att.kind == AttachmentKind::Meet {
+    crate::call::open(&att.url, cx);
+  } else if opens_in_app(att) {
+    let (att, viewer) = (att.clone(), cx.global::<ViewerHandle>().0.clone());
+    viewer.update(cx, |viewer, cx| viewer.open(att, window, cx));
+  } else {
+    cx.open_url(&att.url);
+  }
+}
+
+/// Whether a click on the attachment stays in the app: the viewer shows it, or its card when it has no preview. A
+/// Meet link, a link without a picture, and a Drive file the viewer cannot show leave the app.
+pub fn opens_in_app(att: &Attachment) -> bool {
   match att.kind {
-    AttachmentKind::Meet => crate::call::open(&att.url, cx),
-    AttachmentKind::Drive => cx.open_url(&att.url),
-    AttachmentKind::LinkPreview if att.thumb_url.is_none() => cx.open_url(&att.url),
-    _ => {
-      let viewer = cx.global::<ViewerHandle>().0.clone();
-      viewer.update(cx, |viewer, cx| viewer.open(att, window, cx));
+    AttachmentKind::Meet => false,
+    AttachmentKind::Drive => previews_drive(att),
+    AttachmentKind::LinkPreview => att.thumb_url.is_some(),
+    _ => true,
+  }
+}
+
+/// The icon of a file's chip: the kind of file it is, as the viewer shows it, else by its type or its name's ending.
+pub fn file_icon(att: &Attachment) -> Icon {
+  let mime = att.mime.to_ascii_lowercase();
+  let ext = extension(&att.name);
+  let ext = ext.as_str();
+  match classify(att) {
+    Class::Image => Icon::FileImage,
+    Class::Video => Icon::FilePlay,
+    Class::Audio => Icon::FileMusic,
+    Class::Document if mime == "text/csv" || ext == "csv" => Icon::FileSpreadsheet,
+    Class::Document => Icon::FileText,
+    Class::Other if mime.contains("spreadsheet") || mime.contains("excel") => Icon::FileSpreadsheet,
+    Class::Other if matches!(ext, "xls" | "xlsx" | "ods" | "numbers") => Icon::FileSpreadsheet,
+    Class::Other
+      if mime.ends_with("google-apps.document")
+        || mime.contains("wordprocessingml")
+        || matches!(mime.as_str(), "application/msword" | "application/rtf" | "text/markdown")
+        || matches!(ext, "doc" | "docx" | "odt" | "rtf" | "md" | "pages") =>
+    {
+      Icon::FileText
     },
+    Class::Other
+      if matches!(mime.as_str(), "application/zip" | "application/gzip" | "application/x-tar")
+        || matches!(ext, "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "7z" | "rar") =>
+    {
+      Icon::FileArchive
+    },
+    Class::Other => Icon::File,
   }
 }
 
@@ -117,6 +157,12 @@ fn classify(att: &Attachment) -> Class {
   } else {
     Class::Other
   }
+}
+
+/// Whether a Drive attachment opens in the viewer: a file kept in Drive of a kind the viewer shows. Docs, Sheets,
+/// Slides, and Forms have no file to download, and the rest would only get a card, so both open in the browser.
+fn previews_drive(att: &Attachment) -> bool {
+  !att.mime.starts_with("application/vnd.google-apps") && classify(att) != Class::Other
 }
 
 /// Content type served to the web view, which the class decides, never the attachment alone: a document is a
@@ -204,6 +250,18 @@ pub fn copy_image(core: &Core, att: &Attachment, cx: &mut App) {
   .detach();
 }
 
+/// The attachment's own bytes: an image's best copy, else the file.
+async fn attachment_bytes(core: &Core, att: &Attachment) -> Option<Arc<Vec<u8>>> {
+  if classify(att) == Class::Image {
+    return fetch_image_bytes(core, att).await;
+  }
+  core
+    .fetch(att.url.clone())
+    .await
+    .map_err(|err| tracing::warn!("attachment fetch failed: {err}"))
+    .ok()
+}
+
 /// Asks where to save with the native panel (named after the attachment), then writes the file.
 pub fn save_attachment(core: &Core, att: &Attachment, cx: &mut App) {
   let downloads = dirs::download_dir().or_else(dirs::home_dir).unwrap_or_default();
@@ -218,16 +276,9 @@ pub fn save_attachment(core: &Core, att: &Attachment, cx: &mut App) {
     let Ok(Ok(Some(path))) = choice.await else {
       return;
     };
-    let bytes = if classify(&att) == Class::Image {
-      fetch_image_bytes(&core, &att).await
-    } else {
-      core
-        .fetch(att.url.clone())
-        .await
-        .map_err(|err| tracing::warn!("attachment fetch failed: {err}"))
-        .ok()
+    let Some(bytes) = attachment_bytes(&core, &att).await else {
+      return;
     };
-    let Some(bytes) = bytes else { return };
     let written = cx
       .background_executor()
       .spawn(async move { std::fs::write(&path, bytes.as_slice()) })
@@ -237,6 +288,51 @@ pub fn save_attachment(core: &Core, att: &Attachment, cx: &mut App) {
     }
   })
   .detach();
+}
+
+/// Opens the attachment in the app the system opens its kind of file with, such as Preview for a PDF on macOS.
+pub fn open_in_system(core: &Core, att: &Attachment, cx: &mut App) {
+  let (core, att) = (core.clone(), att.clone());
+  cx.spawn(async move |cx| {
+    let Some(bytes) = attachment_bytes(&core, &att).await else {
+      return;
+    };
+    let written = cx.background_executor().spawn(async move { system_file(&att, &bytes) }).await;
+    match written {
+      Ok(path) => cx.update(|cx| cx.open_with_system(&path)),
+      Err(err) => tracing::warn!("writing the attachment for another app failed: {err}"),
+    }
+  })
+  .detach();
+}
+
+/// A copy of the attachment under its own name, for another app to open. It has a folder of its own in the scratch
+/// folder, so the viewer closing never deletes it under that app; the app empties the scratch folder when it starts.
+fn system_file(att: &Attachment, bytes: &[u8]) -> std::io::Result<PathBuf> {
+  let mut hasher = DefaultHasher::new();
+  att.url.hash(&mut hasher);
+  let name: String = att
+    .name
+    .chars()
+    .map(|c| {
+      if c.is_control() || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+        '_'
+      } else {
+        c
+      }
+    })
+    .collect();
+  let name = if name.trim_matches(['.', ' ']).is_empty() {
+    "attachment"
+  } else {
+    name.as_str()
+  };
+  let path = gchat_core::scratch_dir()
+    .join("open")
+    .join(format!("{:016x}", hasher.finish()))
+    .join(name);
+  gchat_core::write_private(&path, bytes)?;
+  Ok(path)
 }
 
 fn human_size(bytes: u64) -> String {
@@ -420,6 +516,8 @@ pub struct Viewer {
   generation: u64,
   focus: FocusHandle,
   previous_focus: Option<FocusHandle>,
+  /// The name of the toolbar button under the pointer, shown in the toolbar.
+  hint: Option<&'static str>,
 }
 
 fn fit_scale(natural: (f32, f32), viewport: (f32, f32)) -> f32 {
@@ -435,6 +533,7 @@ impl Viewer {
       generation: 0,
       focus: cx.focus_handle(),
       previous_focus: None,
+      hint: None,
     }
   }
 
@@ -472,6 +571,7 @@ impl Viewer {
   /// Drops the open item, stopping any playback first, takes its full-size image out of the windows' sprite atlases,
   /// and deletes its temp file in the background.
   fn drop_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    self.hint = None;
     let Some(open) = self.state.take() else {
       return;
     };
@@ -513,7 +613,7 @@ impl Viewer {
       temp: None,
     });
     let core = self.core.clone();
-    cx.spawn(async move |this, cx| {
+    cx.spawn_in(window, async move |this, cx| {
       let mut original = None;
       for url in image_sources(&att) {
         let Ok(bytes) = core.fetch(url).await else {
@@ -527,13 +627,21 @@ impl Viewer {
           break;
         }
       }
-      this.update(cx, |this, cx| this.original_ready(generation, original, cx)).ok();
+      cx.update(|window, cx| this.update(cx, |this, cx| this.original_ready(generation, original, window, cx)))
+        .ok();
     })
     .detach();
   }
 
-  fn original_ready(&mut self, generation: u64, image: Option<Arc<RenderImage>>, cx: &mut Context<Self>) {
+  fn original_ready(
+    &mut self,
+    generation: u64,
+    image: Option<Arc<RenderImage>>,
+    window: &mut Window,
+    cx: &mut Context<Self>,
+  ) {
     let Some(Open {
+      att,
       generation: current,
       body: Body::Image(view),
       ..
@@ -544,10 +652,15 @@ impl Viewer {
     if *current != generation {
       return;
     }
+    // Drive did not give the file (no access, or a page in its place): its own page says why.
+    if image.is_none() && att.kind == AttachmentKind::Drive {
+      cx.open_url(&att.url);
+      self.close(window, cx);
+      return;
+    }
     view.loading = false;
-    // Called outside a window's update: every window's atlas is reached without one.
     if let Some(old) = std::mem::replace(&mut view.full, image) {
-      cx.drop_image(old, None);
+      cx.drop_image(old, Some(window));
     }
     cx.notify();
   }
@@ -590,6 +703,12 @@ impl Viewer {
   ) {
     let Some(open) = &mut self.state else { return };
     if open.generation != generation {
+      return;
+    }
+    // Drive did not give the file (no access, too large to scan, or a page in its place): its own page says why.
+    if downloaded.is_err() && open.att.kind == AttachmentKind::Drive {
+      cx.open_url(&open.att.url);
+      self.close(window, cx);
       return;
     }
     let state = match downloaded {
@@ -816,8 +935,21 @@ impl Viewer {
 
   // Rendering.
 
-  fn button(id: &'static str, glyph: Icon) -> Stateful<Div> {
-    div()
+  /// Shows `label` in the toolbar while the pointer is on `button`. A tooltip would open under the bar, where a file's
+  /// web view draws over everything the window paints.
+  fn named(button: Stateful<Div>, label: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
+    button.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+      if *hovered {
+        this.hint = Some(label);
+      } else if this.hint == Some(label) {
+        this.hint = None;
+      }
+      cx.notify();
+    }))
+  }
+
+  fn button(id: &'static str, glyph: Icon, label: &'static str, cx: &mut Context<Self>) -> Stateful<Div> {
+    let button = div()
       .id(id)
       .size(px(36.))
       .flex()
@@ -826,7 +958,8 @@ impl Viewer {
       .rounded_full()
       .cursor_pointer()
       .hover(|s| s.bg(rgba(0xffffff1f)))
-      .child(icon(glyph, 18., WHITE))
+      .child(icon(glyph, 18., WHITE));
+    Self::named(button, label, cx)
   }
 
   fn toolbar(&self, zoom_percent: Option<u32>, cx: &mut Context<Self>) -> Div {
@@ -841,6 +974,9 @@ impl Viewer {
     let is_image = matches!(open.body, Body::Image(_));
     let (core, att) = (self.core.clone(), open.att.clone());
     let (copy_core, copy_att) = (core.clone(), att.clone());
+    let (system_core, system_att) = (core.clone(), att.clone());
+    // A link's picture is no file of its own to hand to another app.
+    let has_file = att.kind != AttachmentKind::LinkPreview;
     let url = att.url.clone();
 
     h_flex()
@@ -862,39 +998,65 @@ impl Viewer {
           .font_weight(FontWeight::MEDIUM)
           .child(name),
       )
+      .children(self.hint.map(|label| {
+        div()
+          .flex_shrink_0()
+          .px_2()
+          .text_size(px(12.))
+          .text_color(rgba(0xffffffb3))
+          .child(label)
+      }))
       .when_some(zoom_percent, |bar, percent| {
+        let actual = div()
+          .id("zoom-100")
+          .h(px(36.))
+          .px_2()
+          .flex()
+          .items_center()
+          .rounded_full()
+          .cursor_pointer()
+          .text_size(px(12.))
+          .hover(|s| s.bg(rgba(0xffffff1f)))
+          .on_click(cx.listener(|this, _, window, cx| this.zoom_to(1.0, (0., 0.), window, cx)))
+          .child(format!("{percent}%"));
         bar
           .child(
-            Self::button("zoom-out", Icon::ZoomOut)
+            Self::button("zoom-out", Icon::ZoomOut, "Zoom out", cx)
               .on_click(cx.listener(|this, _, window, cx| this.zoom_by(1. / ZOOM_STEP, (0., 0.), window, cx))),
           )
+          .child(Self::named(actual, "Actual size", cx))
           .child(
-            div()
-              .id("zoom-100")
-              .h(px(36.))
-              .px_2()
-              .flex()
-              .items_center()
-              .rounded_full()
-              .cursor_pointer()
-              .text_size(px(12.))
-              .hover(|s| s.bg(rgba(0xffffff1f)))
-              .on_click(cx.listener(|this, _, window, cx| this.zoom_to(1.0, (0., 0.), window, cx)))
-              .child(format!("{percent}%")),
-          )
-          .child(
-            Self::button("zoom-in", Icon::ZoomIn)
+            Self::button("zoom-in", Icon::ZoomIn, "Zoom in", cx)
               .on_click(cx.listener(|this, _, window, cx| this.zoom_by(ZOOM_STEP, (0., 0.), window, cx))),
           )
-          .child(Self::button("zoom-fit", Icon::Fit).on_click(cx.listener(|this, _, _, cx| this.zoom_fit(cx))))
+          .child(
+            Self::button("zoom-fit", Icon::Fit, "Fit to window", cx)
+              .on_click(cx.listener(|this, _, _, cx| this.zoom_fit(cx))),
+          )
           .child(div().w(px(1.)).h(px(20.)).mx_2().bg(rgba(0xffffff33)))
       })
       .when(is_image, |bar| {
-        bar.child(Self::button("copy", Icon::Copy).on_click(move |_, _, cx| copy_image(&copy_core, &copy_att, cx)))
+        bar.child(
+          Self::button("copy", Icon::Copy, "Copy image", cx)
+            .on_click(move |_, _, cx| copy_image(&copy_core, &copy_att, cx)),
+        )
       })
-      .child(Self::button("download", Icon::Download).on_click(move |_, _, cx| save_attachment(&core, &att, cx)))
-      .child(Self::button("browser", Icon::ExternalLink).on_click(move |_, _, cx| cx.open_url(&url)))
-      .child(Self::button("close", Icon::X).on_click(cx.listener(|this, _, window, cx| this.close(window, cx))))
+      .child(
+        Self::button("download", Icon::Download, "Save as…", cx)
+          .on_click(move |_, _, cx| save_attachment(&core, &att, cx)),
+      )
+      .when(has_file, |bar| {
+        bar.child(
+          Self::button("system", Icon::AppWindow, "Open in default app", cx)
+            .on_click(move |_, _, cx| open_in_system(&system_core, &system_att, cx)),
+        )
+      })
+      .child(
+        Self::button("browser", Icon::ExternalLink, "Open in browser", cx).on_click(move |_, _, cx| cx.open_url(&url)),
+      )
+      .child(
+        Self::button("close", Icon::X, "Close", cx).on_click(cx.listener(|this, _, window, cx| this.close(window, cx))),
+      )
   }
 
   fn render_image(&mut self, window: &mut Window, cx: &mut Context<Self>) -> (Option<u32>, AnyElement) {
@@ -1053,7 +1215,7 @@ impl Viewer {
         .border_color(rgb(BORDER))
         .text_color(rgb(TEXT))
         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-        .child(icon(Icon::File, 40., MUTED))
+        .child(icon(file_icon(&att), 40., MUTED))
         .child(
           div()
             .max_w_full()

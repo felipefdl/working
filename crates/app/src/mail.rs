@@ -930,6 +930,7 @@ fn full_time(time: gchat_core::Micros) -> String {
 /// id is `ix`, the file's place in the email, under the card's own.
 fn attachment_chip(ix: usize, file: &MailAttachment) -> Stateful<Div> {
   let opened = attachment(file);
+  let glyph = viewer::file_icon(&opened);
   h_flex()
     .id(("mail-file", ix))
     .max_w(px(420.))
@@ -943,7 +944,7 @@ fn attachment_chip(ix: usize, file: &MailAttachment) -> Stateful<Div> {
     .cursor_pointer()
     .hover(|s| s.bg(rgb(ROW_HOVER)))
     .on_click(move |_, window, cx| viewer::open_attachment(&opened, window, cx))
-    .child(icon(Icon::File, 16., MUTED))
+    .child(icon(glyph, 16., MUTED))
     .child(
       div()
         .min_w_0()

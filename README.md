@@ -61,7 +61,7 @@ Pick the layout that fits how you work, switch any time in Settings, and keep Ca
 - **Gmail in the same window.** `Cmd+4` opens Mail: mailboxes, labels, Gmail search, new emails, replies, and archive. See [Mail](#mail).
 - **Calendar and Meet in the same window.** `Cmd+2` opens Google Calendar, `Cmd+3` opens Google Meet. The event editor makes new events and changes existing ones.
 - **Calls in their own window.** Camera, microphone, screen sharing, and the call's chat. On Linux, meetings open in your browser.
-- **Media viewer.** Images, video, audio, PDF, and text files open inside the app.
+- **Media viewer.** Images, video, audio, PDF, and text files open inside the app, files kept in Google Drive included.
 - **Notifications and presence.** System notifications for messages, new mail, and event reminders, an unread badge, do-not-disturb schedules, and a custom status.
 - **Rewrite a draft.** `Cmd+Shift+R` rewrites your message through the Claude Code or Codex CLI you already have.
 - **28 themes and your own fonts.** One theme for light, one for dark.
