@@ -116,6 +116,39 @@ fn send_confirms_and_the_person_replies() {
   )));
 }
 
+fn a_direct_message_has_a_thread_and_its_person_answers_in_it() {
+  let (mut demo, events) = demo();
+  let group = GroupId::Dm("demo-riley-dm".into());
+  assert!(demo.groups.get(&group).unwrap().threads);
+  let replies: Vec<Arc<Message>> = demo
+    .messages(&group)
+    .iter()
+    .filter(|message| message.is_thread_reply())
+    .cloned()
+    .collect();
+  assert_eq!(replies.len(), 2, "the seeded thread");
+  let topic = replies[0].topic_id.clone();
+  demo.handle(Command::Open(group.clone()));
+  drain(&events);
+  demo.handle(Command::Send {
+    group,
+    topic_id: Some(topic.clone()),
+    text: "Thanks for digging into it".into(),
+    quote: None,
+    files: Vec::new(),
+    chips: Vec::new(),
+  });
+  run_all(&mut demo);
+  let answer = drain(&events).into_iter().find_map(|event| match event {
+    Event::MessageUpsert { message, incoming: true, .. } if message.sender_id == "demo-riley" => Some(message),
+    _ => None,
+  });
+  let answer = answer.expect("Riley answers");
+  assert!(answer.is_thread_reply());
+  assert_eq!(answer.topic_id, topic, "in the thread the user wrote in");
+}
+
+#[test]
 /// A demo made at the real clock's now, so what the user sends during a test is the newest message of a conversation.
 /// (`demo` is dated after the clock, where a message sent now would sort before the whole workspace.)
 fn live_demo() -> (Demo, flume::Receiver<Event>) {

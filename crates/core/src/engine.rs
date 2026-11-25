@@ -5178,6 +5178,8 @@ fn created_group(id: GroupId, member_ids: Vec<String>, me: &str, users: &convert
     hidden: false,
     blocked: false,
     can_delete: false,
+    // Every direct message and group chat seen live has in-line threading on.
+    threads: true,
   }
 }
 

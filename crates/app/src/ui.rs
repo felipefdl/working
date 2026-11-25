@@ -70,6 +70,8 @@ pub enum Icon {
   Pencil,
   Reply,
   Thread,
+  /// A spool of thread, as Google Chat draws "Reply in thread".
+  Spool,
   More,
   Plus,
   Sparkles,
@@ -210,6 +212,9 @@ impl Icon {
       Self::Reply => lucide!(r#"<path d="M20 18v-2a4 4 0 0 0-4-4H4"/><path d="m9 17-5-5 5-5"/>"#),
       Self::Thread => lucide!(
         r#"<path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/><path d="M13 8H7"/><path d="M17 12H7"/>"#
+      ),
+      Self::Spool => lucide!(
+        r#"<path d="M17 13.44 4.442 17.082A2 2 0 0 0 4.982 21H19a2 2 0 0 0 .558-3.921l-1.115-.32A2 2 0 0 1 17 14.837V7.66"/><path d="m7 10.56 12.558-3.642A2 2 0 0 0 19.018 3H5a2 2 0 0 0-.558 3.921l1.115.32A2 2 0 0 1 7 9.163v7.178"/>"#
       ),
       Self::More => {
         lucide!(r#"<circle cx="12" cy="12" r="1"/><circle cx="12" cy="5" r="1"/><circle cx="12" cy="19" r="1"/>"#)

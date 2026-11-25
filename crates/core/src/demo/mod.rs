@@ -896,9 +896,9 @@ impl Demo {
     sent.id = id;
     sent.pending = false;
     sent.attachments.iter_mut().for_each(uploaded);
-    let (topic, text) = (sent.topic_id.clone(), sent.text.clone());
+    let (topic, in_thread, text) = (sent.topic_id.clone(), sent.reply, sent.text.clone());
     self.schedule(Duration::from_millis(350), Action::Confirm { local_id, message: sent });
-    self.answer(&group, &topic, &text, &typed.chips);
+    self.answer(&group, &topic, in_thread, &text, &typed.chips);
   }
 
   fn edit(&mut self, group: &GroupId, message_id: &str, text: &str) {
@@ -933,9 +933,9 @@ impl Demo {
 
   // ---- The other people ----
 
-  /// Someone answers what the user sent: the app answers its commands, a DM's person replies, and a person
-  /// mentioned in a space replies in the thread.
-  fn answer(&mut self, group: &GroupId, topic: &str, text: &str, chips: &[Chip]) {
+  /// Someone answers what the user sent: the app answers its commands, a DM's person replies (in the thread when
+  /// the user wrote in one), and a person mentioned in a space replies in the thread.
+  fn answer(&mut self, group: &GroupId, topic: &str, in_thread: bool, text: &str, chips: &[Chip]) {
     let command = chips.iter().find_map(|chip| match &chip.kind {
       ChipKind::Command { name, .. } => Some(name.clone()),
       _ => None,
@@ -951,7 +951,7 @@ impl Demo {
     let members = self.members.get(group).cloned().unwrap_or_default();
     let everyone = chips.iter().any(|chip| chip.kind == ChipKind::MentionAll);
     let (who, thread) = match kind {
-      Some(GroupKind::Dm | GroupKind::GroupDm) => (mentioned.or_else(|| members.first().cloned()), false),
+      Some(GroupKind::Dm | GroupKind::GroupDm) => (mentioned.or_else(|| members.first().cloned()), in_thread),
       Some(GroupKind::Space) => (mentioned.or_else(|| everyone.then(|| members.first().cloned()).flatten()), true),
       _ => (None, false),
     };
@@ -1212,6 +1212,7 @@ impl Demo {
       hidden: false,
       blocked: false,
       can_delete: false,
+      threads: true,
     };
     self.emit(Event::ChatStarting(Group { id: GroupId::starting(), ..group.clone() }));
     self.groups.insert(id.clone(), group.clone());

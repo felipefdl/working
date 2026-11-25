@@ -236,6 +236,8 @@ pub fn group(
     blocked,
     can_delete: kind == GroupKind::Space
       && state.and_then(|state| state.membership_role) == Some(proto::MembershipRole::RoleOwner as i32),
+    // A threaded (legacy) space has nothing but threads; a flat conversation has them while in-line threading is on.
+    threads: item.threaded_group.is_some() || item.inline_threading_enabled == Some(true),
   })
 }
 
@@ -1112,6 +1114,26 @@ mod tests {
     };
     assert!(role(proto::MembershipRole::RoleOwner));
     assert!(!role(proto::MembershipRole::RoleMember));
+  }
+
+  #[test]
+  fn threads_follow_the_in_line_threading_flag_whatever_the_kind() {
+    let users = Users::default();
+    let sections = HashMap::new();
+    let threads = |item: proto::WorldItemLite| group(&item, "me", &users, &sections).expect("listed").threads;
+    let mut space = space_item(proto::GroupReadState::default());
+    assert!(!threads(space.clone()), "a flat space without in-line threading");
+    space.inline_threading_enabled = Some(true);
+    assert!(threads(space.clone()));
+    space.inline_threading_enabled = None;
+    space.threaded_group = Some(proto::world_item_lite::ThreadedGroup {});
+    assert!(threads(space));
+    let dm = proto::WorldItemLite {
+      group_id: Some(proto_group_id(&GroupId::Dm("dm-1".into()))),
+      inline_threading_enabled: Some(true),
+      ..Default::default()
+    };
+    assert!(threads(dm));
   }
 
   #[test]

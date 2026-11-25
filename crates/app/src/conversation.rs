@@ -197,7 +197,7 @@ struct MessageList {
   parts: ListParts,
   /// The main list's thread footers open the thread; the thread panel has none.
   opener: Option<Opener>,
-  /// "Reply in thread" is offered: the main list of a space.
+  /// "Reply in thread" is offered: the main list of a conversation Google Chat threads (`Group::threads`).
   threads: bool,
   /// The main list of a conversation with a thread open: under the thread pop-up it shows no toolbar.
   under_thread: bool,
@@ -554,7 +554,7 @@ impl ConversationView {
       me_avatar: me_avatar.clone(),
       reactors: reactors.clone(),
     };
-    let threads = group.kind == GroupKind::Space;
+    let threads = group.threads;
     let main = cx.new(|cx| MessageList::new(rows, parts, Some(opener), threads, cx));
     {
       let weak = cx.weak_entity();
@@ -660,7 +660,7 @@ impl ConversationView {
   }
 
   pub fn set_group(&mut self, group: Group, cx: &mut Context<Self>) {
-    let threads = group.kind == GroupKind::Space;
+    let threads = group.threads;
     self.group = group;
     self.main.update(cx, |list, cx| {
       list.threads = threads;

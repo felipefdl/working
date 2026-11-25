@@ -112,6 +112,10 @@ pub struct Group {
   /// The signed-in user owns this space and can delete it.
   #[serde(default)]
   pub can_delete: bool,
+  /// Google Chat offers replies in threads here (`inline_threading_enabled`): on every direct message, group chat,
+  /// and app chat seen live, and on most spaces but not all.
+  #[serde(default)]
+  pub threads: bool,
 }
 
 /// A conversation's notification setting in Google Chat.

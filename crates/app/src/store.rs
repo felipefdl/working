@@ -2487,6 +2487,7 @@ mod tests {
       hidden: false,
       blocked: false,
       can_delete: false,
+      threads: true,
     }
   }
 

@@ -156,8 +156,8 @@ pub(super) fn list(allow_send: bool) -> Vec<Value> {
       "description": "Read the messages of one conversation, oldest first, ending at the latest message. \
     Replies in a thread are indented under the message they answer, and each top-level message ends with #id \
     (what send_message takes as `thread`). To go further back, pass the `before` value given at the end of the \
-    previous answer. To see what surrounds a search result, pass its `around` value. To read only one thread of a \
-    space, pass its `thread`. To find a word or topic, call search_messages instead of paging back.",
+    previous answer. To see what surrounds a search result, pass its `around` value. To read only one thread, pass \
+    its `thread`. To find a word or topic, call search_messages instead of paging back.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -165,7 +165,7 @@ pub(super) fn list(allow_send: bool) -> Vec<Value> {
           "limit": { "type": "integer", "description": "About how many messages. Default 30, at most 100." },
           "before": { "type": "string", "description": "Read the messages before this point: the value a previous answer gave, or a local date or time such as 2026-11-01 or 2026-11-01T14:30." },
           "around": { "type": "string", "description": "Read the messages around this point: the value a search_messages result gave." },
-          "thread": { "type": "string", "description": "Read only this thread of a space: the #id that ends its top-level message, or the thread recent_activity gives. Read the thread you are about to answer." }
+          "thread": { "type": "string", "description": "Read only this thread: the #id that ends its top-level message, or the thread recent_activity gives. Read the thread you are about to answer." }
         },
         "required": ["conversation"],
         "additionalProperties": false
@@ -200,7 +200,7 @@ pub(super) fn list(allow_send: bool) -> Vec<Value> {
       "description": "Send a message as the user to one conversation, with text, files from this computer, or both. \
 It is posted for real and the people there see it at once: send only what the user asked for. `conversation` \
 has to be an id or a full name; with anything less nothing is sent and the matching conversations are listed. \
-With `thread` the message is a reply inside that thread of a space; without it, it goes to the main conversation. \
+With `thread` the message is a reply inside that thread; without it, it goes to the main conversation. \
 Read the conversation with read_conversation first: a send to a conversation not read since the last send is refused.",
       "inputSchema": {
         "type": "object",
@@ -1326,6 +1326,7 @@ mod tests {
       hidden: false,
       blocked: false,
       can_delete: false,
+      threads: true,
     }
   }
 

@@ -410,7 +410,7 @@ pub struct MsgCtx<'a> {
   pub act: &'a Actor,
   /// Opens the chat with a user id: clicking a sender's name or avatar, or a mention.
   pub open_person: &'a Opener,
-  /// "Reply in thread" is offered: the main list of a space.
+  /// "Reply in thread" is offered: the main list of a conversation Google Chat threads (`Group::threads`).
   pub threads: bool,
   /// The message under the pointer: the one that shows its toolbar.
   pub hovered: Option<&'a str>,
@@ -1177,7 +1177,7 @@ fn toolbar(row: &Row, ctx: &MsgCtx) -> Div {
   if ctx.open_thread.is_some() {
     if ctx.threads {
       tools = tools.child(
-        tool(id(PART_THREAD_TOOL), Icon::Thread)
+        tool(id(PART_THREAD_TOOL), Icon::Spool)
           .tooltip(hint("Reply in thread"))
           .on_click(act(Act::Thread)),
       );

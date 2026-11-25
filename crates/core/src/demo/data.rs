@@ -416,6 +416,7 @@ impl Builder {
       hidden: false,
       blocked: false,
       can_delete: false,
+      threads: true,
     }
   }
 
@@ -535,7 +536,15 @@ fn riley(b: &mut Builder) {
     &code.text.clone(),
     &[("TZ=UTC cargo nextest run --workspace", SpanKind::CodeBlock)],
   );
-  chat.add(code);
+  let code = chat.add(code);
+  // A thread in a direct message: Google Chat offers in-line threads in DMs too.
+  chat.answer(&code, &me, 4 * HOUR + 55 * MINUTE, "Was it the daylight saving switch?");
+  chat.answer(
+    &code,
+    &riley,
+    4 * HOUR + 50 * MINUTE,
+    "Yes. CI runs in UTC and my laptop does not, so only the Sunday cases broke.",
+  );
   chat.say(&me, 4 * HOUR, "Nice catch 🙌");
   b.group(group, &["demo-riley"], chat, 0);
 }
