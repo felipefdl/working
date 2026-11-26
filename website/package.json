@@ -1,7 +1,7 @@
 {
   "name": "working-website",
   "private": true,
-  "packageManager": "bun@1.4.4",
+  "packageManager": "bun@1.4.5",
   "type": "module",
   "scripts": {
     "dev": "bun dev.ts",
@@ -14,6 +14,6 @@
     "preact-render-to-string": "6.8.3"
   },
   "devDependencies": {
-    "@types/bun": "1.4.4"
+    "@types/bun": "1.4.5"
   }
 }

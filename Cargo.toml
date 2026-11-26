@@ -31,7 +31,7 @@ gpui-webview = { version = "0.11", features = ["gpui-fast"] }
 iana-time-zone = "0.1"
 jiff = "1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "tiff", "bmp"] }
-linkify = "0.11"
+linkify = "0.12"
 mime_guess = "2"
 nucleo-matcher = "0.3"
 objc2 = "0.6"
