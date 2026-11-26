@@ -85,6 +85,26 @@ const TOGGLE_SIDEBAR: &str = "ctrl-shift-s";
 /// Opens the Mail view's labels popover (`mail_labels.rs`), in the Mail context.
 pub const MAIL_LABELS: &str = "secondary-l";
 
+/// The keys of a call window's controls (`call::Control`), live in its "Call" context while the app draws them.
+/// Meet's own keys where Meet has one, since the page's shortcuts are off then; sharing and leaving, which Meet has
+/// no key for, take Zoom's and Teams'. Linux has no call window.
+#[cfg(not(target_os = "linux"))]
+pub mod call {
+  pub const MIC: &str = "secondary-d";
+  pub const CAMERA: &str = "secondary-e";
+  pub const SHARE: &str = "secondary-shift-s";
+  /// Control-Command on macOS and Ctrl+Alt elsewhere, as Meet has it.
+  #[cfg(target_os = "macos")]
+  pub const HAND: &str = "ctrl-cmd-h";
+  #[cfg(not(target_os = "macos"))]
+  pub const HAND: &str = "ctrl-alt-h";
+  #[cfg(target_os = "macos")]
+  pub const CHAT: &str = "ctrl-cmd-c";
+  #[cfg(not(target_os = "macos"))]
+  pub const CHAT: &str = "ctrl-alt-c";
+  pub const LEAVE: &str = "secondary-shift-h";
+}
+
 /// This OS, for spelling a `secondary-` binding.
 #[cfg(target_os = "macos")]
 const OS: OperatingSystem = OperatingSystem::Mac;
@@ -156,6 +176,12 @@ fn table() -> Vec<(&'static str, Box<dyn Action>, Option<&'static str>)> {
     ("secondary-q", Box::new(Quit), None),
   ];
   table.extend(hotkeys().into_iter().map(|(keys, action)| (keys, action, None)));
+  #[cfg(not(target_os = "linux"))]
+  table.extend(
+    crate::call::Control::ALL
+      .into_iter()
+      .map(|control| (control.keys(), control.action(), Some(crate::call::KEY_CONTEXT))),
+  );
   table
 }
 

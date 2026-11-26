@@ -2,6 +2,15 @@
 
 What changed in each release of Working, newest first, written for the people who use it. The app shows this file in its What's New dialog, so it keeps one shape: a `## <version> - <YYYY-MM-DD>` heading for each release, then one `- ` line for each change. A change may start with a short `**title.**` in bold; the rest is plain text, with no other Markdown.
 
+## 0.14.0 - 2026-11-25
+
+- **Keys for the call's buttons.** In a call on macOS and Windows, every button of the bar has a key: Cmd+D for the microphone, Cmd+E for the camera, Ctrl+Cmd+H to raise your hand, Ctrl+Cmd+C for the chat, Cmd+Shift+S to share your screen, and Cmd+Shift+H to leave. On Windows, Ctrl takes the place of Cmd, and the hand and the chat are Ctrl+Alt+H and Ctrl+Alt+C. Hold the pointer over a button to see its name and its key beside the bar. Meet's own shortcuts are off while Working draws the buttons, and work as before in WebUI.
+- **Get the main window back during a call.** On macOS, a call window shows an Open Working button while the main window is closed, and Working in the Window menu (Cmd+0) opens it too.
+- On macOS, a shortcut such as Cmd+Shift+L no longer opens a second main window, which left menus and pictures in the first one not responding.
+- On macOS, a shortcut pressed in the call window now does its work in the main window: Cmd+K opens the quick switcher there, for example. Before, it only brought the window forward.
+- What's New opens once after an update again.
+- A non-breaking space after a link is no longer taken as part of the link.
+
 ## 0.13.0 - 2026-11-25
 
 - **Google Drive files open in the app.** A PDF, picture, video, sound, or text file kept in Drive opens in the media viewer, like a file uploaded to the chat. Docs, Sheets, Slides, and Forms still open in your browser, and so does a file Drive does not hand over.

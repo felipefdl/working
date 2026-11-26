@@ -6,6 +6,8 @@ What differs on each system: requirements, known limits, where files live, and w
 
 Working runs on macOS 13 or newer, on Apple silicon and Intel. Notifications and the Dock badge need `Working.app`, not a bare binary. The Dock number counts unread chats and, while Mail is on in Settings, Features, unread inbox threads.
 
+Closing the main window keeps Working running. A click on the Dock icon opens it again; while a call window is open macOS brings that window forward instead, so the call window's top bar has an Open Working button while the main window is closed, and Working in the Window menu (`Cmd+0`) opens it too.
+
 ## Linux
 
 ### Requirements

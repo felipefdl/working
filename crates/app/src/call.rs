@@ -13,11 +13,15 @@
 
 use gpui_kit::component::input::{Escape, InputEvent, Textarea, TextareaState};
 use gpui_kit::component::{h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use gpui_webview::WebView;
 
 use crate::call_chat::{Chat, ChatMessage};
 use crate::chrome;
+use crate::keys;
+#[cfg(target_os = "macos")]
+use crate::root::ShowMain;
 #[cfg(target_os = "macos")]
 use crate::screen::{self, End, Frame, Share};
 use crate::session;
@@ -42,6 +46,70 @@ const CHAT_WIDTH: std::ops::RangeInclusive<f32> = 240.0..=360.0;
 const CONTROLS_WIDTH: f32 = 460.0;
 /// A message's preview beside the controls needs at least this much room.
 const PREVIEW_MIN_WIDTH: f32 = 140.0;
+/// The name of a control beside the buttons needs at least this much room; with less, only its key shows.
+const HINT_MIN_WIDTH: f32 = 168.0;
+/// The key context of a call window while the app draws the call's controls: their keys (`keys::call`) are live
+/// in it.
+pub const KEY_CONTEXT: &str = "Call";
+
+actions!(call, [ToggleMic, ToggleCamera, ShareScreen, ToggleHand, ToggleChat, LeaveCall]);
+
+/// A button of the call's controls.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Control {
+  Mic,
+  Camera,
+  Share,
+  Hand,
+  Chat,
+  Leave,
+}
+
+impl Control {
+  pub const ALL: [Self; 6] = [Self::Mic, Self::Camera, Self::Share, Self::Hand, Self::Chat, Self::Leave];
+
+  /// The key that presses it.
+  pub const fn keys(self) -> &'static str {
+    match self {
+      Self::Mic => keys::call::MIC,
+      Self::Camera => keys::call::CAMERA,
+      Self::Share => keys::call::SHARE,
+      Self::Hand => keys::call::HAND,
+      Self::Chat => keys::call::CHAT,
+      Self::Leave => keys::call::LEAVE,
+    }
+  }
+
+  /// The action its key sends.
+  pub fn action(self) -> Box<dyn Action> {
+    match self {
+      Self::Mic => Box::new(ToggleMic),
+      Self::Camera => Box::new(ToggleCamera),
+      Self::Share => Box::new(ShareScreen),
+      Self::Hand => Box::new(ToggleHand),
+      Self::Chat => Box::new(ToggleChat),
+      Self::Leave => Box::new(LeaveCall),
+    }
+  }
+
+  /// What a press does now.
+  const fn label(self, state: CallState, chat_shown: bool) -> &'static str {
+    match self {
+      Self::Mic if matches!(state.mic, Some(true)) => "Turn off microphone",
+      Self::Mic => "Turn on microphone",
+      Self::Camera if matches!(state.camera, Some(true)) => "Turn off camera",
+      Self::Camera => "Turn on camera",
+      Self::Share if state.presenting => "Stop presenting",
+      Self::Share => "Share screen",
+      Self::Hand if state.hand => "Lower hand",
+      Self::Hand => "Raise hand",
+      Self::Chat if chat_shown => "Hide chat",
+      Self::Chat => "Show chat",
+      Self::Leave => "Leave call",
+    }
+  }
+}
+
 /// What the notification of a chat message is filed under, before the meeting's code: a click on it comes back
 /// with this key (`show_chat`).
 const CHAT_KEY: &str = "meet-chat/";
@@ -119,6 +187,10 @@ struct CallView {
   copied: bool,
   _copied_reset: Option<Task<()>>,
   state: CallState,
+  /// The window's own focus, so the keys of the controls work with no field in focus.
+  focus: FocusHandle,
+  /// The control the pointer is on: the bar names it and its key beside the buttons.
+  hint: Option<Control>,
   chat: Chat,
   /// The chat panel is showing beside the tiles.
   chat_shown: bool,
@@ -144,6 +216,9 @@ struct CallView {
   /// Turns the camera off when "Camera always off" is switched on during a call.
   _settings: Subscription,
   _draft: Subscription,
+  /// Redraws the bar when the main window closes or opens again, for the button that opens it.
+  #[cfg(target_os = "macos")]
+  _main: Subscription,
 }
 
 impl CallView {
@@ -273,7 +348,11 @@ impl CallView {
       InputEvent::PressEnter { shift: false, .. } => this.send_chat(cx),
       _ => {},
     });
+    let focus = cx.focus_handle();
+    window.focus(&focus, cx);
     Self {
+      focus,
+      hint: None,
       web: None,
       url: url.to_string(),
       code: code.into(),
@@ -301,6 +380,8 @@ impl CallView {
         cx.notify();
       }),
       _draft: draft_events,
+      #[cfg(target_os = "macos")]
+      _main: cx.observe_global::<crate::Main>(|_, cx| cx.notify()),
     }
   }
 
@@ -365,8 +446,42 @@ impl CallView {
     if self.chat_shown {
       self.see_chat();
       self.draft.update(cx, |state, cx| state.focus(window, cx));
+    } else {
+      // The field goes with the panel: the keyboard goes back to the window, for the controls' keys.
+      window.focus(&self.focus, cx);
     }
     cx.notify();
+  }
+
+  /// A control was pressed, by its button or its key.
+  fn press(&mut self, control: Control, window: &mut Window, cx: &mut Context<Self>) {
+    match control {
+      Control::Mic => self.run("toggleMic()", cx),
+      // "Camera always off" has no camera button, and its key does nothing.
+      Control::Camera if cx.global::<Settings>().camera_off => {},
+      Control::Camera if self.state.camera == Some(true) => self.run("setCamera(false)", cx),
+      Control::Camera => self.run("setCamera(true)", cx),
+      Control::Share => self.run("share()", cx),
+      Control::Hand => self.run("toggleHand()", cx),
+      Control::Chat => self.toggle_chat(window, cx),
+      Control::Leave => self.run("leave()", cx),
+    }
+  }
+
+  /// Makes `button` the one of `control`: a click presses it, and while the pointer is on it the bar says its name
+  /// and key beside the buttons. A tooltip would open over the call, where the web view draws over everything the
+  /// window paints.
+  fn named(button: Stateful<Div>, control: Control, cx: &mut Context<Self>) -> Stateful<Div> {
+    button
+      .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+        if *hovered {
+          this.hint = Some(control);
+        } else if this.hint == Some(control) {
+          this.hint = None;
+        }
+        cx.notify();
+      }))
+      .on_click(cx.listener(move |this, _, window, cx| this.press(control, window, cx)))
   }
 
   /// Sends what the field holds through Meet's own chat field. The text stays in the field until the page
@@ -718,6 +833,37 @@ impl CallView {
         .child(bar(0.6)),
     )
   }
+
+  /// The button that opens the main window again, only while it is closed: macOS keeps the app and the call going
+  /// without it, and a click on the Dock icon then only brings this window forward. `labeled` is false where the
+  /// bar has no room for the button's words; the icon alone then stands as tall as a line of them, so the button
+  /// keeps the height of the bar's others.
+  #[cfg(target_os = "macos")]
+  fn main_button(labeled: bool, window: &Window, cx: &App) -> Option<impl IntoElement> {
+    const TEXT_SIZE: f32 = 12.;
+    crate::Main::closed(cx).then(|| {
+      let mut text = window.text_style();
+      text.font_size = px(TEXT_SIZE).into();
+      let line = text.line_height_in_pixels(window.rem_size());
+      h_flex()
+        .id("show-main")
+        .occlude()
+        .gap_1p5()
+        .px_3()
+        .py_1()
+        .items_center()
+        .rounded_full()
+        .bg(rgb(FIELD))
+        .text_size(px(TEXT_SIZE))
+        .text_color(rgb(TEXT))
+        .cursor_pointer()
+        .hover(|s| s.opacity(0.85))
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(|_, window, cx| window.dispatch_action(Box::new(ShowMain), cx))
+        .child(h_flex().h(line).items_center().child(icon(Icon::AppWindow, 13., TEXT)))
+        .children(labeled.then_some("Open Working"))
+    })
+  }
 }
 
 impl Render for CallView {
@@ -763,7 +909,11 @@ impl Render for CallView {
           }))
           .child("WebUI"),
       )
-      .child(div().flex_1())
+      .child(div().flex_1());
+    // Under this width the bar has no room for the button's words beside the others.
+    #[cfg(target_os = "macos")]
+    let bar = bar.children(Self::main_button(width >= 720., window, cx));
+    let bar = bar
       .child(
         h_flex()
           .id("copy-link")
@@ -807,6 +957,17 @@ impl Render for CallView {
           .child(if on { "Camera on" } else { "Camera off" })
       }));
 
+    // The controls are the app's only in its own view of a call: Google's interface has its own, and the lobby
+    // passes by itself.
+    let native = custom && state.phase == Phase::Call;
+    if !native {
+      self.hint = None;
+    }
+    // The keys of the controls need the focus inside this view, and a field that closed took it along.
+    if window.focused(cx).is_none() {
+      let focus = self.focus.clone();
+      window.defer(cx, move |window, cx| window.focus(&focus, cx));
+    }
     let chat_shown = self.chat_shown;
     // Messages from the others that came while the panel was closed.
     let unread = if chat_shown {
@@ -845,41 +1006,49 @@ impl Render for CallView {
             .child(div().min_w_0().truncate().child(line)),
         )
       });
-    // Google's interface has its own controls, and the lobby passes by itself.
-    let controls = (custom && state.phase == Phase::Call).then(|| {
+    // The control under the pointer, named with its key in the room right of the buttons; the key alone where
+    // the name does not fit.
+    let hint = self.hint.map(|control| {
+      div().absolute().right_3().top_0().bottom_0().flex().items_center().child(
+        h_flex()
+          .gap_2()
+          .text_size(px(12.))
+          .children(
+            (room >= HINT_MIN_WIDTH).then(|| div().text_color(rgb(TEXT)).child(control.label(state, chat_shown))),
+          )
+          .child(div().text_color(rgb(MUTED)).child(keys::text(control.keys()))),
+      )
+    });
+    let controls = native.then(|| {
       h_flex()
         .h(px(CONTROLS_HEIGHT))
         .relative()
         .children(preview)
+        .children(hint)
         .w_full()
         .flex_shrink_0()
         .gap_3()
         .items_center()
         .justify_center()
-        .child(Self::mic(state).on_click(cx.listener(|this, _, _, cx| this.run("toggleMic()", cx))))
+        .child(Self::named(Self::mic(state), Control::Mic, cx))
         .children((!camera_off).then(|| {
-          Self::device("camera", state.camera, Icon::Video, Icon::VideoOff).on_click(cx.listener(
-            move |this, _, _, cx| {
-              this.run(
-                if state.camera == Some(true) {
-                  "setCamera(false)"
-                } else {
-                  "setCamera(true)"
-                },
-                cx,
-              );
-            },
-          ))
+          Self::named(
+            Self::device("camera", state.camera, Icon::Video, Icon::VideoOff),
+            Control::Camera,
+            cx,
+          )
         }))
-        .child(
-          Self::control("share", Icon::ScreenShare, if state.presenting { ACCENT_BG } else { FIELD })
-            .on_click(cx.listener(|this, _, _, cx| this.run("share()", cx))),
-        )
-        .child(
-          Self::control("hand", Icon::Hand, if state.hand { ACCENT_BG } else { FIELD })
-            .on_click(cx.listener(|this, _, _, cx| this.run("toggleHand()", cx))),
-        )
-        .child(
+        .child(Self::named(
+          Self::control("share", Icon::ScreenShare, if state.presenting { ACCENT_BG } else { FIELD }),
+          Control::Share,
+          cx,
+        ))
+        .child(Self::named(
+          Self::control("hand", Icon::Hand, if state.hand { ACCENT_BG } else { FIELD }),
+          Control::Hand,
+          cx,
+        ))
+        .child(Self::named(
           Self::control("chat", Icon::MessageSquare, if chat_shown { ACCENT_BG } else { FIELD })
             .relative()
             .children((unread > 0).then(|| {
@@ -898,18 +1067,19 @@ impl Render for CallView {
                 .text_size(px(11.))
                 .text_color(rgb(BG))
                 .child(unread.to_string())
-            }))
-            .on_click(cx.listener(|this, _, window, cx| this.toggle_chat(window, cx))),
-        )
-        .child(
-          Self::tinted("leave", Icon::PhoneOff, HANGUP, WHITE)
-            .w(px(64.))
-            .on_click(cx.listener(|this, _, _, cx| this.run("leave()", cx))),
-        )
+            })),
+          Control::Chat,
+          cx,
+        ))
+        .child(Self::named(
+          Self::tinted("leave", Icon::PhoneOff, HANGUP, WHITE).w(px(64.)),
+          Control::Leave,
+          cx,
+        ))
     });
 
     // The chat belongs to the stripped view: Google's interface has its own panel.
-    let chat = (custom && state.phase == Phase::Call && chat_shown).then(|| {
+    let chat = (native && chat_shown).then(|| {
       let panel = (width * CHAT_SHARE).clamp(*CHAT_WIDTH.start(), *CHAT_WIDTH.end());
       self.chat_panel(panel, cx)
     });
@@ -917,6 +1087,15 @@ impl Render for CallView {
       .size_full()
       .bg(rgb(BG))
       .font_family(theme::sans())
+      .track_focus(&self.focus)
+      // Only with the app's controls on screen: in Google's interface the keys are Meet's.
+      .when(native, |root| root.key_context(KEY_CONTEXT))
+      .on_action(cx.listener(|this, _: &ToggleMic, window, cx| this.press(Control::Mic, window, cx)))
+      .on_action(cx.listener(|this, _: &ToggleCamera, window, cx| this.press(Control::Camera, window, cx)))
+      .on_action(cx.listener(|this, _: &ShareScreen, window, cx| this.press(Control::Share, window, cx)))
+      .on_action(cx.listener(|this, _: &ToggleHand, window, cx| this.press(Control::Hand, window, cx)))
+      .on_action(cx.listener(|this, _: &ToggleChat, window, cx| this.press(Control::Chat, window, cx)))
+      .on_action(cx.listener(|this, _: &LeaveCall, window, cx| this.press(Control::Leave, window, cx)))
       .child(chrome::top_bar(bar, TOP_BAR_HEIGHT))
       .child(
         h_flex()

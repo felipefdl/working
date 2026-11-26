@@ -73,6 +73,21 @@
   `;
 
   let custom = true;
+  // While the stripped view shows, the keyboard is the app's: its control bar has a key for every button. Meet's own
+  // shortcuts (Cmd+D, Cmd+E, the space bar that unmutes while held, ...) would act on controls nobody sees, so no
+  // key reaches Meet's code or a focused button of its hidden interface. This runs before Meet's code, so these
+  // listeners are the window's first. Nothing in the stripped page takes typing: `sendChat` fills the chat field.
+  for (const type of ['keydown', 'keypress', 'keyup']) {
+    window.addEventListener(
+      type,
+      (event) => {
+        if (!custom) return;
+        event.stopImmediatePropagation();
+        event.preventDefault();
+      },
+      true,
+    );
+  }
   let joined = false;
   let joinClickedAt = 0;
   // The camera's master switch, held by the app's camera button. While it is off, a camera request from Meet
