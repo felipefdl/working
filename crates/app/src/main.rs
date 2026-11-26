@@ -125,10 +125,29 @@ use crate::root::{Quit, RootView, TOP_BAR_HEIGHT};
 use crate::settings::Settings;
 use crate::store::Store;
 
+/// The main window and the view in it. The window's own root is the kit's `Root`, which wraps the view, so the
+/// handle does not downcast to the view: it is kept beside the handle, weakly, since the window owns it.
+#[derive(Clone)]
+struct MainWindow {
+  window: AnyWindowHandle,
+  root: WeakEntity<RootView>,
+}
+
+impl MainWindow {
+  /// Runs `run` on the view, in its window. Nothing runs once the window is closed.
+  fn update(&self, cx: &mut App, run: impl FnOnce(&mut RootView, &mut Window, &mut Context<RootView>)) {
+    let root = self.root.clone();
+    let _ = self
+      .window
+      .update(cx, |_, window, cx| root.update(cx, |root, cx| run(root, window, cx)));
+  }
+}
+
 /// What it takes to bring the main window back: the window itself, and what a new one is made from.
 #[cfg(target_os = "macos")]
 struct Main {
-  window: AnyWindowHandle,
+  /// Empty once the window is closed, which leaves the app running.
+  open: Option<MainWindow>,
   core: Core,
   store: Entity<Store>,
 }
@@ -136,30 +155,59 @@ struct Main {
 #[cfg(target_os = "macos")]
 impl Global for Main {}
 
-/// A click on the Dock icon: the main window comes forward, or opens again after it was closed.
+#[cfg(target_os = "macos")]
+impl Main {
+  /// Whether the app is running with its main window closed, as it does while a call window stays open.
+  fn closed(cx: &App) -> bool {
+    cx.try_global::<Self>().is_some_and(|main| main.open.is_none())
+  }
+
+  /// The main window was closed, if `closed` is its id: observers of `Main` hear of it.
+  fn on_closed(closed: WindowId, cx: &mut App) {
+    let is_main = cx
+      .try_global::<Self>()
+      .and_then(|main| main.open.as_ref())
+      .is_some_and(|open| open.window.window_id() == closed);
+    if is_main {
+      cx.global_mut::<Self>().open = None;
+    }
+  }
+}
+
+/// A click on the Dock icon, Working in the Window menu, or the button of a call window: the main window comes
+/// forward, or opens again after it was closed.
 #[cfg(target_os = "macos")]
 fn reopen(cx: &mut App) {
   let Some(main) = cx.try_global::<Main>() else {
     return;
   };
-  let (window, core, store) = (main.window, main.core.clone(), main.store.clone());
-  if window.update(cx, |_, window, _| window.activate_window()).is_err() {
+  let (open, core, store) = (
+    main.open.as_ref().map(|open| open.window),
+    main.core.clone(),
+    main.store.clone(),
+  );
+  if let Some(window) = open {
+    let _ = window.update(cx, |_, window, _| window.activate_window());
+  } else {
     // The open conversation belonged to the window that is gone.
     store.update(cx, store::Store::go_home);
-    let window = open_main(core.clone(), store.clone(), cx);
-    cx.set_global(Main { window, core, store });
+    let open = Some(open_main(core.clone(), store.clone(), cx));
+    cx.set_global(Main { open, core, store });
   }
   cx.activate(true);
 }
 
 /// Runs a menu bar command on the main window whatever has the focus, bringing the window forward (or back) first.
+/// It runs after the current update: a key pressed in the main window while nothing in it has the focus arrives in
+/// the middle of that window's own update, when the window can be neither brought forward nor handed the command.
 #[cfg(target_os = "macos")]
 fn on_main(cx: &mut App, run: root::MenuCommand) {
-  reopen(cx);
-  let Some(window) = cx.try_global::<Main>().and_then(|main| main.window.downcast::<RootView>()) else {
-    return;
-  };
-  let _ = window.update(cx, run);
+  cx.defer(move |cx| {
+    reopen(cx);
+    if let Some(open) = cx.try_global::<Main>().and_then(|main| main.open.clone()) {
+      open.update(cx, move |root, window, cx| root.run_menu_command(run, window, cx));
+    }
+  });
 }
 
 fn main() {
@@ -217,7 +265,7 @@ fn main() {
     cx.on_action(|_: &Quit, cx| cx.quit());
     #[cfg(target_os = "macos")]
     {
-      use crate::root::{Hide, HideOthers, Minimize, ShowAll, Zoom, bind_menu_commands, menus};
+      use crate::root::{Hide, HideOthers, Minimize, ShowAll, ShowMain, Zoom, bind_menu_commands, menus};
       cx.on_action(|_: &Hide, cx| cx.hide());
       cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
       cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
@@ -231,6 +279,7 @@ fn main() {
           let _ = window.update(cx, |_, window, _| window.zoom_window());
         }
       });
+      cx.on_action(|_: &ShowMain, cx| cx.defer(reopen));
       bind_menu_commands(cx, on_main);
       // Only macOS has a menu bar of its own: elsewhere the main window's top bar has a button with these menus.
       cx.set_menus(menus(cx));
@@ -252,26 +301,28 @@ fn main() {
     let images = Images::new(core.clone(), cx);
     let store = cx.new(|_| Store::new(core.clone(), images));
     #[cfg(target_os = "macos")]
-    let window = {
-      let window = open_main(core.clone(), store.clone(), cx);
-      cx.set_global(Main { window, core, store });
-      window
+    let main_window = {
+      let open = open_main(core.clone(), store.clone(), cx);
+      cx.set_global(Main { open: Some(open.clone()), core, store });
+      cx.on_window_closed(|cx, closed| Main::on_closed(closed, cx)).detach();
+      open
     };
     // Only macOS brings a closed main window back (from the Dock): elsewhere closing it quits.
     #[cfg(not(target_os = "macos"))]
-    let window = {
-      let window = open_main(core, store, cx);
+    let main_window = {
+      let open = open_main(core, store, cx);
+      let id = open.window.window_id();
       cx.on_window_closed(move |cx, closed| {
-        if closed == window.window_id() {
+        if closed == id {
           cx.quit();
         }
       })
       .detach();
-      window
+      open
     };
     // The first run after an update shows what changed, once.
-    if whats_new && let Some(window) = window.downcast::<RootView>() {
-      let _ = window.update(cx, RootView::open_whats_new);
+    if whats_new {
+      main_window.update(cx, RootView::open_whats_new);
     }
     // `Working https://meet.google.com/<code>` also opens that meeting.
     if let Some(url) = std::env::args()
@@ -284,15 +335,15 @@ fn main() {
   });
 }
 
-fn open_main(core: Core, store: Entity<Store>, cx: &mut App) -> AnyWindowHandle {
+fn open_main(core: Core, store: Entity<Store>, cx: &mut App) -> MainWindow {
   let mut options = TitleBar::window_options();
   chrome::set_title_bar(&mut options, "Working", TOP_BAR_HEIGHT);
   options.window_bounds = Some(WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(800.)), cx)));
   options.window_min_size = Some(size(px(800.), px(500.)));
-  open_window(options, cx, |window, cx| cx.new(|cx| RootView::new(core, store, window, cx)))
+  let (window, root) = open_window(options, cx, |window, cx| cx.new(|cx| RootView::new(core, store, window, cx)))
     .unwrap_or_else(|_| {
       tracing::error!("failed to open the main window");
       std::process::exit(1);
-    })
-    .0
+    });
+  MainWindow { window, root: root.downgrade() }
 }

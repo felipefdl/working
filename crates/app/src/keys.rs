@@ -173,6 +173,7 @@ pub fn bind(cx: &mut App) {
     KeyBinding::new("cmd-h", crate::root::Hide, None),
     KeyBinding::new("alt-cmd-h", crate::root::HideOthers, None),
     KeyBinding::new("cmd-m", crate::root::Minimize, None),
+    KeyBinding::new("cmd-0", crate::root::ShowMain, None),
   ]);
 }
 

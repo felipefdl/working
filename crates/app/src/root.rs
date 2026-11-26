@@ -79,7 +79,7 @@ actions!(
 // The app and window commands of the macOS menu bar. Elsewhere the title bar has the window's buttons, and hiding apps
 // is not there (Windows' platform panics on it).
 #[cfg(target_os = "macos")]
-actions!(working, [Hide, HideOthers, ShowAll, Minimize, Zoom]);
+actions!(working, [Hide, HideOthers, ShowAll, Minimize, Zoom, ShowMain]);
 
 /// Height of the top bar. On macOS the traffic lights are centered in it (see `chrome::set_title_bar`).
 pub const TOP_BAR_HEIGHT: f32 = 52.0;
@@ -228,7 +228,14 @@ pub fn menus(cx: &App) -> Vec<Menu> {
   menus.push(Menu {
     name: "Window".into(),
     disabled: false,
-    items: vec![MenuItem::action("Minimize", Minimize), MenuItem::action("Zoom", Zoom)],
+    // Working brings the main window forward, or back after it was closed while a call window stayed open: the
+    // list of windows macOS keeps under these items names only the open ones.
+    items: vec![
+      MenuItem::action("Minimize", Minimize),
+      MenuItem::action("Zoom", Zoom),
+      MenuItem::separator(),
+      MenuItem::action("Working", ShowMain),
+    ],
   });
   menus
 }
@@ -583,6 +590,16 @@ impl RootView {
     });
     self.theme_picker = Some((picker, sub));
     cx.notify();
+  }
+
+  /// Runs a menu bar command that came through the app (`bind_menu_commands`) rather than this view's own
+  /// listeners. The welcome screen takes none: it draws in place of everything a command opens.
+  #[cfg(target_os = "macos")]
+  pub fn run_menu_command(&mut self, run: MenuCommand, window: &mut Window, cx: &mut Context<Self>) {
+    if self.store.read(cx).signed_out.is_some() {
+      return;
+    }
+    run(self, window, cx);
   }
 
   /// Opens the picker of a setting's choices: the layout, or the message style. One at a time.
