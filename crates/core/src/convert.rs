@@ -961,6 +961,9 @@ pub fn message(message: &proto::Message, users: &Users) -> Option<Message> {
     })
     .filter(|card| !card.is_empty())
     .collect();
+  let forward = |quoted: &proto::QuotedMessageMetadata| {
+    quoted.quote_type == Some(proto::message_info::reply_to::QuoteType::Forward as i32)
+  };
   let quote = message.quoted_message_metadata.as_ref().map(|quoted| Quote {
     sender_name: quoted
       .creator_profile
@@ -973,13 +976,25 @@ pub fn message(message: &proto::Message, users: &Users) -> Option<Message> {
       .unwrap_or_default(),
     text: quoted.text_body.clone().unwrap_or_default(),
     // A forward (quote type 2) names the conversation it comes from, the same one too.
-    forwarded_from: (quoted.quote_type == Some(proto::message_info::reply_to::QuoteType::Forward as i32)).then(|| {
+    forwarded_from: forward(quoted).then(|| {
       quoted
         .forwarded_from
         .as_ref()
         .and_then(|source| source.name.clone())
         .unwrap_or_default()
     }),
+    origin: if forward(quoted) {
+      None
+    } else {
+      quoted
+        .message_id
+        .as_ref()
+        .and_then(|id| id.message_id.clone())
+        .map(|message_id| crate::model::QuoteOrigin {
+          message_id,
+          time: quoted.create_time_micros,
+        })
+    },
   });
   Some(Message {
     id: id.message_id.clone()?,
@@ -1271,6 +1286,7 @@ mod tests {
       quoted_message_metadata: Some(proto::QuotedMessageMetadata {
         message_id: Some(id(&here, "msgQuoted01")),
         text_body: Some("Launch moves to Tuesday.".into()),
+        create_time_micros: Some(1_700_000_000_000_000),
         quote_type: Some(kind as i32),
         forwarded_from: source.map(|name| proto::quoted_message_metadata::ForwardedFrom {
           group_id: Some(proto_group_id(&here)),
@@ -1287,6 +1303,16 @@ mod tests {
       Some("Product launch")
     );
     assert_eq!(forwarded_from(&quoting(QuoteType::Reply, None)), None);
+    // Only a quote in reply names a message of this conversation to go to.
+    let origin = |wire: &proto::Message| message(wire, &users)?.quote?.origin;
+    assert_eq!(origin(&quoting(QuoteType::Forward, Some("Product launch"))), None);
+    assert_eq!(
+      origin(&quoting(QuoteType::Reply, None)),
+      Some(crate::model::QuoteOrigin {
+        message_id: "msgQuoted01".into(),
+        time: Some(1_700_000_000_000_000),
+      })
+    );
   }
 
   #[test]

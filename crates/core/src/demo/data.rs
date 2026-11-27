@@ -551,6 +551,7 @@ fn riley(b: &mut Builder) {
     sender_name: b.user("demo-sam").name,
     text: "Branch cut for 2.41.0 is Thursday. Anything not merged by noon waits for 2.42.".into(),
     forwarded_from: Some("Release train".into()),
+    origin: None,
   });
   chat.add(forwarded);
   chat.say(&me, 4 * HOUR, "Nice catch 🙌");
@@ -565,11 +566,18 @@ fn priya(b: &mut Builder) {
   let mut slides = chat.post(&priya, 6 * DAY - HOUR, "Here you go. The flows are on slide 4.");
   slides.attachments = vec![file("design-review.md")];
   chat.add(slides);
+  let option = chat.post(&priya, 27 * HOUR, "Option B tested better with every group.");
+  let origin = crate::model::QuoteOrigin {
+    message_id: option.id.clone(),
+    time: Some(option.time),
+  };
+  chat.add(option);
   let mut quoted = chat.post(&me, 26 * HOUR, "Going with option B, then.");
   quoted.quote = Some(Quote {
     sender_name: priya.name.clone(),
     text: "Option B tested better with every group.".into(),
     forwarded_from: None,
+    origin: Some(origin),
   });
   chat.add(quoted);
   b.group(group, &["demo-priya"], chat, 0);
@@ -694,7 +702,8 @@ fn launch(b: &mut Builder) {
   );
 }
 
-/// A long, muted space with one unread message and no mention: enough messages to page through older history.
+/// A long, muted space with one unread message and no mention: enough messages to page through older history. Its
+/// last two messages quote one far up the loaded page and one that is not loaded until it is gone to.
 fn release_train(b: &mut Builder) {
   let people = ["demo-riley", "demo-noah", "demo-sam", "demo-diego"].map(|id| b.user(id));
   let (mut group, mut chat) = b.space("demo-release", "Release train", "🚂");
@@ -707,16 +716,36 @@ fn release_train(b: &mut Builder) {
     "Rolled out to 100% for",
   ];
   let mut ago = 60 * DAY;
+  let mut cuts = Vec::new();
   for release in 1..=40_usize {
     for (step, line) in lines.iter().enumerate() {
       let index = (release + step) % people.len();
       if let Some(sender) = people.get(index) {
-        chat.say(sender, ago, &format!("{line} 2.{release}.0"));
+        let said = chat.post(sender, ago, &format!("{line} 2.{release}.0"));
+        if step == 0 {
+          cuts.push(Quote {
+            sender_name: said.sender_name.clone(),
+            text: said.text.clone(),
+            forwarded_from: None,
+            origin: Some(crate::model::QuoteOrigin {
+              message_id: said.id.clone(),
+              time: Some(said.time),
+            }),
+          });
+        }
+        chat.add(said);
       }
       ago -= 3 * HOUR;
     }
     ago -= 9 * HOUR;
   }
+  let [riley, noah, ..] = &people;
+  let mut loaded = chat.post(riley, ago, "This one had the flaky migration, for the record.");
+  loaded.quote = cuts.get(33).cloned();
+  chat.add(loaded);
+  let mut older = chat.post(noah, ago - HOUR, "Still my favorite release.");
+  older.quote = cuts.first().cloned();
+  chat.add(older);
   b.group(group, &["demo-riley", "demo-noah", "demo-sam", "demo-diego"], chat, 1);
 }
 

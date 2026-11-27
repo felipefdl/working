@@ -2,6 +2,11 @@
 
 What changed in each release of Working, newest first, written for the people who use it. The app shows this file in its What's New dialog, so it keeps one shape: a `## <version> - <YYYY-MM-DD>` heading for each release, then one `- ` line for each change. A change may start with a short `**title.**` in bold; the rest is plain text, with no other Markdown.
 
+## 0.15.0 - 2026-11-27
+
+- **Go to the message a reply quotes.** Click the quote in a message to scroll to the message it quotes, which gets a ring around it for a moment. It works for a message far up the conversation too: Working loads that part of the conversation, and Jump to latest takes you back.
+- A message you jump to from Find or from a search result has a ring around its bubble instead of a colored band across the row.
+
 ## 0.14.0 - 2026-11-25
 
 - **Keys for the call's buttons.** In a call on macOS and Windows, every button of the bar has a key: Cmd+D for the microphone, Cmd+E for the camera, Ctrl+Cmd+H to raise your hand, Ctrl+Cmd+C for the chat, Cmd+Shift+S to share your screen, and Cmd+Shift+H to leave. On Windows, Ctrl takes the place of Cmd, and the hand and the chat are Ctrl+Alt+H and Ctrl+Alt+C. Hold the pointer over a button to see its name and its key beside the bar. Meet's own shortcuts are off while Working draws the buttons, and work as before in WebUI.

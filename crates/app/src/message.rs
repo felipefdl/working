@@ -47,6 +47,7 @@ const PART_EDIT: usize = 8;
 const PART_THREAD_TOOL: usize = 9;
 const PART_QUOTE: usize = 10;
 const PART_MORE: usize = 11;
+const PART_ORIGIN: usize = 12;
 const PART_QUICK: usize = 16;
 const PART_ATTACHMENT: usize = 1 << 10;
 const PART_REACTION: usize = 2 << 10;
@@ -437,6 +438,8 @@ pub enum Act {
   Edit,
   /// Quote the message in the next message sent.
   Quote,
+  /// Go to the message this one quotes.
+  Origin,
   /// Open the thread panel on the message.
   Thread,
   /// The pointer came onto the message: it is the one with the toolbar now.
@@ -456,7 +459,12 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
     return irc_row(row, ctx, cx);
   }
   let focused = ctx.focus == Some(msg.id.as_str());
-  let mut out = v_flex().w_full().items_center().when(focused, |row| row.bg(rgb(ACCENT_BG)));
+  // The message a jump went to: a ring around its bubble; the whole row tinted when it has none.
+  let ringed = focused && !msg.system && (!msg.text.trim().is_empty() || msg.quote.is_some());
+  let mut out = v_flex()
+    .w_full()
+    .items_center()
+    .when(focused && !ringed, |row| row.bg(rgb(ACCENT_BG)));
   if let Some(date) = &row.date {
     out = out.child(
       div().py_3().child(
@@ -576,13 +584,23 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
       .bg(rgb(bubble_bg))
       .text_size(px(14.))
       .text_color(rgb(TEXT))
+      .when(ringed, |bubble| {
+        bubble.shadow(vec![BoxShadow {
+          color: rgb(ACCENT).into(),
+          offset: point(px(0.), px(0.)),
+          blur_radius: px(0.),
+          spread_radius: px(2.),
+          inset: false,
+        }])
+      })
       .when(has_text, |bubble| {
         let msg = msg.clone();
         bubble.on_click(move |event, window, cx| text_panel::show(event.position(), &msg.text, window, cx))
       });
     if let (Some(quote), Some(clipped)) = (&msg.quote, &prepared.quote) {
-      bubble = bubble.child(
+      bubble = bubble.child(to_origin(
         v_flex()
+          .id((row.id.clone(), PART_ORIGIN))
           .gap_0p5()
           .pl_2()
           .border_l_2()
@@ -592,7 +610,9 @@ pub fn render_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
           .children(quote.forwarded_from.as_deref().map(forwarded_from))
           .child(div().font_weight(FontWeight::SEMIBOLD).child(quote.sender_name.clone()))
           .child(div().child(clipped.clone())),
-      );
+        msg,
+        ctx,
+      ));
     }
     if has_text {
       bubble = bubble.child(rich_text(row, &prepared, ctx));
@@ -921,7 +941,16 @@ fn irc_row(row: &Row, ctx: &MsgCtx, cx: &App) -> AnyElement {
       let forwarded = msg.quote.as_ref().and_then(|quote| quote.forwarded_from.as_deref());
       text = text
         .children(forwarded.map(|from| forwarded_from(from).text_color(rgb(MUTED))))
-        .child(div().max_w_full().truncate().text_color(rgb(MUTED)).child(quote.clone()));
+        .child(to_origin(
+          div()
+            .id((row.id.clone(), PART_ORIGIN))
+            .max_w_full()
+            .truncate()
+            .text_color(rgb(MUTED))
+            .child(quote.clone()),
+          msg,
+          ctx,
+        ));
     }
     if has_text {
       let rich = rich_text(row, &prepared, ctx);
@@ -1130,6 +1159,18 @@ fn quick_reactions(msg: &Arc<Message>, id: &SharedString, core: &Core) -> Div {
     );
   }
   pill
+}
+
+/// A quote in reply goes to the message it quotes on a click, which is then not a click on the bubble around it.
+fn to_origin(quote: Stateful<Div>, msg: &Arc<Message>, ctx: &MsgCtx) -> Stateful<Div> {
+  if msg.quote.as_ref().is_none_or(|quote| quote.origin.is_none()) {
+    return quote;
+  }
+  let (act, msg) = (ctx.act.clone(), msg.clone());
+  quote.cursor_pointer().on_click(move |_, window, cx| {
+    cx.stop_propagation();
+    act(Act::Origin, &msg, window, cx);
+  })
 }
 
 /// The line over a forwarded message's quote: the forward glyph and the conversation it came from.

@@ -308,6 +308,18 @@ pub struct Quote {
   pub text: String,
   /// Name of the conversation the message was forwarded from; `None` when it is a quote in reply.
   pub forwarded_from: Option<String>,
+  /// The quoted message, in the conversation of the message that quotes it; `None` for a forward.
+  #[serde(default)]
+  pub origin: Option<QuoteOrigin>,
+}
+
+/// The message a quote in reply quotes.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuoteOrigin {
+  /// Its id.
+  pub message_id: String,
+  /// When it was sent, for `Command::Jump`; `None` when the server did not say.
+  pub time: Option<Micros>,
 }
 
 /// The message a sent one carries along.

@@ -1819,6 +1819,10 @@ impl Engine {
           sender_name: carried.message.sender_name.clone(),
           text: carried.message.text.clone(),
           forwarded_from: carried.forward.then(|| self.group_name(&carried.group)).flatten(),
+          origin: (!carried.forward).then(|| crate::model::QuoteOrigin {
+            message_id: carried.message.id.clone(),
+            time: Some(carried.message.time),
+          }),
         });
         let attached = files.iter().map(|path| local_attachment(path)).collect();
         let typed = markup::parse(&text, &chips);

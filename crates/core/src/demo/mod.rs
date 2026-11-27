@@ -891,6 +891,10 @@ impl Demo {
     let mut draft = data::message(group, "", topic_id.unwrap_or_default(), &self.me, now_micros(), text);
     draft.quote = quote.map(|(quoted, forwarded_from)| Quote {
       sender_name: quoted.sender_name.clone(),
+      origin: forwarded_from.is_none().then(|| crate::model::QuoteOrigin {
+        message_id: quoted.id.clone(),
+        time: Some(quoted.time),
+      }),
       text: quoted.text.clone(),
       forwarded_from,
     });

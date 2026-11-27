@@ -1342,6 +1342,21 @@ impl ConversationView {
       },
       Act::Leave => return self.pointer_left(window, cx),
       Act::Thread => self.open_thread(message.topic(), window, cx),
+      Act::Origin => {
+        let Some(origin) = message.quote.as_ref().and_then(|quote| quote.origin.clone()) else {
+          return;
+        };
+        if self.messages.iter().any(|held| held.id == origin.message_id) {
+          self.focus_message(origin.message_id, window, cx);
+        } else if let Some(time) = origin.time {
+          // Not loaded: the list becomes a window around it, as for a search hit.
+          self.core.send(Command::Jump {
+            group: self.group.id.clone(),
+            message_id: origin.message_id,
+            time,
+          });
+        }
+      },
       Act::Quote => {
         if self.editing.take_if(|editing| !editing.in_thread).is_some() {
           self.composer.update(cx, |state, cx| state.set_value("", window, cx));
